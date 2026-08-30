@@ -15,50 +15,153 @@
 //! traffic, and a rolling update leaves the client talking to addresses that no
 //! longer exist. That is the failure D68 calls self-amplifying, and it is a
 //! property of D23 rather than of the autoscaler.
+//!
+//! NOTE ON THE EMPTY CASE: the refresh loop never acts on an empty resolution.
+//! A headless Service briefly returns nothing during some rollouts, and removing
+//! every endpoint on that basis is a self-inflicted outage from a transient DNS
+//! answer. `diff` itself has no such opinion — it is pure — so the guard lives in
+//! the loop and the test for the recovering-from-zero case lives here.
 
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::time::Duration;
 
+use tokio::sync::mpsc::Sender;
+// tonic re-exports its OWN Change. Importing tower::discover::Change directly
+// compiles and then fails to match: the two are distinct types even at the same
+// tower version, and the error reads "expected Change, found a different Change".
+use tonic::transport::channel::Change;
 use tonic::transport::{Channel, Endpoint};
 
 /// How often the endpoint set is re-resolved.
 ///
 /// Kubernetes headless DNS has a short TTL, and pods come and go on deploys and
-/// autoscaling events. Five seconds is well inside a rolling update's window;
-/// resolving once at startup is what this constant exists to prevent.
+/// autoscaling events. Five seconds is well inside a rolling update's window.
 const RERESOLVE: Duration = Duration::from_secs(5);
 
-/// Resolve every A record behind `host` and build a balanced channel.
+/// What changed between two resolutions.
 ///
-/// `tonic`'s `Channel::balance_list` round-robins across the endpoints it is
-/// given, so the work here is producing that list from DNS and refreshing it.
+/// Extracted as a PURE function on purpose: the DNS loop around it is thin and
+/// hard to test, while getting the diff wrong is easy and silent. Removing an
+/// endpoint that is still live drops traffic; failing to remove a dead one sends
+/// requests into a black hole; re-inserting an unchanged endpoint churns
+/// connections on every tick, which looks like working code and is not.
+pub fn diff(
+    current: &BTreeSet<SocketAddr>,
+    resolved: &BTreeSet<SocketAddr>,
+) -> Vec<Change<SocketAddr, ()>> {
+    let added = resolved.difference(current).map(|a| Change::Insert(*a, ()));
+    let removed = current.difference(resolved).map(|a| Change::Remove(*a));
+    // Removals first: a rolling update reuses IPs, so inserting before removing
+    // can leave the balancer holding a stale entry under a key it just re-added.
+    removed.chain(added).collect()
+}
+
+fn endpoint(addr: SocketAddr) -> Endpoint {
+    Endpoint::from_shared(format!("http://{addr}"))
+        .expect("a socket address always forms a valid authority")
+        // A dead pod must not hold a request open until the caller's deadline.
+        .connect_timeout(Duration::from_secs(2))
+        // HTTP/2 keepalive notices a pod that vanished without closing its
+        // connection — the common case when a node goes away.
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_timeout(Duration::from_secs(3))
+}
+
+/// Resolve `host`, build a balanced channel, and KEEP RESOLVING.
+///
+/// The refresh loop is the whole point. Resolving once pins the client to
+/// whichever pods existed at startup: new replicas receive nothing, and a rolling
+/// update leaves it talking to addresses that no longer exist. Under D68 that is
+/// self-amplifying — the autoscaler adds pods that get no traffic, so the metric
+/// does not move, so it adds more.
+///
+/// The task holds a `Sender` into the channel's discovery stream and lives as
+/// long as the channel does; when the channel is dropped the send fails and the
+/// loop exits, so there is no task leak.
 pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
-    let addrs = resolve(host, port).await?;
-    if addrs.is_empty() {
+    let initial = resolve(host, port).await?;
+    if initial.is_empty() {
         return Err(BalanceError::NoEndpoints {
             host: host.to_string(),
         });
     }
     tracing::info!(
         host,
-        count = addrs.len(),
+        count = initial.len(),
         "balancing across task-db replicas"
     );
 
-    let endpoints = addrs.into_iter().map(|addr| {
-        Endpoint::from_shared(format!("http://{addr}"))
-            .expect("a socket address always forms a valid authority")
-            // A dead pod must not hold a request open until the caller's deadline.
-            .connect_timeout(Duration::from_secs(2))
-            // HTTP/2 keepalive is what notices a pod that vanished without
-            // closing its connection — the common case when a node goes away.
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_timeout(Duration::from_secs(3))
-    });
+    let (channel, tx) = Channel::balance_channel::<SocketAddr>(initial.len().max(8));
+    for addr in &initial {
+        // Before any request is served: a channel with no endpoints yet would
+        // fail the first calls while the loop caught up.
+        let _ = tx.send(Change::Insert(*addr, endpoint(*addr))).await;
+    }
 
-    Ok(Channel::balance_list(endpoints))
+    tokio::spawn(refresh(host.to_string(), port, initial, tx));
+    Ok(channel)
 }
 
-async fn resolve(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, BalanceError> {
+/// The loop. Separate from `connect` so a failed resolution never takes down a
+/// channel that is still serving: DNS blipping is not a reason to stop using
+/// endpoints that currently work.
+async fn refresh(
+    host: String,
+    port: u16,
+    mut current: BTreeSet<SocketAddr>,
+    tx: Sender<Change<SocketAddr, Endpoint>>,
+) {
+    loop {
+        tokio::time::sleep(RERESOLVE).await;
+
+        let resolved = match resolve(&host, port).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(host, error = %e, "re-resolution failed; keeping the current endpoints");
+                continue;
+            }
+        };
+
+        // An EMPTY result is not a reason to remove everything. A headless
+        // Service briefly returns nothing during some rollouts, and acting on it
+        // would take the client to zero endpoints and fail every request — a
+        // self-inflicted outage from a transient DNS answer.
+        if resolved.is_empty() {
+            tracing::warn!(
+                host,
+                "re-resolution returned no addresses; keeping the current set"
+            );
+            continue;
+        }
+
+        if resolved == current {
+            continue;
+        }
+
+        for change in diff(&current, &resolved) {
+            let sent = match change {
+                Change::Insert(addr, ()) => {
+                    tracing::info!(%addr, "task-db endpoint added");
+                    tx.send(Change::Insert(addr, endpoint(addr))).await
+                }
+                Change::Remove(addr) => {
+                    tracing::info!(%addr, "task-db endpoint removed");
+                    tx.send(Change::Remove(addr)).await
+                }
+            };
+            // The receiver is gone, so the channel was dropped: stop rather than
+            // spin forever against a dead sender.
+            if sent.is_err() {
+                tracing::debug!("channel dropped; ending re-resolution");
+                return;
+            }
+        }
+        current = resolved;
+    }
+}
+
+async fn resolve(host: &str, port: u16) -> Result<BTreeSet<SocketAddr>, BalanceError> {
     let target = format!("{host}:{port}");
     let addrs = tokio::net::lookup_host(target.clone())
         .await
@@ -69,10 +172,8 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, Bal
     Ok(addrs.collect())
 }
 
-/// The interval at which a caller should re-resolve. Exposed rather than applied
-/// internally because the refresh loop belongs to whoever owns the channel's
-/// lifetime, and hiding it would make "did anyone actually re-resolve?"
-/// unanswerable from the outside.
+/// The interval at which endpoints are re-resolved. Exposed so a caller can log
+/// it, and so "did anyone actually re-resolve?" is answerable from outside.
 pub const fn reresolve_interval() -> Duration {
     RERESOLVE
 }
