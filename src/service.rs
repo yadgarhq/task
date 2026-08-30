@@ -112,9 +112,17 @@ impl TaskService for Task {
             number: created.number,
         };
 
-        // D67, on the one path this service fully owns. The payload here is a URN
-        // and a number — the IDENTIFIER class, which is exactly the case a
-        // word count under-reports and the reason both features are recorded.
+        // D67, on the one path this service fully owns.
+        //
+        // ENVELOPE, not Identifiers, and the first real record is what corrected
+        // it: classified as Identifiers this 310-byte response estimated 264
+        // tokens — roughly three times plausible. The payload is a response
+        // STRUCTURE containing one URN, not a list of URNs, and the two
+        // tokenize differently.
+        //
+        // This is the calibration loop working on its first observation, and the
+        // reason D67 insists the coefficients are provisional and that the
+        // estimator carries its version.
         record::emit(
             &record::Builder::new("task", "CreateTask", Kind::Write)
                 .scope(
@@ -125,7 +133,7 @@ impl TaskService for Task {
                 )
                 .outcome("OK")
                 .duration(started.elapsed())
-                .payload(&format!("{response:?}"), Class::Identifiers)
+                .payload(&format!("{response:?}"), Class::Envelope)
                 .rows_returned(1)
                 .build(),
         );
