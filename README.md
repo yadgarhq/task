@@ -43,11 +43,23 @@ pods that also receive nothing.
 So `task-db`'s Service is **headless**: DNS returns every pod address and this
 service balances across them itself.
 
-**Re-resolution is the half that must not be forgotten.** Resolving once at
-startup pins the client to whichever pods existed then — new replicas get no
-traffic, and a rolling update leaves it talking to addresses that no longer
-exist. `balance::reresolve_interval()` is exposed rather than applied internally
-so that "did anyone actually re-resolve?" is answerable from outside the module.
+**Re-resolution is the half that must not be forgotten**, and it is wired up: a
+background task re-resolves every 5s and applies the difference to the channel's
+endpoint set. Resolving once at startup would pin the client to whichever pods
+existed then — new replicas getting no traffic, and a rolling update leaving it
+talking to addresses that no longer exist.
+
+Two things the loop deliberately does not do:
+
+- **It never acts on an empty resolution.** A headless Service briefly returns
+  nothing during some rollouts, and removing every endpoint on that basis is a
+  self-inflicted outage from a transient DNS answer.
+- **It never tears down a working channel because DNS failed.** A blip is not a
+  reason to stop using endpoints that currently work.
+
+`balance::diff` is a pure function over two address sets, extracted so the part
+that is easy to get silently wrong is testable: re-inserting an unchanged
+endpoint churns connections every tick and looks like working code.
 
 ## It does not wait for `task-db` to be ready
 
