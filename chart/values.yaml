@@ -1,0 +1,24 @@
+# In git the image points at a moving TAG; the PUBLISHED chart pins a DIGEST,
+# rewritten by ci-release at package time (D65).
+image:
+  repository: ghcr.io/yadgarhq/task
+  tag: latest
+
+# At least two, always (D55) — and here it is load-bearing rather than
+# ceremonial: D23's client-side balancing cannot be exercised by one replica of
+# the caller talking to one replica of the callee.
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+# The HEADLESS Service of the -db twin (D23). Resolving this name yields every
+# ready pod address rather than one virtual IP, which is what makes client-side
+# balancing possible at all.
+taskDb:
+  host: task-db
+  port: 50051
