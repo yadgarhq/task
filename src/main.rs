@@ -48,6 +48,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "connected to task-db"
     );
 
+    // The BINARY installs the exporter, never the library — a library that
+    // installs one picks the backend for every service linking it. A failure here
+    // is logged and ignored: a service that cannot export metrics should still
+    // serve traffic, which is D25's rule applied to the metrics path too.
+    let metrics_addr: SocketAddr = env_or("METRICS_LISTEN", "0.0.0.0:9090").parse()?;
+    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
+        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
+    }
+
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
     tracing::info!(%addr, "task listening");
     tonic::transport::Server::builder()
