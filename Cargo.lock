@@ -644,6 +644,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1083,6 +1084,21 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "yadgar-telemetry",
+]
+
+[[package]]
+name = "yadgar-telemetry"
+version = "0.1.0"
+source = "git+https://github.com/yadgarhq/telemetry.git?rev=ee27349ea0aa2516fd29740aec7fd90cd7725827#ee27349ea0aa2516fd29740aec7fd90cd7725827"
+dependencies = [
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]
