@@ -21,7 +21,7 @@ tonic = { version = "0.14", default-features = false, features = [
 tonic-prost = "0.14"
 # The shared instrumentation seam (D67). Pinned by revision, like every other
 # in-org crate — a branch is a moving target.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "76a03651beca029efe886bfdaffc2296eb0cabc6" }
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1273e45e641c6af5187af1203dfb153d4369b5bc", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

@@ -1398,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "yadgar-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/telemetry.git?rev=76a03651beca029efe886bfdaffc2296eb0cabc6#76a03651beca029efe886bfdaffc2296eb0cabc6"
+source = "git+https://github.com/yadgarhq/telemetry.git?rev=1273e45e641c6af5187af1203dfb153d4369b5bc#1273e45e641c6af5187af1203dfb153d4369b5bc"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -1407,6 +1407,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tonic",
  "tonic-prost-build",
  "tracing",
 ]
