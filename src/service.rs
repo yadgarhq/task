@@ -1,11 +1,9 @@
 //! `TaskService`. Business rules here; storage over the `-db` API, never directly.
 
-use std::time::Instant;
-
 use tonic::{Request, Response, Status};
 use yadgar_telemetry::estimator::Class;
+use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
-use yadgar_telemetry::record;
 
 use crate::pb::yadgar::task::v1 as db;
 use crate::pb::yadgar::task::v1::task_db_service_client::TaskDbServiceClient;
@@ -13,29 +11,27 @@ use crate::pb::yadgar::taskapi::v1 as api;
 use crate::pb::yadgar::taskapi::v1::task_service_server::TaskService;
 use crate::rules;
 
-/// The scope fields a record needs, copied before the request is consumed.
+/// KNOWN LIMITATION, recorded rather than hidden: an error path returns via `?`,
+/// which drops the `Call`, and a dropped call records `UNRECORDED` rather than the
+/// real gRPC status. So failures are counted but not yet classified.
 ///
-/// A small struct rather than four loose strings because they are always used
-/// together and mixing up two of them produces telemetry that is wrong in a way
-/// no test would catch.
-struct Telemetry {
-    request_id: String,
-    instance_id: String,
-    user_id: String,
-    project_id: String,
-}
-
-impl From<Option<&crate::pb::yadgar::common::v1::Scope>> for Telemetry {
-    fn from(scope: Option<&crate::pb::yadgar::common::v1::Scope>) -> Self {
-        // An absent scope is refused later with INVALID_ARGUMENT; here it simply
-        // yields empty strings, because telemetry must never be the thing that
-        // fails a call (D25).
-        Self {
-            request_id: scope.map(|s| s.request_id.clone()).unwrap_or_default(),
-            instance_id: scope.map(|s| s.instance_id.clone()).unwrap_or_default(),
-            user_id: scope.map(|s| s.user_id.clone()).unwrap_or_default(),
-            project_id: scope.map(|s| s.project_id.clone()).unwrap_or_default(),
-        }
+/// Fixing it means threading the status through every `?` site, which is a
+/// restructure rather than an addition — deliberately not done in the same change
+/// that established the coverage.
+///
+/// Copy the scope fields a record needs, before the request is consumed.
+///
+/// An absent scope yields empty strings rather than an error: the call is refused
+/// on its own merits with INVALID_ARGUMENT, and telemetry must never be the thing
+/// that fails a request (D25).
+fn tel_scope(
+    scope: Option<&crate::pb::yadgar::common::v1::Scope>,
+) -> yadgar_telemetry::observe::Scope {
+    yadgar_telemetry::observe::Scope {
+        request_id: scope.map(|s| s.request_id.clone()).unwrap_or_default(),
+        instance_id: scope.map(|s| s.instance_id.clone()).unwrap_or_default(),
+        user_id: scope.map(|s| s.user_id.clone()).unwrap_or_default(),
+        project_id: scope.map(|s| s.project_id.clone()).unwrap_or_default(),
     }
 }
 
@@ -77,11 +73,15 @@ impl TaskService for Task {
         &self,
         request: Request<api::CreateTaskRequest>,
     ) -> Result<Response<api::CreateTaskResponse>, Status> {
-        let started = Instant::now();
         let req = request.into_inner();
-        // Captured BEFORE the request is consumed by the -db call. The gateway
-        // attests these; this service only carries them through (D12).
-        let tel = Telemetry::from(req.scope.as_ref());
+        // Started BEFORE the work, so the duration covers the handler and the
+        // scope is captured before the request is consumed by the -db call.
+        let call = Call::start(
+            "task",
+            "CreateTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
         if req.title.trim().is_empty() {
             // A rule, not a storage constraint: an untitled task is unfindable by
             // the humans who have to triage it. The column would happily take it.
@@ -112,31 +112,16 @@ impl TaskService for Task {
             number: created.number,
         };
 
-        // D67, on the one path this service fully owns.
-        //
-        // ENVELOPE, not Identifiers, and the first real record is what corrected
-        // it: classified as Identifiers this 310-byte response estimated 264
-        // tokens — roughly three times plausible. The payload is a response
-        // STRUCTURE containing one URN, not a list of URNs, and the two
-        // tokenize differently.
-        //
-        // This is the calibration loop working on its first observation, and the
-        // reason D67 insists the coefficients are provisional and that the
-        // estimator carries its version.
-        record::emit(
-            &record::Builder::new("task", "CreateTask", Kind::Write)
-                .scope(
-                    &tel.request_id,
-                    &tel.instance_id,
-                    &tel.user_id,
-                    &tel.project_id,
-                )
-                .outcome("OK")
-                .duration(started.elapsed())
-                .payload(&format!("{response:?}"), Class::Envelope)
-                .rows_returned(1)
-                .build(),
-        );
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            // A response STRUCTURE containing one URN, not a list of URNs — the
+            // first real record corrected this from Identifiers, which
+            // over-estimated it threefold.
+            class: Class::Envelope,
+            rows: 1,
+            ..Default::default()
+        });
 
         Ok(Response::new(response))
     }
@@ -146,6 +131,12 @@ impl TaskService for Task {
         request: Request<api::ReadTaskRequest>,
     ) -> Result<Response<api::ReadTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "ReadTask",
+            Kind::Read,
+            tel_scope(req.scope.as_ref()),
+        );
         let key = match req.key {
             Some(api::read_task_request::Key::Id(id)) => db::get_task_request::Key::Id(id),
             Some(api::read_task_request::Key::Number(n)) => db::get_task_request::Key::Number(n),
@@ -163,7 +154,15 @@ impl TaskService for Task {
             .map_err(|e| passthrough(e, "read"))?
             .into_inner();
 
-        Ok(Response::new(api::ReadTaskResponse { task: got.task }))
+        let response = api::ReadTaskResponse { task: got.task };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: 1,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn find_tasks(
@@ -171,6 +170,12 @@ impl TaskService for Task {
         request: Request<api::FindTasksRequest>,
     ) -> Result<Response<api::FindTasksResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "FindTasks",
+            Kind::Read,
+            tel_scope(req.scope.as_ref()),
+        );
         let found = self
             .db
             .clone()
@@ -184,10 +189,18 @@ impl TaskService for Task {
             .map_err(|e| passthrough(e, "find"))?
             .into_inner();
 
-        Ok(Response::new(api::FindTasksResponse {
+        let response = api::FindTasksResponse {
             tasks: found.tasks,
             next_page_token: found.next_page_token,
-        }))
+        };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: response.tasks.len() as u32,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn edit_task(
@@ -195,6 +208,12 @@ impl TaskService for Task {
         request: Request<api::EditTaskRequest>,
     ) -> Result<Response<api::EditTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "EditTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
         if req.title.trim().is_empty() {
             return Err(Status::invalid_argument("a task needs a title"));
         }
@@ -235,7 +254,15 @@ impl TaskService for Task {
             .map_err(|e| passthrough(e, "edit"))?
             .into_inner();
 
-        Ok(Response::new(api::EditTaskResponse { meta: updated.meta }))
+        let response = api::EditTaskResponse { meta: updated.meta };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: 1,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn transition_task(
@@ -243,6 +270,12 @@ impl TaskService for Task {
         request: Request<api::TransitionTaskRequest>,
     ) -> Result<Response<api::TransitionTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "TransitionTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
         let to = db::TaskStatus::try_from(req.to)
             .map_err(|_| Status::invalid_argument("unknown target status"))?;
 
@@ -284,14 +317,22 @@ impl TaskService for Task {
             .await
             .map_err(|e| passthrough(e, "transition"))?;
 
-        Ok(Response::new(api::TransitionTaskResponse {
+        let response = api::TransitionTaskResponse {
             meta: Some(crate::pb::yadgar::common::v1::Meta {
                 id: req.id,
                 version: req.expect_version + 1,
                 ..Default::default()
             }),
             from: from as i32,
-        }))
+        };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: 1,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn remove_task(
@@ -299,6 +340,12 @@ impl TaskService for Task {
         request: Request<api::RemoveTaskRequest>,
     ) -> Result<Response<api::RemoveTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "RemoveTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
         self.db
             .clone()
             .delete_task(db::DeleteTaskRequest {
@@ -309,6 +356,14 @@ impl TaskService for Task {
             })
             .await
             .map_err(|e| passthrough(e, "remove"))?;
+        // No payload to measure: RemoveTaskResponse is empty. Recording it
+        // anyway matters — a call that returns nothing still costs time and still
+        // belongs in the count, and omitting it would make deletes invisible.
+        call.finish(Outcome {
+            status: "OK",
+            rows: 1,
+            ..Default::default()
+        });
         Ok(Response::new(api::RemoveTaskResponse {}))
     }
 }
