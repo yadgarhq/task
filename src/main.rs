@@ -23,7 +23,18 @@ fn env_or(key: &str, default: &str) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // A DEFAULT, because from_default_env() with RUST_LOG unset enables
+        // NOTHING — the service runs silently and its boot sequence, its
+        // capability probe result and its errors all vanish. Found by deploying:
+        // two replicas were Running and `kubectl logs` returned nothing at all,
+        // so the only way to see why one had restarted was the previous
+        // container's exit output.
+        //
+        // A service nobody can observe is one D67 cannot measure either.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
