@@ -13,6 +13,12 @@ spec:
     metadata:
       labels:
         app: {{ .Chart.Name }}
+      annotations:
+        # OPT-IN scraping. Prometheus discovers pods by this annotation rather
+        # than from a static list, so a new module is scraped by declaring itself
+        # rather than by someone remembering to add it centrally (D62's shape).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
     spec:
       # POD-level, and distinct from the container block below. Setting only the
       # container context leaves the pod admitting root — runAsNonRoot is the

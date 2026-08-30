@@ -22,3 +22,21 @@ resources:
 taskDb:
   host: task-db
   port: 50051
+
+# D68: scale on CONCURRENCY, not CPU. A -db waits on MariaDB and a logic service
+# waits on its -db, so both saturate at low CPU — a CPU-driven HPA stays quiet
+# exactly when the system is in trouble.
+#
+# The signal is call RATE per replica, read from D67's metrics. Rate rather than
+# a gauge because nothing tracks in-flight requests yet: rate is what the
+# instrumentation actually exposes today, and pretending otherwise would give a
+# scaler that reads nothing. Stated here rather than silently substituted.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  # At least two, always (D55) — the floor is a correctness property, not a
+  # tuning knob: one replica makes a class of defect unreachable.
+  maxReplicas: 6
+  # Calls per second per replica before adding one.
+  threshold: "10"
+  prometheusAddress: http://prometheus-server.observability.svc.cluster.local
