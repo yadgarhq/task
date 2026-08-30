@@ -1,0 +1,16 @@
+# A NORMAL Service, unlike task-db's. This one is called by the gateway over
+# gRPC too, so the same HTTP/2 pinning applies — but the gateway is the thing
+# that will do client-side balancing against it when it exists, and until then a
+# ClusterIP is honest about what is actually happening rather than declaring a
+# balancing story nothing implements.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Chart.Name }}
+spec:
+  selector:
+    app: {{ .Chart.Name }}
+  ports:
+    - name: grpc
+      port: 50052
+      targetPort: grpc

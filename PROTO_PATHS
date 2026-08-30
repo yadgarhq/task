@@ -1,0 +1,9 @@
+# What this module vendors from yadgarhq/proto (D70). buf closes the import graph
+# itself, so listing taskapi also brings yadgar/task/v1 (for Task and TaskStatus)
+# and yadgar/common/v1.
+#
+# yadgar/task/v1 is listed explicitly as well because this service is a CLIENT of
+# TaskDbService — it needs the service definition, not only the messages the API
+# references, and an import closure brings the latter but not the former.
+yadgar/taskapi/v1
+yadgar/task/v1

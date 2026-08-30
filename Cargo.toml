@@ -1,0 +1,41 @@
+[package]
+name = "yadgar-task"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "The task module's logic service: business rules, no store."
+
+[dependencies]
+# NO sqlx, NO yadgar-store, and that absence is the design (D4). A logic service
+# reaches its data only over the -db API; a store SDK in this dependency tree
+# would mean it could open its own connection, which is what the twin exists to
+# prevent. proto-contract-design keeps a per-repo check for exactly this.
+tonic = { version = "0.14", default-features = false, features = [
+  "codegen",
+  "router",
+  "server",
+  "transport",
+  "channel",
+] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower = "0.5"
+http = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

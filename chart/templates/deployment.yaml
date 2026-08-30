@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      # POD-level, and distinct from the container block below. Setting only the
+      # container context leaves the pod admitting root — runAsNonRoot is the
+      # assertion that actually refuses an image which would run as one, rather
+      # than trusting the Containerfile to have said so.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Chart.Name }}
+          # A published chart carries image.digest and no tag (D65, D61).
+          image: "{{ .Values.image.repository }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}"
+          ports:
+            - name: grpc
+              containerPort: 50052
+          env:
+            - name: TASK_DB_HOST
+              value: {{ .Values.taskDb.host | quote }}
+            - name: TASK_DB_PORT
+              value: {{ .Values.taskDb.port | quote }}
+          # This service does NOT wait for task-db before listening, so the port
+          # opening means "process up", not "dependency healthy" — deliberately.
+          # Blocking startup on a -db that is still migrating would turn one
+          # module's slow boot into a cascading outage, and a pod stuck in
+          # startup is one D68's autoscaler cannot help. A request that cannot
+          # reach the store fails with UNAVAILABLE, which is recoverable.
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
