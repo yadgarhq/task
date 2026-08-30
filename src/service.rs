@@ -2,6 +2,7 @@
 
 use tonic::{Request, Response, Status};
 use yadgar_telemetry::estimator::Class;
+use yadgar_telemetry::grpc::status_name;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
@@ -82,48 +83,53 @@ impl TaskService for Task {
             Kind::Write,
             tel_scope(req.scope.as_ref()),
         );
-        if req.title.trim().is_empty() {
-            // A rule, not a storage constraint: an untitled task is unfindable by
-            // the humans who have to triage it. The column would happily take it.
-            return Err(Status::invalid_argument("a task needs a title"));
-        }
 
-        let created = self
-            .db
-            .clone()
-            .create_task(db::CreateTaskRequest {
-                idempotency: req.idempotency,
-                scope: req.scope,
-                task: Some(db::Task {
-                    title: req.title,
-                    body: req.body,
-                    status: db::TaskStatus::Open as i32,
-                    tags: req.tags,
-                    links: req.links,
-                    ..Default::default()
-                }),
-            })
-            .await
-            .map_err(|e| passthrough(e, "create"))?
-            .into_inner();
+        call.run(
+            async move {
+                if req.title.trim().is_empty() {
+                    // A rule, not a storage constraint: an untitled task is unfindable by
+                    // the humans who have to triage it. The column would happily take it.
+                    return Err(Status::invalid_argument("a task needs a title"));
+                }
 
-        let response = api::CreateTaskResponse {
-            meta: created.meta,
-            number: created.number,
-        };
+                let created = self
+                    .db
+                    .clone()
+                    .create_task(db::CreateTaskRequest {
+                        idempotency: req.idempotency,
+                        scope: req.scope,
+                        task: Some(db::Task {
+                            title: req.title,
+                            body: req.body,
+                            status: db::TaskStatus::Open as i32,
+                            tags: req.tags,
+                            links: req.links,
+                            ..Default::default()
+                        }),
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "create"))?
+                    .into_inner();
 
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            // A response STRUCTURE containing one URN, not a list of URNs — the
-            // first real record corrected this from Identifiers, which
-            // over-estimated it threefold.
-            class: Class::Envelope,
-            rows: 1,
-            ..Default::default()
-        });
+                let response = api::CreateTaskResponse {
+                    meta: created.meta,
+                    number: created.number,
+                };
 
-        Ok(Response::new(response))
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn read_task(
@@ -137,32 +143,45 @@ impl TaskService for Task {
             Kind::Read,
             tel_scope(req.scope.as_ref()),
         );
-        let key = match req.key {
-            Some(api::read_task_request::Key::Id(id)) => db::get_task_request::Key::Id(id),
-            Some(api::read_task_request::Key::Number(n)) => db::get_task_request::Key::Number(n),
-            None => return Err(Status::invalid_argument("one of id or number is required")),
-        };
 
-        let got = self
-            .db
-            .clone()
-            .get_task(db::GetTaskRequest {
-                scope: req.scope,
-                key: Some(key),
-            })
-            .await
-            .map_err(|e| passthrough(e, "read"))?
-            .into_inner();
+        call.run(
+            async move {
+                let key = match req.key {
+                    Some(api::read_task_request::Key::Id(id)) => db::get_task_request::Key::Id(id),
+                    Some(api::read_task_request::Key::Number(n)) => {
+                        db::get_task_request::Key::Number(n)
+                    }
+                    None => {
+                        return Err(Status::invalid_argument("one of id or number is required"))
+                    }
+                };
 
-        let response = api::ReadTaskResponse { task: got.task };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+                let got = self
+                    .db
+                    .clone()
+                    .get_task(db::GetTaskRequest {
+                        scope: req.scope,
+                        key: Some(key),
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "read"))?
+                    .into_inner();
+
+                let response = api::ReadTaskResponse { task: got.task };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn find_tasks(
@@ -176,31 +195,41 @@ impl TaskService for Task {
             Kind::Read,
             tel_scope(req.scope.as_ref()),
         );
-        let found = self
-            .db
-            .clone()
-            .list_tasks(db::ListTasksRequest {
-                scope: req.scope,
-                statuses: req.statuses,
-                page_size: req.page_size,
-                page_token: req.page_token,
-            })
-            .await
-            .map_err(|e| passthrough(e, "find"))?
-            .into_inner();
 
-        let response = api::FindTasksResponse {
-            tasks: found.tasks,
-            next_page_token: found.next_page_token,
-        };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: response.tasks.len() as u32,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+        call.run(
+            async move {
+                let found = self
+                    .db
+                    .clone()
+                    .list_tasks(db::ListTasksRequest {
+                        scope: req.scope,
+                        statuses: req.statuses,
+                        page_size: req.page_size,
+                        page_token: req.page_token,
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "find"))?
+                    .into_inner();
+
+                let response = api::FindTasksResponse {
+                    tasks: found.tasks,
+                    next_page_token: found.next_page_token,
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                // The row count for a list is the LIST, not one.
+                rows: r.tasks.len() as u32,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn edit_task(
@@ -214,55 +243,64 @@ impl TaskService for Task {
             Kind::Write,
             tel_scope(req.scope.as_ref()),
         );
-        if req.title.trim().is_empty() {
-            return Err(Status::invalid_argument("a task needs a title"));
-        }
 
-        // Status is NOT read from this request — the API has no such field, and
-        // that is the point. Reading the current status and writing it back keeps
-        // the -db call's shape without letting an edit change it.
-        let current = self
-            .db
-            .clone()
-            .get_task(db::GetTaskRequest {
-                scope: req.scope.clone(),
-                key: Some(db::get_task_request::Key::Id(req.id.clone())),
-            })
-            .await
-            .map_err(|e| passthrough(e, "edit-read"))?
-            .into_inner()
-            .task
-            .ok_or_else(|| Status::not_found("no such task in this scope"))?;
+        call.run(
+            async move {
+                if req.title.trim().is_empty() {
+                    return Err(Status::invalid_argument("a task needs a title"));
+                }
 
-        let updated = self
-            .db
-            .clone()
-            .update_task(db::UpdateTaskRequest {
-                idempotency: req.idempotency,
-                scope: req.scope,
-                id: req.id,
-                expect_version: req.expect_version,
-                task: Some(db::Task {
-                    title: req.title,
-                    body: req.body,
-                    status: current.status,
-                    ..Default::default()
-                }),
-                update_mask: req.update_mask,
-            })
-            .await
-            .map_err(|e| passthrough(e, "edit"))?
-            .into_inner();
+                // Status is NOT read from this request — the API has no such field, and
+                // that is the point. Reading the current status and writing it back keeps
+                // the -db call's shape without letting an edit change it.
+                let current = self
+                    .db
+                    .clone()
+                    .get_task(db::GetTaskRequest {
+                        scope: req.scope.clone(),
+                        key: Some(db::get_task_request::Key::Id(req.id.clone())),
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "edit-read"))?
+                    .into_inner()
+                    .task
+                    .ok_or_else(|| Status::not_found("no such task in this scope"))?;
 
-        let response = api::EditTaskResponse { meta: updated.meta };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+                let updated = self
+                    .db
+                    .clone()
+                    .update_task(db::UpdateTaskRequest {
+                        idempotency: req.idempotency,
+                        scope: req.scope,
+                        id: req.id,
+                        expect_version: req.expect_version,
+                        task: Some(db::Task {
+                            title: req.title,
+                            body: req.body,
+                            status: current.status,
+                            ..Default::default()
+                        }),
+                        update_mask: req.update_mask,
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "edit"))?
+                    .into_inner();
+
+                let response = api::EditTaskResponse { meta: updated.meta };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn transition_task(
@@ -276,63 +314,73 @@ impl TaskService for Task {
             Kind::Write,
             tel_scope(req.scope.as_ref()),
         );
-        let to = db::TaskStatus::try_from(req.to)
-            .map_err(|_| Status::invalid_argument("unknown target status"))?;
 
-        let current = self
-            .db
-            .clone()
-            .get_task(db::GetTaskRequest {
-                scope: req.scope.clone(),
-                key: Some(db::get_task_request::Key::Id(req.id.clone())),
-            })
-            .await
-            .map_err(|e| passthrough(e, "transition-read"))?
-            .into_inner()
-            .task
-            .ok_or_else(|| Status::not_found("no such task in this scope"))?;
+        call.run(
+            async move {
+                let to = db::TaskStatus::try_from(req.to)
+                    .map_err(|_| Status::invalid_argument("unknown target status"))?;
 
-        let from = db::TaskStatus::try_from(current.status)
-            .map_err(|_| Status::internal("the stored status is not a known value"))?;
+                let current = self
+                    .db
+                    .clone()
+                    .get_task(db::GetTaskRequest {
+                        scope: req.scope.clone(),
+                        key: Some(db::get_task_request::Key::Id(req.id.clone())),
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "transition-read"))?
+                    .into_inner()
+                    .task
+                    .ok_or_else(|| Status::not_found("no such task in this scope"))?;
 
-        // THE RULE. Checked here, in the logic tier, because -db owns the
-        // boundary and not the rules.
-        rules::may_transition(from, to).map_err(|e| Status::failed_precondition(e.to_string()))?;
+                let from = db::TaskStatus::try_from(current.status)
+                    .map_err(|_| Status::internal("the stored status is not a known value"))?;
 
-        self.db
-            .clone()
-            .update_task(db::UpdateTaskRequest {
-                idempotency: req.idempotency,
-                scope: req.scope,
-                id: req.id.clone(),
-                expect_version: req.expect_version,
-                task: Some(db::Task {
-                    title: current.title,
-                    body: current.body,
-                    status: to as i32,
-                    ..Default::default()
-                }),
-                update_mask: None,
-            })
-            .await
-            .map_err(|e| passthrough(e, "transition"))?;
+                // THE RULE. Checked here, in the logic tier, because -db owns the
+                // boundary and not the rules.
+                rules::may_transition(from, to)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-        let response = api::TransitionTaskResponse {
-            meta: Some(crate::pb::yadgar::common::v1::Meta {
-                id: req.id,
-                version: req.expect_version + 1,
+                self.db
+                    .clone()
+                    .update_task(db::UpdateTaskRequest {
+                        idempotency: req.idempotency,
+                        scope: req.scope,
+                        id: req.id.clone(),
+                        expect_version: req.expect_version,
+                        task: Some(db::Task {
+                            title: current.title,
+                            body: current.body,
+                            status: to as i32,
+                            ..Default::default()
+                        }),
+                        update_mask: None,
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "transition"))?;
+
+                let response = api::TransitionTaskResponse {
+                    meta: Some(crate::pb::yadgar::common::v1::Meta {
+                        id: req.id,
+                        version: req.expect_version + 1,
+                        ..Default::default()
+                    }),
+                    from: from as i32,
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
                 ..Default::default()
-            }),
-            from: from as i32,
-        };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn remove_task(
@@ -346,24 +394,34 @@ impl TaskService for Task {
             Kind::Write,
             tel_scope(req.scope.as_ref()),
         );
-        self.db
-            .clone()
-            .delete_task(db::DeleteTaskRequest {
-                idempotency: req.idempotency,
-                scope: req.scope,
-                id: req.id,
-                expect_version: req.expect_version,
-            })
-            .await
-            .map_err(|e| passthrough(e, "remove"))?;
-        // No payload to measure: RemoveTaskResponse is empty. Recording it
-        // anyway matters — a call that returns nothing still costs time and still
-        // belongs in the count, and omitting it would make deletes invisible.
-        call.finish(Outcome {
-            status: "OK",
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(api::RemoveTaskResponse {}))
+
+        call.run(
+            async move {
+                self.db
+                    .clone()
+                    .delete_task(db::DeleteTaskRequest {
+                        idempotency: req.idempotency,
+                        scope: req.scope,
+                        id: req.id,
+                        expect_version: req.expect_version,
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "remove"))?;
+                // No payload to measure: RemoveTaskResponse is empty. Recording it
+                // anyway matters — a call that returns nothing still costs time and still
+                // belongs in the count, and omitting it would make deletes invisible.
+                Ok(api::RemoveTaskResponse {})
+            },
+            |_| Outcome {
+                status: "OK",
+                // RemoveTaskResponse is empty — nothing to measure. Recorded
+                // anyway: a delete costs time and belongs in the count.
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 }
