@@ -1,12 +1,43 @@
 //! `TaskService`. Business rules here; storage over the `-db` API, never directly.
 
+use std::time::Instant;
+
 use tonic::{Request, Response, Status};
+use yadgar_telemetry::estimator::Class;
+use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
+use yadgar_telemetry::record;
 
 use crate::pb::yadgar::task::v1 as db;
 use crate::pb::yadgar::task::v1::task_db_service_client::TaskDbServiceClient;
 use crate::pb::yadgar::taskapi::v1 as api;
 use crate::pb::yadgar::taskapi::v1::task_service_server::TaskService;
 use crate::rules;
+
+/// The scope fields a record needs, copied before the request is consumed.
+///
+/// A small struct rather than four loose strings because they are always used
+/// together and mixing up two of them produces telemetry that is wrong in a way
+/// no test would catch.
+struct Telemetry {
+    request_id: String,
+    instance_id: String,
+    user_id: String,
+    project_id: String,
+}
+
+impl From<Option<&crate::pb::yadgar::common::v1::Scope>> for Telemetry {
+    fn from(scope: Option<&crate::pb::yadgar::common::v1::Scope>) -> Self {
+        // An absent scope is refused later with INVALID_ARGUMENT; here it simply
+        // yields empty strings, because telemetry must never be the thing that
+        // fails a call (D25).
+        Self {
+            request_id: scope.map(|s| s.request_id.clone()).unwrap_or_default(),
+            instance_id: scope.map(|s| s.instance_id.clone()).unwrap_or_default(),
+            user_id: scope.map(|s| s.user_id.clone()).unwrap_or_default(),
+            project_id: scope.map(|s| s.project_id.clone()).unwrap_or_default(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Task {
@@ -46,7 +77,11 @@ impl TaskService for Task {
         &self,
         request: Request<api::CreateTaskRequest>,
     ) -> Result<Response<api::CreateTaskResponse>, Status> {
+        let started = Instant::now();
         let req = request.into_inner();
+        // Captured BEFORE the request is consumed by the -db call. The gateway
+        // attests these; this service only carries them through (D12).
+        let tel = Telemetry::from(req.scope.as_ref());
         if req.title.trim().is_empty() {
             // A rule, not a storage constraint: an untitled task is unfindable by
             // the humans who have to triage it. The column would happily take it.
@@ -72,10 +107,30 @@ impl TaskService for Task {
             .map_err(|e| passthrough(e, "create"))?
             .into_inner();
 
-        Ok(Response::new(api::CreateTaskResponse {
+        let response = api::CreateTaskResponse {
             meta: created.meta,
             number: created.number,
-        }))
+        };
+
+        // D67, on the one path this service fully owns. The payload here is a URN
+        // and a number — the IDENTIFIER class, which is exactly the case a
+        // word count under-reports and the reason both features are recorded.
+        record::emit(
+            &record::Builder::new("task", "CreateTask", Kind::Write)
+                .scope(
+                    &tel.request_id,
+                    &tel.instance_id,
+                    &tel.user_id,
+                    &tel.project_id,
+                )
+                .outcome("OK")
+                .duration(started.elapsed())
+                .payload(&format!("{response:?}"), Class::Identifiers)
+                .rows_returned(1)
+                .build(),
+        );
+
+        Ok(Response::new(response))
     }
 
     async fn read_task(
