@@ -38,20 +38,50 @@ pub fn may_transition(from: TaskStatus, to: TaskStatus) -> Result<(), Transition
     };
 
     if allowed.contains(&to) {
-        Ok(())
-    } else {
-        Err(TransitionError::Illegal { from, to })
+        return Ok(());
     }
+    // WHY TWO VARIANTS. There used to be one, and its message explained DROPPED
+    // — so a caller refused DONE -> BLOCKED was told that dropping is terminal,
+    // which is true, unrelated, and says nothing about the transition it asked
+    // for. An error that explains the WRONG rule is worse than one that explains
+    // none: it sends the reader off to fix something that is not broken.
+    if from == Dropped {
+        return Err(TransitionError::Terminal { to });
+    }
+    Err(TransitionError::Illegal {
+        from,
+        to,
+        legal: allowed
+            .iter()
+            .map(|s| s.as_str_name())
+            .collect::<Vec<_>>()
+            .join(", "),
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransitionError {
     #[error(
-        "cannot move a task from {from:?} to {to:?}. DROPPED is terminal by \
-         design: undoing it would erase the fact that the task was abandoned. \
-         Create a new task linking to this one instead."
+        "cannot move a task from TASK_STATUS_DROPPED to {}. DROPPED is terminal \
+         by design: undoing it would erase the fact that the task was abandoned. \
+         Create a new task linking to this one instead.",
+        .to.as_str_name()
     )]
-    Illegal { from: TaskStatus, to: TaskStatus },
+    Terminal { to: TaskStatus },
+
+    /// Names the LEGAL TARGETS rather than a rationale, because the reason
+    /// differs per pair while the caller's next move does not: pick one from the
+    /// list. DONE refuses BLOCKED and DROPPED because a finished task is
+    /// reopened first — the intermediate state is the record of what happened.
+    #[error(
+        "cannot move a task from {} to {}. The legal targets from {} are: {legal}.",
+        .from.as_str_name(), .to.as_str_name(), .from.as_str_name()
+    )]
+    Illegal {
+        from: TaskStatus,
+        to: TaskStatus,
+        legal: String,
+    },
 
     #[error("a transition must name a target status; TASK_STATUS_UNSPECIFIED is not one")]
     Unspecified,

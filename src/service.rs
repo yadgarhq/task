@@ -11,6 +11,7 @@ use crate::pb::yadgar::task::v1::task_db_service_client::TaskDbServiceClient;
 use crate::pb::yadgar::taskapi::v1 as api;
 use crate::pb::yadgar::taskapi::v1::task_service_server::TaskService;
 use crate::rules;
+use crate::writes;
 
 /// KNOWN LIMITATION, recorded rather than hidden: an error path returns via `?`,
 /// which drops the `Call`, and a dropped call records `UNRECORDED` rather than the
@@ -64,6 +65,11 @@ fn passthrough(status: Status, op: &str) -> Status {
             "the task changed since you read it, or you may not modify it — re-read and retry",
         ),
         tonic::Code::InvalidArgument => Status::invalid_argument("invalid request"),
+        // The store could not serialise this write against a concurrent one, and
+        // said so specifically. Folding it into INTERNAL here would undo the
+        // reason `-db` distinguishes it at all: this is the one storage failure
+        // a caller can act on, and the action is to send the request again.
+        tonic::Code::Aborted => Status::aborted("the write raced another one — retry"),
         _ => Status::internal("the task store is unavailable"),
     }
 }
@@ -250,9 +256,12 @@ impl TaskService for Task {
                     return Err(Status::invalid_argument("a task needs a title"));
                 }
 
-                // Status is NOT read from this request — the API has no such field, and
-                // that is the point. Reading the current status and writing it back keeps
-                // the -db call's shape without letting an edit change it.
+                // The read is kept for what it actually provides: NOT_FOUND for a
+                // task that is not there or not visible, before anything is
+                // written. Its STATUS is no longer what keeps an edit from
+                // changing one — `writes::edit_request` masks the column out, so
+                // the rule is in the request rather than in this handler's
+                // discipline.
                 let current = self
                     .db
                     .clone()
@@ -269,19 +278,7 @@ impl TaskService for Task {
                 let updated = self
                     .db
                     .clone()
-                    .update_task(db::UpdateTaskRequest {
-                        idempotency: req.idempotency,
-                        scope: req.scope,
-                        id: req.id,
-                        expect_version: req.expect_version,
-                        task: Some(db::Task {
-                            title: req.title,
-                            body: req.body,
-                            status: current.status,
-                            ..Default::default()
-                        }),
-                        update_mask: req.update_mask,
-                    })
+                    .update_task(writes::edit_request(req, current.status)?)
                     .await
                     .map_err(|e| passthrough(e, "edit"))?
                     .into_inner();
@@ -338,31 +335,28 @@ impl TaskService for Task {
 
                 // THE RULE. Checked here, in the logic tier, because -db owns the
                 // boundary and not the rules.
+                //
+                // INVALID_ARGUMENT, not FAILED_PRECONDITION. `passthrough`
+                // documents the latter as "re-read and retry", and there is
+                // nothing to re-read: DROPPED -> OPEN is refused by the rule
+                // itself and will be refused identically forever. A code that
+                // invites a retry which can never succeed is worse than a plain
+                // refusal — a client obeying the contract loops.
                 rules::may_transition(from, to)
-                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+                let id = req.id.clone();
+                let expect_version = req.expect_version;
                 self.db
                     .clone()
-                    .update_task(db::UpdateTaskRequest {
-                        idempotency: req.idempotency,
-                        scope: req.scope,
-                        id: req.id.clone(),
-                        expect_version: req.expect_version,
-                        task: Some(db::Task {
-                            title: current.title,
-                            body: current.body,
-                            status: to as i32,
-                            ..Default::default()
-                        }),
-                        update_mask: None,
-                    })
+                    .update_task(writes::transition_request(req, &current, to))
                     .await
                     .map_err(|e| passthrough(e, "transition"))?;
 
                 let response = api::TransitionTaskResponse {
                     meta: Some(crate::pb::yadgar::common::v1::Meta {
-                        id: req.id,
-                        version: req.expect_version + 1,
+                        id,
+                        version: expect_version + 1,
                         ..Default::default()
                     }),
                     from: from as i32,
