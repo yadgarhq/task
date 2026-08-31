@@ -21,6 +21,10 @@ tonic = { version = "0.14", default-features = false, features = [
 tonic-prost = "0.14"
 # The shared instrumentation seam (D67). Pinned by revision, like every other
 # in-org crate — a branch is a moving target.
+# Client-side balancing, shared rather than copied. This began life as
+# src/balance.rs here; the gateway needed the identical logic and the invariant
+# is that anything every service needs is implemented once.
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "2c1aab6e2754317e9dcea53c1d8c2d37e5d10042" }
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1273e45e641c6af5187af1203dfb153d4369b5bc", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
