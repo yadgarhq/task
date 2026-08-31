@@ -8,6 +8,17 @@ kind: Service
 metadata:
   name: {{ .Chart.Name }}
 spec:
+  # HEADLESS (D23), so DNS returns every pod address rather than one virtual IP.
+  #
+  # This changed when the gateway became this service's first gRPC client. gRPC
+  # holds ONE long-lived HTTP/2 connection, so against a virtual IP the caller
+  # reaches whichever pod it connected to and every other replica sits idle while
+  # looking perfectly healthy — and D68's autoscaler answers the resulting latency
+  # by adding pods that also receive nothing.
+  #
+  # It was not wrong before: nothing called this service over gRPC, so nothing
+  # could be pinned. The Service had to change on the day it acquired a caller.
+  clusterIP: None
   selector:
     app: {{ .Chart.Name }}
   ports:

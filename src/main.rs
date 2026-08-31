@@ -3,7 +3,7 @@
 //!
 //! The twin's own boot is gated — probe, migrate, then listen (D69) — so a
 //! `-db` that is not ready has no DNS endpoint behind the headless Service, and
-//! `balance::connect` fails loudly. Blocking this service's startup on that would
+//! `yadgar_dial::connect` fails loudly. Blocking this service's startup on that would
 //! turn one module's slow migration into a cascading outage across everything
 //! that depends on it, and under D68 a pod stuck in startup is one the autoscaler
 //! cannot help. Failing a request with UNAVAILABLE is recoverable; refusing to
@@ -11,7 +11,6 @@
 
 use std::net::SocketAddr;
 
-use yadgar_task::balance;
 use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
 use yadgar_task::service::Task;
 
@@ -42,9 +41,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_host = env_or("TASK_DB_HOST", "task-db");
     let db_port: u16 = env_or("TASK_DB_PORT", "50051").parse()?;
 
-    let channel = balance::connect(&db_host, db_port).await?;
+    let channel = yadgar_dial::connect(&db_host, db_port).await?;
     tracing::info!(
-        reresolve_secs = balance::reresolve_interval().as_secs(),
+        reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
         "connected to task-db"
     );
 

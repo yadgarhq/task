@@ -8,7 +8,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod balance;
 pub mod rules;
 pub mod service;
 
