@@ -34,9 +34,45 @@ fn done_can_be_reopened() {
 fn dropped_is_terminal() {
     for to in [Open, InProgress, Blocked, Done] {
         let err = may_transition(Dropped, to).expect_err("nothing may come back from DROPPED");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("terminal"),
+            message.contains("terminal"),
             "the error must say why, not just refuse: {err}"
+        );
+        // Naming the status it is talking about is what makes this assertion
+        // discriminating. `contains("terminal")` on its own passed for EVERY
+        // refusal, because one message was returned for all of them.
+        assert!(
+            message.contains("TASK_STATUS_DROPPED"),
+            "the error must name the rule it is applying: {err}"
+        );
+    }
+}
+
+/// The table refuses both and nothing asserted it, so there was no way to tell a
+/// deliberate rule from a typo in the row.
+///
+/// A finished task is REOPENED before it moves anywhere else. Blocking something
+/// already done is meaningless, and dropping it erases that it was completed —
+/// either way the intermediate state is the record of what actually happened.
+#[test]
+fn a_done_task_must_be_reopened_before_it_moves_anywhere_else() {
+    for to in [Blocked, Dropped] {
+        let err = may_transition(Done, to).expect_err("the transition table refuses this");
+        let message = err.to_string();
+        assert!(
+            message.contains("TASK_STATUS_DONE"),
+            "the error must name what is being moved: {err}"
+        );
+        // This refusal has nothing to do with DROPPED being terminal, and saying
+        // so sends the reader off to the wrong rule.
+        assert!(
+            !message.contains("terminal"),
+            "DONE -> {to:?} is not the DROPPED rule: {err}"
+        );
+        assert!(
+            message.contains("TASK_STATUS_OPEN") && message.contains("TASK_STATUS_IN_PROGRESS"),
+            "a refusal must name the legal targets, or the caller is guessing: {err}"
         );
     }
 }
