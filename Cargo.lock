@@ -1381,7 +1381,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "yadgar-dial"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/dial.git?rev=2c1aab6e2754317e9dcea53c1d8c2d37e5d10042#2c1aab6e2754317e9dcea53c1d8c2d37e5d10042"
+source = "git+https://github.com/yadgarhq/dial.git?rev=abd9c3105f2a2746faa795c6d4936b0fb195f4a8#abd9c3105f2a2746faa795c6d4936b0fb195f4a8"
 dependencies = [
  "thiserror",
  "tokio",

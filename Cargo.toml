@@ -24,7 +24,7 @@ tonic-prost = "0.14"
 # Client-side balancing, shared rather than copied. This began life as
 # src/balance.rs here; the gateway needed the identical logic and the invariant
 # is that anything every service needs is implemented once.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "2c1aab6e2754317e9dcea53c1d8c2d37e5d10042" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "abd9c3105f2a2746faa795c6d4936b0fb195f4a8" }
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1694475a7eab9a8332f2955671987c57bf3234e8", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
