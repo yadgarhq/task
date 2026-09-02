@@ -39,6 +39,13 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `tests/service.rs` serves a scripted TaskDbService on loopback and points the
+# real handlers at it, so the codec, the trailers and the Status round-trip are
+# exercised rather than stubbed. `TcpListenerStream` is what lets the listener be
+# BOUND before it is served — picking a port and reopening it leaves a window in
+# which something else can take it. Already in the lock file by way of tonic, so
+# this adds no crate to the dependency graph.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -57,8 +57,26 @@ impl Task {
 /// `INTERNAL` would destroy that. The message is not passed through: it may name
 /// tables and columns, and a client of the public API has no business seeing the
 /// storage layer's vocabulary.
+///
+/// It IS logged, and that is not in tension with withholding it. Keeping the
+/// message out of the RESPONSE is the point; discarding it altogether leaves the
+/// operator with a code and no reason, and the log is the only place the reason
+/// survives at all. There is no redaction concern in doing so — the log never
+/// reaches the client.
+///
+/// The field is `db_message` rather than `message` because the event's own text
+/// is already emitted under `message`. Naming it that a second time produces a
+/// JSON object carrying the key TWICE, and no parser preserves a duplicate — each
+/// keeps one value and drops the other, so an operator loses either the store's
+/// reason or the words that say what the event is, with nothing to indicate
+/// which. Verified against the JSON formatter this binary installs, not assumed.
 fn passthrough(status: Status, op: &str) -> Status {
-    tracing::warn!(op, code = ?status.code(), "task-db returned an error");
+    tracing::warn!(
+        op,
+        code = ?status.code(),
+        db_message = status.message(),
+        "task-db returned an error"
+    );
     match status.code() {
         tonic::Code::NotFound => Status::not_found("no such task in this scope"),
         tonic::Code::FailedPrecondition => Status::failed_precondition(
@@ -300,6 +318,29 @@ impl TaskService for Task {
         .map(Response::new)
     }
 
+    /// KNOWN CONTRACT GAP, recorded here rather than papered over: on an
+    /// IDEMPOTENT REPLAY, `from` reports the status the task is already in.
+    ///
+    /// The read below runs before the write. On the retry of a transition that
+    /// was already applied, it returns the NEW status; `rules::may_transition`
+    /// waves `(to, to)` through as an identity no-op; `task-db` replays the
+    /// recorded response without writing; and `from` comes back equal to `to`.
+    ///
+    /// That is exactly the guarantee the field exists to give. `taskapi.proto`
+    /// says `from` is there "so a caller that raced another writer sees what
+    /// actually happened rather than assuming its own read was current" — and on
+    /// this path it carries no information at all.
+    ///
+    /// IT CANNOT BE FIXED HERE. Nothing this service can reach holds the prior
+    /// status. `UpdateTaskResponse` carries `meta` and nothing else, identically
+    /// at proto v1.2.0 and v1.6.0, and `task-db`'s idempotency row persists that
+    /// same response — so even a change confined to `-db` has nowhere to put the
+    /// answer. Closing it needs a new field on `UpdateTaskResponse` in
+    /// yadgarhq/proto first, after which the store's replay carries the true
+    /// predecessor and this handler reports it instead of its own read.
+    ///
+    /// Deriving one instead would be worse than the gap: several statuses lead to
+    /// any given target, so a guess is indistinguishable from an answer.
     async fn transition_task(
         &self,
         request: Request<api::TransitionTaskRequest>,
@@ -345,20 +386,25 @@ impl TaskService for Task {
                 rules::may_transition(from, to)
                     .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-                let id = req.id.clone();
-                let expect_version = req.expect_version;
-                self.db
+                // The STORE'S meta, as `edit_task` already does. This used to
+                // discard the response and synthesise one from the request —
+                // `id` from `req.id`, `version` from `expect_version + 1` — which
+                // asserted two things this service cannot know: that `-db`
+                // increments by exactly one, and that no other Meta field the
+                // store fills in differs from the zero value. On a replay the
+                // second is plainly false, since the version is the ORIGINAL
+                // write's and the project comes from the scope. A synthesised
+                // envelope is a guess wearing the shape of an answer.
+                let updated = self
+                    .db
                     .clone()
                     .update_task(writes::transition_request(req, &current, to))
                     .await
-                    .map_err(|e| passthrough(e, "transition"))?;
+                    .map_err(|e| passthrough(e, "transition"))?
+                    .into_inner();
 
                 let response = api::TransitionTaskResponse {
-                    meta: Some(crate::pb::yadgar::common::v1::Meta {
-                        id,
-                        version: expect_version + 1,
-                        ..Default::default()
-                    }),
+                    meta: updated.meta,
                     from: from as i32,
                 };
                 Ok(response)
