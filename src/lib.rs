@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod rules;
+pub mod serve;
 pub mod service;
 pub mod upstream;
 pub mod writes;

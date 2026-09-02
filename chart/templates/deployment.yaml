@@ -80,12 +80,32 @@ spec:
               value: {{ .Values.taskDb.tls.domain | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.tls.enabled }}
+            # THE OTHER DIRECTION: what a caller reaching THIS service gets.
+            # Rendered only when asked for, so a deployment that has not cut over
+            # sends the binary nothing and opens the cleartext listener it has
+            # always opened.
+            - name: SERVE_TLS_ENABLED
+              value: "1"
+            # PATHS, never an issuer-specific resource (D80). Two of them,
+            # because a certificate and its key are two files — and naming them
+            # separately is what lets the binary say WHICH of the two was missing
+            # when only half of a Secret mounted.
+            - name: SERVE_TLS_CERT_FILE
+              value: /var/run/config/serving-cert/tls.crt
+            - name: SERVE_TLS_KEY_FILE
+              value: /var/run/config/serving-cert/tls.key
+            {{- end }}
           # This service does NOT wait for task-db before listening, so the port
           # opening means "process up", not "dependency healthy" — deliberately.
           # Blocking startup on a -db that is still migrating would turn one
           # module's slow boot into a cascading outage, and a pod stuck in
           # startup is one D68's autoscaler cannot help. A request that cannot
           # reach the store fails with UNAVAILABLE, which is recoverable.
+          #
+          # A tcpSocket probe is still the right one once tls.enabled is set: it
+          # completes a TCP connection and no handshake, so it neither needs a
+          # certificate of its own nor cares which transport the port speaks.
           readinessProbe:
             tcpSocket:
               port: grpc
@@ -97,8 +117,9 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- if .Values.taskDb.tls.enabled }}
+          {{- if or .Values.taskDb.tls.enabled .Values.tls.enabled }}
           volumeMounts:
+            {{- if .Values.taskDb.tls.enabled }}
             # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
             # copy that kubelet never refreshes, so the bundle would freeze at
             # whatever it was when the pod started and a rotated authority would
@@ -106,9 +127,19 @@ spec:
             - name: task-db-ca
               mountPath: /var/run/config/task-db-ca
               readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            # A DIRECTORY MOUNT for the same reason, and here it matters more: a
+            # frozen serving certificate EXPIRES, and every caller starts
+            # refusing this pod on a date nobody is watching.
+            - name: serving-cert
+              mountPath: /var/run/config/serving-cert
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if .Values.taskDb.tls.enabled }}
+      {{- if or .Values.taskDb.tls.enabled .Values.tls.enabled }}
       volumes:
+        {{- if .Values.taskDb.tls.enabled }}
         - name: task-db-ca
           secret:
             secretName: {{ required "taskDb.tls.caSecret holds the CA bundle task-db is verified against and must be set whenever taskDb.tls.enabled is; see the chart's values.yaml" .Values.taskDb.tls.caSecret }}
@@ -130,4 +161,28 @@ spec:
             items:
               - key: {{ required "taskDb.tls.caSecretKey names the key inside taskDb.tls.caSecret that holds the CA bundle and must be set whenever taskDb.tls.enabled is; see the chart's values.yaml" .Values.taskDb.tls.caSecretKey | quote }}
                 path: ca.pem
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: serving-cert
+          secret:
+            secretName: {{ required "tls.certSecret holds the certificate and private key this service presents and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecret }}
+            # OPTIONAL, for the same reason as above: it decides WHICH error the
+            # operator gets. A required mount that cannot be satisfied leaves the
+            # pod in ContainerCreating with a FailedMount event about a volume.
+            # An optional one mounts an empty directory, the binary finds no file
+            # at SERVE_TLS_CERT_FILE, and it exits at boot naming THAT PATH and
+            # saying that TLS was asked for so a plaintext listener is not the
+            # answer. Neither starts; only one of them explains itself.
+            optional: true
+            # NAMED KEYS rather than the whole Secret. An issuer's Secret also
+            # carries `ca.crt`, which this pod has no use for, and selecting the
+            # two it does need is what renames whatever the issuer called them to
+            # the `tls.crt` and `tls.key` that SERVE_TLS_CERT_FILE and
+            # SERVE_TLS_KEY_FILE name.
+            items:
+              - key: {{ required "tls.certSecretKey names the key inside tls.certSecret that holds the certificate and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecretKey | quote }}
+                path: tls.crt
+              - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
+                path: tls.key
+        {{- end }}
       {{- end }}

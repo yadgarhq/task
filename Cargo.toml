@@ -17,6 +17,16 @@ tonic = { version = "0.14", default-features = false, features = [
   "server",
   "transport",
   "channel",
+  # `tls-ring`, NOT `tls-aws-lc`. aws-lc-rs needs cmake and a C toolchain, and
+  # this binary builds for x86_64-unknown-linux-musl (D63) — the same provider
+  # yadgar-dial picks, so cargo's feature unification cannot end up asking for
+  # both.
+  #
+  # NAMED HERE rather than inherited from yadgar-dial. This crate serves TLS of
+  # its own now, so it needs the feature whether or not the dial crate happens to
+  # enable it — a dependency's feature is not something this code may rely on. It
+  # adds no crate: `ring` has been in the lock file since the dial pin moved.
+  "tls-ring",
 ] }
 tonic-prost = "0.14"
 # The shared instrumentation seam (D67). Pinned by revision, like every other
@@ -46,6 +56,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # which something else can take it. Already in the lock file by way of tonic, so
 # this adds no crate to the dependency graph.
 tokio-stream = { version = "0.1", features = ["net"] }
+# `tests/serve_tls.rs` proves the serving transport with REAL handshakes, so it
+# needs a certificate authority and a server certificate. They are MINTED PER
+# RUN rather than checked in: a fixture key in the repository is a secret in the
+# repository, and it expires on a date nobody is watching. Same crate and same
+# features yadgar-dial uses for the client half of this seam.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 
 [lints.rust]
 unsafe_code = "forbid"
