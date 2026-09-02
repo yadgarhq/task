@@ -32,7 +32,12 @@ taskDb:
 # instrumentation actually exposes today, and pretending otherwise would give a
 # scaler that reads nothing. Stated here rather than silently substituted.
 autoscaling:
-  enabled: true
+  # D80: KEDA's CRD is not something every adopter has installed. `false` here
+  # is the chart's own default so `helm template`/`helm install` succeed on a
+  # bare cluster; the reference deployment in yadgarhq/deploy sets this true
+  # (autoscaling.enabled=true in its values for this chart) to get the scaling
+  # behaviour described above.
+  enabled: false
   minReplicas: 2
   # At least two, always (D55) — the floor is a correctness property, not a
   # tuning knob: one replica makes a class of defect unreachable.
