@@ -9,17 +9,18 @@
 //! cannot help. Failing a request with UNAVAILABLE is recoverable; refusing to
 //! start is not.
 //!
-//! **The TRANSPORT to `task-db` is a different rule again, and it fails boot.**
-//! A CA bundle that is missing, undecodable or empty is a deployment mistake
-//! rather than an outage, so D69's rule applies and the process refuses to
-//! start — the same treatment `YADGAR_MAX_REPLICAS` and `YADGAR_RATE_LIMITS`
-//! already get in the gateway. Connecting in cleartext instead is the silent
-//! downgrade this whole change exists to remove, so there is no path here that
-//! does it.
+//! **The TRANSPORT is a different rule again, in BOTH directions, and it fails
+//! boot.** A CA bundle or a serving certificate that is missing, undecodable or
+//! mismatched is a deployment mistake rather than an outage, so D69's rule
+//! applies and the process refuses to start — the same treatment
+//! `YADGAR_MAX_REPLICAS` and `YADGAR_RATE_LIMITS` already get in the gateway.
+//! Dialling or listening in cleartext instead is the silent downgrade this whole
+//! change exists to remove, so there is no path here that does it.
 
 use std::net::SocketAddr;
 
 use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
+use yadgar_task::serve::{self, ServeTls, SERVE};
 use yadgar_task::service::Task;
 use yadgar_task::upstream::{self, UpstreamTls, TASK_DB};
 
@@ -44,6 +45,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // FIRST, before a socket of any kind is opened. The identity this service
+    // presents is read and CHECKED here — the PEM decoded, the certificate
+    // matched against its key — so a deployment that asked for TLS and got the
+    // mount wrong exits now rather than after something is already listening.
+    //
+    // `serve::builder` is the only server construction in this binary, which is
+    // structural rather than tidy: the downgrade this car removes is a listener
+    // that opens in cleartext because TLS configuration failed, and with one
+    // construction site there is nowhere else to write it.
+    let tls = ServeTls::from_env(SERVE).map_err(|e| e.to_string())?;
+    let mut server = serve::builder(tls.as_ref()).map_err(|e| e.to_string())?;
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
@@ -84,8 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
-    tracing::info!(%addr, "task listening");
-    tonic::transport::Server::builder()
+    tracing::info!(%addr, tls = tls.is_some(), "task listening");
+    server
         .add_service(TaskServiceServer::new(Task::new(channel)))
         .serve_with_shutdown(addr, async {
             let _ = tokio::signal::ctrl_c().await;
