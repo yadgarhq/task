@@ -42,7 +42,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::{http, Service};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
-use yadgar_task::serve::{self, ServeTls, ServeTlsError, SERVE};
+use yadgar_task::serve::{self, ServeTls, ServeTlsError, LISTEN};
 
 /// The name the test certificates are issued for, and the name the rig listens
 /// on.
@@ -116,10 +116,10 @@ impl Drop for TempPem {
 fn serve_tls(cert: &Path, key: &Path) -> ServeTls {
     let cert = cert.display().to_string();
     let key = key.display().to_string();
-    ServeTls::from_lookup(SERVE, |k| match k {
-        "SERVE_TLS_ENABLED" => Some("1".to_string()),
-        "SERVE_TLS_CERT_FILE" => Some(cert.clone()),
-        "SERVE_TLS_KEY_FILE" => Some(key.clone()),
+    ServeTls::from_lookup(LISTEN, |k| match k {
+        "LISTEN_TLS_ENABLED" => Some("1".to_string()),
+        "LISTEN_TLS_CERT_FILE" => Some(cert.clone()),
+        "LISTEN_TLS_KEY_FILE" => Some(key.clone()),
         _ => None,
     })
     .expect("a certificate and a key enable TLS")

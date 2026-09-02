@@ -28,21 +28,38 @@
 //! tonic's `ServerTlsConfig::client_ca_root` plus one more path, and it is left
 //! unbuilt deliberately: every client would need an issued certificate before it
 //! could be turned on, which is a decision rather than a line of code.
+//!
+//! # Shutdown
+//!
+//! [`shutdown`] is here rather than in `main` for the same reason [`builder`] is:
+//! a decision inside a binary entry point is one no test can reach, and which
+//! signals end this process is exactly the kind that fails silently. It listened
+//! for SIGINT alone while Kubernetes sends SIGTERM.
 
 use std::path::{Path, PathBuf};
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-/// The environment variables this service's own listener is configured from.
+/// The environment variables this service's own listener is configured from:
+/// `LISTEN_TLS_ENABLED`, `LISTEN_TLS_CERT_FILE` and `LISTEN_TLS_KEY_FILE`.
 ///
 /// Built from a PREFIX rather than written out three times, so the naming stays
-/// mechanical: `<PREFIX>_TLS_ENABLED`, `<PREFIX>_TLS_CERT_FILE` and
-/// `<PREFIX>_TLS_KEY_FILE`. `SERVE` rather than the bare names, because
-/// [`crate::upstream`] reads `TASK_DB_TLS_*` for the hop it dials and a bare
-/// `TLS_ENABLED` would be ambiguous between the two — `upstream`'s
-/// `another_upstreams_variables_do_not_configure_this_one` pins that a bare
-/// prefix configures nothing.
-pub const SERVE: &str = "SERVE";
+/// mechanical.
+///
+/// **THE PREFIX NAMES THE THING BEING CONFIGURED, and it is derived rather than
+/// chosen.** `LISTEN` is already the variable holding the address this service
+/// binds, so the listener's transport keys extend a name that exists. A dial is
+/// named for the upstream it reaches, which is why [`crate::upstream`] reads
+/// `TASK_DB_TLS_*`. `SERVE` — what this constant used to be — invented a second
+/// word for the listener and so described nothing the process otherwise had, and
+/// `iam` derived `LISTEN` independently for the identical seam. One idea spelled
+/// two ways across the estate is its own defect.
+///
+/// A bare `TLS_ENABLED` is ambiguous between the two directions, which is what
+/// makes a prefix necessary at all — `the_upstreams_variables_do_not_configure_the_listener`
+/// below and `upstream`'s `another_upstreams_variables_do_not_configure_this_one`
+/// pin both halves of that.
+pub const LISTEN: &str = "LISTEN";
 
 /// What a deployment got wrong about the transport, before anything is bound.
 ///
@@ -230,6 +247,51 @@ pub fn builder(tls: Option<&ServeTls>) -> Result<Server, ServeTlsError> {
         })
 }
 
+/// The future `serve_with_shutdown` drains on: SIGTERM, and SIGINT beside it.
+///
+/// **SIGTERM IS THE ONE THAT MATTERS, and it was the one missing.** Kubernetes
+/// ends a pod by sending SIGTERM and waiting out `terminationGracePeriodSeconds`
+/// before SIGKILL; it never sends SIGINT. This binary listened for `ctrl_c()`
+/// alone, so on every rolling update the drain was simply never reached — the
+/// process ran until the kill, and whatever was in flight died with it. D23
+/// makes that worse rather than milder: each caller holds ONE long-lived HTTP/2
+/// connection, so the requests lost are not a thin slice of traffic but
+/// everything that connection was carrying.
+///
+/// SIGINT is kept because it is what a terminal sends, and losing the local
+/// behaviour to fix the deployed one would be a poor trade.
+///
+/// **BOTH HANDLERS ARE REGISTERED BEFORE THIS RETURNS, and that is the reason
+/// this is a function returning a future rather than an `async fn`.** Installing
+/// a handler is what replaces the signal's default disposition, which for
+/// SIGTERM is "terminate the process". An `async fn` registers nothing until it
+/// is first polled, so a signal arriving in the window between spawning the
+/// server and the executor reaching the shutdown future would kill the process
+/// outright — the precise failure this exists to prevent, reintroduced as a
+/// race. `tests/shutdown.rs` raises SIGTERM after this call and before the
+/// future is awaited, so that window is what it measures.
+///
+/// The error is an `io::Error` because registration can fail, and `main` refuses
+/// to start on it. A server that cannot hear SIGTERM is one that cannot drain,
+/// and starting anyway would hide that until the next rollout.
+pub fn shutdown() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+
+    Ok(async move {
+        let signal = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        // NAMED, because the two arrive for different reasons: SIGTERM is a
+        // rollout or an eviction and SIGINT is a person at a terminal. An
+        // operator reading why a pod went away wants to know which.
+        tracing::info!(signal, "draining in-flight requests before shutting down");
+    })
+}
+
 /// Flatten an error and everything under it into one sentence.
 ///
 /// `tonic::transport::Error` displays as "transport error" and keeps what
@@ -271,7 +333,7 @@ mod tests {
     /// configured means the cleartext listener, unchanged.
     #[test]
     fn nothing_configured_means_no_tls() {
-        assert_eq!(ServeTls::from_lookup(SERVE, lookup(&[])).unwrap(), None);
+        assert_eq!(ServeTls::from_lookup(LISTEN, lookup(&[])).unwrap(), None);
     }
 
     /// A certificate without the flag is the REVERTED state, not an error. The
@@ -279,10 +341,10 @@ mod tests {
     #[test]
     fn a_certificate_alone_does_not_enable_tls() {
         let vars = [
-            ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
-            ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
+            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
         ];
-        assert_eq!(ServeTls::from_lookup(SERVE, lookup(&vars)).unwrap(), None);
+        assert_eq!(ServeTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
     }
 
     /// Anything but "1" is off. A permissive parse is how a setting meant to be
@@ -292,12 +354,12 @@ mod tests {
     fn only_exactly_one_enables_tls() {
         for value in ["0", "false", "no", "true", "yes", "", " "] {
             let vars = [
-                ("SERVE_TLS_ENABLED", value),
-                ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
-                ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+                ("LISTEN_TLS_ENABLED", value),
+                ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
+                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
             ];
             assert_eq!(
-                ServeTls::from_lookup(SERVE, lookup(&vars)).unwrap(),
+                ServeTls::from_lookup(LISTEN, lookup(&vars)).unwrap(),
                 None,
                 "{value:?} must not enable TLS"
             );
@@ -311,24 +373,24 @@ mod tests {
     fn asking_for_tls_without_a_certificate_is_an_error() {
         for vars in [
             vec![
-                ("SERVE_TLS_ENABLED", "1"),
-                ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+                ("LISTEN_TLS_ENABLED", "1"),
+                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
             ],
             vec![
-                ("SERVE_TLS_ENABLED", "1"),
-                ("SERVE_TLS_CERT_FILE", ""),
-                ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+                ("LISTEN_TLS_ENABLED", "1"),
+                ("LISTEN_TLS_CERT_FILE", ""),
+                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
             ],
             vec![
-                ("SERVE_TLS_ENABLED", "1"),
-                ("SERVE_TLS_CERT_FILE", "   "),
-                ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+                ("LISTEN_TLS_ENABLED", "1"),
+                ("LISTEN_TLS_CERT_FILE", "   "),
+                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
             ],
         ] {
             assert!(
                 matches!(
-                    ServeTls::from_lookup(SERVE, lookup(&vars)),
-                    Err(ServeTlsError::NoCertFile("SERVE"))
+                    ServeTls::from_lookup(LISTEN, lookup(&vars)),
+                    Err(ServeTlsError::NoCertFile("LISTEN"))
                 ),
                 "{vars:?} must be refused, not silently downgraded"
             );
@@ -341,19 +403,19 @@ mod tests {
     fn asking_for_tls_without_a_private_key_is_an_error() {
         for vars in [
             vec![
-                ("SERVE_TLS_ENABLED", "1"),
-                ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
+                ("LISTEN_TLS_ENABLED", "1"),
+                ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
             ],
             vec![
-                ("SERVE_TLS_ENABLED", "1"),
-                ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
-                ("SERVE_TLS_KEY_FILE", "   "),
+                ("LISTEN_TLS_ENABLED", "1"),
+                ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
+                ("LISTEN_TLS_KEY_FILE", "   "),
             ],
         ] {
             assert!(
                 matches!(
-                    ServeTls::from_lookup(SERVE, lookup(&vars)),
-                    Err(ServeTlsError::NoKeyFile("SERVE"))
+                    ServeTls::from_lookup(LISTEN, lookup(&vars)),
+                    Err(ServeTlsError::NoKeyFile("LISTEN"))
                 ),
                 "{vars:?} must be refused, not silently downgraded"
             );
@@ -365,11 +427,11 @@ mod tests {
     #[test]
     fn the_certificate_and_the_key_both_arrive() {
         let vars = [
-            ("SERVE_TLS_ENABLED", "1"),
-            ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
-            ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+            ("LISTEN_TLS_ENABLED", "1"),
+            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
+            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
         ];
-        let tls = ServeTls::from_lookup(SERVE, lookup(&vars))
+        let tls = ServeTls::from_lookup(LISTEN, lookup(&vars))
             .unwrap()
             .expect("a flag, a certificate and a key enable TLS");
         assert_eq!(tls.cert_file(), Path::new(SENTINEL_CERT));
@@ -388,6 +450,6 @@ mod tests {
             ("TLS_ENABLED", "1"),
             ("TLS_CERT_FILE", SENTINEL_CERT),
         ];
-        assert_eq!(ServeTls::from_lookup(SERVE, lookup(&vars)).unwrap(), None);
+        assert_eq!(ServeTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
     }
 }

@@ -20,7 +20,7 @@
 use std::net::SocketAddr;
 
 use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
-use yadgar_task::serve::{self, ServeTls, SERVE};
+use yadgar_task::serve::{self, ServeTls, LISTEN};
 use yadgar_task::service::Task;
 use yadgar_task::upstream::{self, UpstreamTls, TASK_DB};
 
@@ -55,13 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // structural rather than tidy: the downgrade this car removes is a listener
     // that opens in cleartext because TLS configuration failed, and with one
     // construction site there is nowhere else to write it.
-    let tls = ServeTls::from_env(SERVE).map_err(|e| e.to_string())?;
+    let tls = ServeTls::from_env(LISTEN).map_err(|e| e.to_string())?;
     let mut server = serve::builder(tls.as_ref()).map_err(|e| e.to_string())?;
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
     let db_host = env_or("TASK_DB_HOST", "task-db");
-    let db_port: u16 = env_or("TASK_DB_PORT", "50051").parse()?;
+    // STRINGIFIED AND NAMED, for the same reason as every other error in this
+    // function: `main` returns `Box<dyn Error>`, which Rust prints with DEBUG. A
+    // bare `?` here yields `ParseIntError { kind: InvalidDigit }`, and the two
+    // addresses below yield `AddrParseError(())` — a CrashLoop whose entire
+    // output is `AddrParseError(())` tells an operator neither which variable was
+    // wrong nor what it held. These three were the last bare `?`s left beside the
+    // comments explaining why nothing else is one.
+    let db_port: u16 = env_or("TASK_DB_PORT", "50051")
+        .parse()
+        .map_err(|e| format!("TASK_DB_PORT is not a port number: {e}"))?;
 
     // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
     // the cleartext dial this service has always done — no server in the estate
@@ -91,19 +100,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
     // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_or("METRICS_LISTEN", "0.0.0.0:9090").parse()?;
+    // Named on the way out, for the reason given on TASK_DB_PORT above.
+    let metrics_addr: SocketAddr = env_or("METRICS_LISTEN", "0.0.0.0:9090")
+        .parse()
+        .map_err(|e| format!("METRICS_LISTEN is not a host:port address: {e}"))?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
 
-    let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
+    // Named on the way out, for the reason given on TASK_DB_PORT above.
+    let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052")
+        .parse()
+        .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
+
+    // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
+    // than an accident of where the line sits. `serve::shutdown` installs both
+    // signal handlers when it is CALLED — a SIGTERM arriving between here and
+    // the first poll of the future would otherwise take the process's default
+    // disposition and kill it outright.
+    let shutdown = serve::shutdown().map_err(|e| {
+        format!("the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one")
+    })?;
+
     tracing::info!(%addr, tls = tls.is_some(), "task listening");
     server
         .add_service(TaskServiceServer::new(Task::new(channel)))
-        .serve_with_shutdown(addr, async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
+        .serve_with_shutdown(addr, shutdown)
         .await?;
 
     Ok(())

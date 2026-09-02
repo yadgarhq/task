@@ -88,6 +88,26 @@ fn passthrough(status: Status, op: &str) -> Status {
         // reason `-db` distinguishes it at all: this is the one storage failure
         // a caller can act on, and the action is to send the request again.
         tonic::Code::Aborted => Status::aborted("the write raced another one — retry"),
+        // THE STORE WAS UNREACHABLE, WHICH IS THE ONE FAILURE THIS SERVICE
+        // ALREADY PROMISES TO REPORT AS ITSELF.
+        //
+        // Three places state the contract, and none of them was true: `main.rs`'s
+        // module doc ("Failing a request with UNAVAILABLE is recoverable"),
+        // `README.md`'s "It does not wait for task-db to be ready", and the
+        // readiness-probe comment in `chart/templates/deployment.yaml`. All three
+        // rest on the same design — this service deliberately does NOT block its
+        // boot on the twin (D69), and the whole justification for that is that a
+        // request arriving before `task-db` is reachable fails RECOVERABLY. The
+        // `_ =>` arm below collapsed it into INTERNAL, so the recoverable failure
+        // was indistinguishable from a bug and no client would retry it.
+        //
+        // DEADLINE_EXCEEDED belongs with it rather than with the opaque arm: the
+        // store did not refuse the work, it did not answer in time — which is a
+        // transient condition of the same shape, and one a caller can act on
+        // identically.
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+            Status::unavailable("the task store could not be reached in time — retry")
+        }
         _ => Status::internal("the task store is unavailable"),
     }
 }
@@ -270,7 +290,21 @@ impl TaskService for Task {
 
         call.run(
             async move {
-                if req.title.trim().is_empty() {
+                // THE MASK FIRST, before the store is touched at all. Resolving it
+                // is a pure decision about the request, so a mask naming a field
+                // no edit may write is refused here rather than after a `get_task`
+                // round trip whose answer was always going to be discarded.
+                let paths = writes::requested_paths(req.update_mask.as_ref())?;
+
+                // THE TITLE RULE, and it applies only to an edit that WRITES a
+                // title. It used to run before the mask was resolved, which made a
+                // body-only edit impossible: `EditTaskRequest.title` is empty when
+                // a caller does not intend to change it, and this refused the call
+                // over a value it was never going to store. The rule itself is
+                // unchanged — an untitled task is unfindable by the humans who
+                // have to triage it — it simply now applies where a title is
+                // actually at stake.
+                if paths.contains(&"title") && req.title.trim().is_empty() {
                     return Err(Status::invalid_argument("a task needs a title"));
                 }
 
@@ -279,7 +313,8 @@ impl TaskService for Task {
                 // written. Its STATUS is no longer what keeps an edit from
                 // changing one — `writes::edit_request` masks the column out, so
                 // the rule is in the request rather than in this handler's
-                // discipline.
+                // discipline. It now also supplies the fields the mask does NOT
+                // name, for the rollout reason `edit_request` documents.
                 let current = self
                     .db
                     .clone()
@@ -296,7 +331,7 @@ impl TaskService for Task {
                 let updated = self
                     .db
                     .clone()
-                    .update_task(writes::edit_request(req, current.status)?)
+                    .update_task(writes::edit_request(req, &current, &paths))
                     .await
                     .map_err(|e| passthrough(e, "edit"))?
                     .into_inner();
@@ -386,6 +421,55 @@ impl TaskService for Task {
                 rules::may_transition(from, to)
                     .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+                // THE WRITE BELOW CARRIES `req.expect_version`, NOT
+                // `current.meta.version`, AND THAT IS DELIBERATE. A scanner reads
+                // the read-then-check-then-write above as a race and proposes
+                // substituting the version just read. Doing so would introduce a
+                // real defect, so the reasoning is recorded here rather than left
+                // to be rediscovered.
+                //
+                // `expect_version` is the CALLER'S claim about what it saw. It is
+                // the compare half of a compare-and-set, and it exists to refuse a
+                // caller that acted on a stale read. Replacing it with a version
+                // this service read microseconds ago launders a stale expectation
+                // into a fresh one: a write that must be refused would then
+                // succeed, and the caller would never learn it had overwritten
+                // somebody else's change.
+                //
+                // THERE IS NO ARM THAT SKIPS THE COMPARE. `task-db`'s
+                // `write.rs::update` binds `expect_version` into the WHERE clause
+                // of every UPDATE — `WHERE id = ? AND version = ? AND deleted_at
+                // IS NULL AND <reach>` — and a mismatch makes `rows_affected()`
+                // zero, which it turns into FAILED_PRECONDITION. Zero is not a
+                // wildcard there; it is simply a version no row holds.
+                //
+                // A SECOND CHECK HERE WOULD CATCH NOTHING. Only the comparison
+                // inside the store's transaction is atomic with the write. One
+                // added here passes in exactly the cases the CAS passes, and in
+                // the racing case — a writer committing between this read and that
+                // UPDATE — it passes too, because it is reading the same stale row.
+                //
+                // THE CAS IS ALSO WHAT MAKES THE RULE CHECK ABOVE SOUND. Any
+                // change that could invalidate `may_transition(from, to)` is a
+                // change of STATUS, a status change is a write, and every write
+                // bumps `version` — so the racing writer this handler cannot see
+                // is one the CAS refuses on its behalf.
+                //
+                // ONE LOOSE END, AND IT IS IN EXACTLY ONE PLACE. A review claimed
+                // `expect_version + 1` is live code both here and in
+                // `task-db/src/write.rs`. IT IS NOT. In THIS crate the expression
+                // survives only as the WORDS of the comment directly below, which
+                // describes what this handler used to do and no longer does;
+                // there is no such arithmetic on any executable line here.
+                //
+                // In `task-db/src/write.rs` it IS live: the SQL sets `version =
+                // version + 1`, and the response's `Meta.version` is then computed
+                // as `req.expect_version + 1` rather than read back. That is
+                // correct only BECAUSE the CAS guarantees the stored version
+                // equalled `expect_version`. If that side is ever changed to read
+                // the version back, the change belongs there alone — this
+                // repository holds no second copy to keep in step.
+                //
                 // The STORE'S meta, as `edit_task` already does. This used to
                 // discard the response and synthesise one from the request —
                 // `id` from `req.id`, `version` from `expect_version + 1` — which
