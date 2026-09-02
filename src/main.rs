@@ -8,11 +8,20 @@
 //! that depends on it, and under D68 a pod stuck in startup is one the autoscaler
 //! cannot help. Failing a request with UNAVAILABLE is recoverable; refusing to
 //! start is not.
+//!
+//! **The TRANSPORT to `task-db` is a different rule again, and it fails boot.**
+//! A CA bundle that is missing, undecodable or empty is a deployment mistake
+//! rather than an outage, so D69's rule applies and the process refuses to
+//! start — the same treatment `YADGAR_MAX_REPLICAS` and `YADGAR_RATE_LIMITS`
+//! already get in the gateway. Connecting in cleartext instead is the silent
+//! downgrade this whole change exists to remove, so there is no path here that
+//! does it.
 
 use std::net::SocketAddr;
 
 use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
 use yadgar_task::service::Task;
+use yadgar_task::upstream::{self, UpstreamTls, TASK_DB};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -41,9 +50,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_host = env_or("TASK_DB_HOST", "task-db");
     let db_port: u16 = env_or("TASK_DB_PORT", "50051").parse()?;
 
-    let channel = yadgar_dial::connect(&db_host, db_port).await?;
+    // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
+    // the cleartext dial this service has always done — no server in the estate
+    // serves TLS yet, so the cut-over is a later change that can be reverted on
+    // its own.
+    //
+    // `.to_string()` on the way out, and not decoration: `main` returns
+    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
+    // `NoCaFile("TASK_DB")` on the operator's terminal instead of the sentence
+    // saying which variable is missing and why cleartext is not the answer. The
+    // same reason the gateway stringifies `Limits::parse`.
+    let db_tls = UpstreamTls::from_env(TASK_DB).map_err(|e| e.to_string())?;
+    let channel = upstream::connect(&db_host, db_port, db_tls.as_ref())
+        .await
+        // Same reasoning, and it matters more here: `BalanceError`'s messages
+        // are paragraphs explaining that an empty bundle trusts nobody and that
+        // a missing one is not a reason to connect in cleartext. Debug prints
+        // the struct and throws all of that away.
+        .map_err(|e| e.to_string())?;
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
+        tls = db_tls.is_some(),
         "connected to task-db"
     );
 

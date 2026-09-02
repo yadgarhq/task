@@ -57,6 +57,29 @@ spec:
               value: {{ .Values.taskDb.host | quote }}
             - name: TASK_DB_PORT
               value: {{ .Values.taskDb.port | quote }}
+            {{- if .Values.taskDb.tls.enabled }}
+            # RENDERED ONLY WHEN TLS IS ASKED FOR, so a deployment that has not
+            # cut over sends the binary nothing at all and takes the cleartext
+            # path it always took. The same shape as the gateway's
+            # trustUnauthenticatedHeaders: absence is the default, and the flag
+            # is the whole of the lever.
+            - name: TASK_DB_TLS_ENABLED
+              value: "1"
+            # A PATH, never an issuer-specific resource (D80). cert-manager
+            # writes this file in the reference deployment and a hand-assembled
+            # Secret writes it anywhere else; neither the chart nor the binary
+            # can tell the difference, which is the point.
+            - name: TASK_DB_TLS_CA_FILE
+              value: /var/run/config/task-db-ca/ca.pem
+            {{- if .Values.taskDb.tls.domain }}
+            # Only when the certificate names something other than the Service.
+            # Unset means "verify against taskDb.host", which is what makes a
+            # certificate issued for the Service name work while the balancer
+            # dials pod addresses.
+            - name: TASK_DB_TLS_DOMAIN
+              value: {{ .Values.taskDb.tls.domain | quote }}
+            {{- end }}
+            {{- end }}
           # This service does NOT wait for task-db before listening, so the port
           # opening means "process up", not "dependency healthy" — deliberately.
           # Blocking startup on a -db that is still migrating would turn one
@@ -74,3 +97,37 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+          {{- if .Values.taskDb.tls.enabled }}
+          volumeMounts:
+            # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
+            # copy that kubelet never refreshes, so the bundle would freeze at
+            # whatever it was when the pod started and a rotated authority would
+            # never reach this process.
+            - name: task-db-ca
+              mountPath: /var/run/config/task-db-ca
+              readOnly: true
+          {{- end }}
+      {{- if .Values.taskDb.tls.enabled }}
+      volumes:
+        - name: task-db-ca
+          secret:
+            secretName: {{ required "taskDb.tls.caSecret holds the CA bundle task-db is verified against and must be set whenever taskDb.tls.enabled is; see the chart's values.yaml" .Values.taskDb.tls.caSecret }}
+            # OPTIONAL, and that is not laxity — it is which error the operator
+            # gets. A required mount that cannot be satisfied leaves the pod in
+            # ContainerCreating with a FailedMount event about a volume. An
+            # optional one mounts an empty directory, the binary finds no file
+            # at TASK_DB_TLS_CA_FILE, and it exits at boot naming THAT PATH and
+            # saying that TLS was asked for so cleartext is not the answer.
+            # Neither starts; only one of them explains itself. There is no
+            # third outcome in which this pod serves traffic over an
+            # unencrypted connection it was told to encrypt.
+            optional: true
+            # ONE KEY, not the whole Secret. The Secret this usually names also
+            # holds a PRIVATE KEY, and this pod has no business being able to
+            # read it. Selecting a single key is what keeps it out, and it is
+            # also what renames whatever the issuer called it to the `ca.pem`
+            # that TASK_DB_TLS_CA_FILE names.
+            items:
+              - key: {{ required "taskDb.tls.caSecretKey names the key inside taskDb.tls.caSecret that holds the CA bundle and must be set whenever taskDb.tls.enabled is; see the chart's values.yaml" .Values.taskDb.tls.caSecretKey | quote }}
+                path: ca.pem
+      {{- end }}

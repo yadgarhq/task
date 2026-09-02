@@ -10,6 +10,7 @@
 
 pub mod rules;
 pub mod service;
+pub mod upstream;
 pub mod writes;
 
 /// Generated from the vendored contract (D16, D70). The module tree mirrors the

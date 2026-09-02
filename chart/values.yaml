@@ -23,6 +23,51 @@ taskDb:
   host: task-db
   port: 50051
 
+  # The TRANSPORT to that twin. Everything in the cluster is cleartext today,
+  # so a bearer token and every task body cross the pod network in the open;
+  # this is the seam that closes it, one hop at a time.
+  #
+  # PATHS AND A FLAG, NEVER AN ISSUER-SPECIFIC RESOURCE (D80). The chart names a
+  # Secret and a key inside it, and the binary is handed a file path. In the
+  # reference deployment cert-manager writes that Secret; on EKS a Secret
+  # assembled by hand produces something neither the chart nor the binary can
+  # tell apart. Nothing here requires a CRD, an issuer or a mesh.
+  tls:
+    # OFF, and it stays off until the servers can answer. **task-db does not
+    # serve TLS yet**, so turning this on today breaks the hop rather than
+    # securing it. The code ships first and the cut-over is a separate,
+    # revertible change — the same discipline the attestation cut-over used.
+    #
+    # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at
+    # boot naming the file; it never falls back to cleartext, and it never falls
+    # back to the platform trust store. `false` with a bundle still configured
+    # is the reverted state, and task logs a warning saying the hop is in
+    # cleartext so nobody has to infer it.
+    enabled: false
+    # The Secret holding the authority that signed task-db's certificate.
+    #
+    # A SECRET, THOUGH A CA IS PUBLIC — because that is where an issuer actually
+    # writes it. Reading it here claims no confidentiality the certificate does
+    # not have.
+    #
+    # NOT A PEM PASTED INTO THIS FILE. The authority rotates, and a copy in git
+    # is correct only until the rotation nobody remembered to follow.
+    caSecret: task-db-tls
+    # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
+    # Named rather than assumed: `ca.crt` is what cert-manager calls it, and a
+    # Secret assembled by hand for a deployment cert-manager does not run in is
+    # free to call it something else.
+    caSecretKey: ca.crt
+    # The name task-db's certificate is verified against, when it is NOT
+    # `taskDb.host`.
+    #
+    # EMPTY IS THE RIGHT ANSWER ALMOST ALWAYS. Client-side balancing dials pod
+    # ADDRESSES, and a certificate names a HOST — so leaving this empty verifies
+    # against the Service name above, which is what lets one certificate issued
+    # for the Service work across every pod behind it. Set it only for a
+    # certificate issued for something else, such as a per-namespace FQDN.
+    domain: ""
+
 # D68: scale on CONCURRENCY, not CPU. A -db waits on MariaDB and a logic service
 # waits on its -db, so both saturate at low CPU — a CPU-driven HPA stays quiet
 # exactly when the system is in trouble.
