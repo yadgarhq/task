@@ -1,6 +1,15 @@
 // Shared envelope and scope types. Every module imports this and nothing else
 // from outside its own package.
 //
+// ONE EXCEPTION, recorded HERE because a reader of the rule above will not open
+// the files that break it: yadgar/iam/v1 and yadgar/iamdb/v1 also import
+// yadgar/telemetry/v1, for D67's `Kind`. D74 keys a rate limit on that existing
+// bounded dimension rather than on a second taxonomy, and `buf breaking`'s FILE
+// rule means the enum cannot be moved into this file without breaking the
+// contract. Both files carry the full reasoning. The practical consequence is
+// that a consumer vendoring `iam` now vendors `telemetry` too, because
+// `buf export` follows the import graph.
+//
 // Field numbers 1-15 encode in one byte, so the envelope fields that appear on
 // every row are kept inside that range. 13-15 are reserved for envelope growth;
 // entity-specific fields start at 16.
@@ -115,7 +124,36 @@ message Scope {
 
 // Applied to every mutating RPC (D9). The same key replayed returns the
 // original outcome rather than performing the write twice; required because a
-// retrying load balancer will deliver a write more than once.
+// retrying load balancer will deliver a write more than once. THE SAME KEY
+// CARRYING A DIFFERENT REQUEST IS REFUSED, with INVALID_ARGUMENT, rather than
+// replayed: replaying it would answer a request nobody made and report success.
+// Which fields count as the request is per-RPC, and D9 carries the argument.
+//
+// ONE CARVE-OUT FROM THE REPLAY RULE, and it is stated here because a caller
+// reading only the RPC it is calling would meet it as a surprise: AN RPC WHOSE
+// SUCCESSFUL OUTCOME IS A SINGLE-USE SECRET REFUSES A REPLAYED KEY, with
+// INVALID_ARGUMENT, RATHER THAN ANSWERING WITH A SPENT ONE (ADR-0519). The
+// replay rule above holds for every RPC whose outcome can be re-derived from
+// what the store kept; this covers an outcome that cannot, and the boundary is
+// whether the answer is reconstructible without persisting the secret itself.
+// A secret shown once and kept only as a hash is not, so the original cannot
+// be returned and a replay would hand back a token that authenticates nobody.
+//
+// THE MEMBERS ARE ENUMERATED RATHER THAN LEFT AS A TEST THE READER APPLIES,
+// and today the list is one: yadgar.iam.v1.IssueEnrolment. AN RPC NOT NAMED
+// HERE IS NOT A MEMBER, however well it fits the description — deciding it by
+// reading would silently reclassify RPCs that are already published, which is
+// the change this enumeration exists to prevent.
+//
+// TWO OTHER RPCs ANSWER WITH A TOKEN THE STORE KEEPS ONLY AS A HASH, and both
+// are deliberately left as they stand. yadgar.iam.v1.RedeemEnrolment already
+// puts its credential OUTSIDE the replayed key — a retry mints a fresh one
+// under a key of its own — so the outcome the key does cover is reconstructible
+// and the carve-out has nothing to say about it. yadgar.iam.v1.IssueCredential
+// is the case this rule would reach; moving it is its own decision and its own
+// contract release, and it is not made here. A NEW RPC MINTING A SINGLE-USE
+// SECRET MUST CLASSIFY ITSELF AGAINST THIS RULE, and say on which side it
+// landed, before its idempotency behaviour is written.
 message Idempotency {
   string key = 1;
 }

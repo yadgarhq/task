@@ -709,6 +709,9 @@ async fn a_body_only_edit_is_not_refused_for_a_title_it_never_writes() {
         })),
         update: Some(Ok(db::UpdateTaskResponse {
             meta: Some(store_meta()),
+            // What the real store returns for this double: the task it holds is
+            // OPEN, and an edit or a first transition displaces exactly that.
+            previous_status: db::TaskStatus::Open as i32,
         })),
         ..Default::default()
     })
@@ -750,6 +753,9 @@ async fn a_title_only_edit_sends_the_stored_body_rather_than_an_empty_one() {
         })),
         update: Some(Ok(db::UpdateTaskResponse {
             meta: Some(store_meta()),
+            // What the real store returns for this double: the task it holds is
+            // OPEN, and an edit or a first transition displaces exactly that.
+            previous_status: db::TaskStatus::Open as i32,
         })),
         ..Default::default()
     })
@@ -840,6 +846,9 @@ async fn an_edit_returns_the_meta_the_store_assigned() {
         })),
         update: Some(Ok(db::UpdateTaskResponse {
             meta: Some(store_meta()),
+            // What the real store returns for this double: the task it holds is
+            // OPEN, and an edit or a first transition displaces exactly that.
+            previous_status: db::TaskStatus::Open as i32,
         })),
         ..Default::default()
     })
@@ -974,6 +983,9 @@ async fn a_transition_returns_the_meta_the_store_assigned_not_one_built_from_the
         })),
         update: Some(Ok(db::UpdateTaskResponse {
             meta: Some(store_meta()),
+            // What the real store returns for this double: the task it holds is
+            // OPEN, and an edit or a first transition displaces exactly that.
+            previous_status: db::TaskStatus::Open as i32,
         })),
         ..Default::default()
     })
@@ -1009,6 +1021,9 @@ async fn a_transition_writes_the_status_column_and_names_only_it() {
         })),
         update: Some(Ok(db::UpdateTaskResponse {
             meta: Some(store_meta()),
+            // What the real store returns for this double: the task it holds is
+            // OPEN, and an edit or a first transition displaces exactly that.
+            previous_status: db::TaskStatus::Open as i32,
         })),
         ..Default::default()
     })
@@ -1046,15 +1061,24 @@ async fn a_transition_writes_the_status_column_and_names_only_it() {
 /// read was current". On this path `from == to` always, so it carries no
 /// information at all, which is precisely the guarantee it was added to provide.
 ///
-/// WHY IT IS NOT FIXED HERE. Nothing available to this service holds the prior
-/// status. `UpdateTaskResponse` carries `meta` and nothing else, and it is
-/// byte-identical at proto v1.2.0 and v1.6.0. `task-db`'s idempotency row stores
-/// that same response, so even a change confined to `-db` has nowhere to put the
-/// answer. Closing this needs a new field on `UpdateTaskResponse` in
-/// yadgarhq/proto first. Inventing a value here would be worse than the gap.
+/// WHAT CHANGED, AND WHAT DID NOT. The field this test was waiting for exists:
+/// `UpdateTaskResponse.previous_status` arrived in proto v1.7.0, and
+/// `yadgarhq/task-db` populates it on every update. So the answer now REACHES
+/// this service — and this service still throws it away, which is the half that
+/// is left. `from` is still read off the pre-write `GetTask`, so on a replay it
+/// is still the post-transition status and still carries no information.
 ///
-/// WHEN THAT FIELD LANDS, this test goes red and should be rewritten to assert
-/// the true prior status.
+/// WHY IT IS NOT FIXED HERE. Wiring `from` to `previous_status` changes what
+/// this service answers, which is a behaviour change to `TaskService` rather
+/// than a consequence of the pin bump this commit carries. It is its own change
+/// with its own reasoning, and this test is what will go red when it lands.
+///
+/// The store's double below now supplies `previous_status: BLOCKED`, a value
+/// neither the read nor the request contains. The assertions pin BOTH halves:
+/// `from` equals `to` (the gap), and `from` is not the value the store
+/// supplied (the reason the gap survives). Wiring `from` correctly inverts the
+/// second assertion, which is what makes this test a tripwire rather than a
+/// comment.
 #[tokio::test]
 async fn a_replayed_transition_reports_a_from_that_carries_no_information() {
     // The store already holds DONE: this is the retry, after the first delivery
@@ -1063,9 +1087,15 @@ async fn a_replayed_transition_reports_a_from_that_carries_no_information() {
         get: Some(Ok(db::GetTaskResponse {
             task: Some(a_stored_task(db::TaskStatus::Done as i32)),
         })),
-        // What `idem::claim` replays: the FIRST call's response, verbatim.
+        // What `idem::claim` replays: the FIRST call's response, verbatim —
+        // and at proto v1.7.1 that response CARRIES the prior status. BLOCKED
+        // is deliberate: it is neither the status the read returns (DONE) nor
+        // the target the request names (DONE), so a `from` carrying it could
+        // only have come from the store. The handler discards it, and the
+        // assertion below is what says so.
         update: Some(Ok(db::UpdateTaskResponse {
             meta: Some(store_meta()),
+            previous_status: db::TaskStatus::Blocked as i32,
         })),
         ..Default::default()
     })
@@ -1084,6 +1114,14 @@ async fn a_replayed_transition_reports_a_from_that_carries_no_information() {
         response.from, to,
         "THE GAP: on a replay `from` equals `to`, so the field the contract adds \
          for a racing caller tells that caller nothing"
+    );
+    assert_ne!(
+        response.from,
+        db::TaskStatus::Blocked as i32,
+        "THE REASON THE GAP SURVIVES: the store supplied the prior status on \
+         `UpdateTaskResponse.previous_status` and this service discarded it, \
+         answering from its own pre-write read instead. Wiring `from` to that \
+         field inverts this assertion, which is the point of writing it"
     );
 
     // The other half of the gap: there is no second place the prior status could
