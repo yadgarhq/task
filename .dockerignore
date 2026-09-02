@@ -1,0 +1,44 @@
+# What the image build must NOT be sent.
+#
+# `Containerfile` runs `COPY . .` twice — once for the cargo-chef planner and
+# once for the builder — so every path listed here is one that would otherwise
+# cross into the build context on both. `target/` alone is several gigabytes of
+# host-architecture artifacts that the musl build cannot use and immediately
+# overwrites, and `.git/` carries the whole history of a repository the image
+# never reads.
+#
+# A DENY LIST rather than an allow list, deliberately. An allow list that forgets
+# a file the build needs fails at compile time with a missing-module error three
+# stages deep, and the next person adding a source directory has to remember to
+# amend it. Everything named below is something the build provably does not read.
+#
+# `.dockerignore` rather than `.containerignore`: docker reads only the former,
+# and podman and buildah fall back to it when no `.containerignore` exists — so
+# one file covers every builder this repository is built with.
+
+# Build output. The largest single entry by far, and the only one worth
+# measuring: the musl target the image ships is built inside the container.
+target/
+
+# History, hooks and the remote configuration. Nothing in the build reads them.
+.git/
+.gitignore
+.dockerignore
+
+# CI and review artifacts. `.local-review/` is a local review tool's scratch
+# output — it is ignored by git and must not reach an image either.
+.github/
+.local-review/
+.pre-commit-config.yaml
+
+# Deployment and documentation. The chart is applied by Argo from the repository,
+# never from inside the image.
+chart/
+README.md
+
+# Formatting configuration, which only the pre-commit hooks read.
+.prettierrc
+.prettierignore
+
+# `cargo deny` configuration, which runs in CI rather than in the image build.
+deny.toml

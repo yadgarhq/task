@@ -329,16 +329,50 @@ async fn a_serialisation_failure_stays_aborted() {
     );
 }
 
+/// THE ONE FAILURE A CALLER IS SUPPOSED TO RETRY, and until now it was the one
+/// this service hid.
+///
+/// Three places in this repository already promised `UNAVAILABLE`: `main.rs`'s
+/// module doc, the "It does not wait for `task-db` to be ready" section of
+/// `README.md`, and the readiness-probe comment in
+/// `chart/templates/deployment.yaml`. They rest on one design — this service
+/// deliberately does not block its boot on the twin (D69), because a request
+/// arriving before `task-db` is reachable fails RECOVERABLY. `passthrough`'s
+/// `_ =>` arm collapsed it into `INTERNAL`, so the recoverable failure was
+/// indistinguishable from a bug and no client obeying the contract would retry.
+///
+/// The test that used to sit below asserted `UNAVAILABLE -> INTERNAL`, so the
+/// repository's own suite defended the defect against the repository's own
+/// documentation.
+#[tokio::test]
+async fn a_store_that_could_not_be_reached_stays_unavailable() {
+    for code in [Code::Unavailable, Code::DeadlineExceeded] {
+        let status = read_failing_with(code, DB_DETAIL).await;
+        assert_eq!(
+            status.code(),
+            Code::Unavailable,
+            "{code:?} is the store being unreachable, which is what this API promises to report"
+        );
+        assert!(
+            status.message().contains("retry"),
+            "the code invites a retry and the message must say so: {}",
+            status.message()
+        );
+    }
+}
+
+/// **`UNAVAILABLE` AND `DEADLINE_EXCEEDED` ARE DELIBERATELY ABSENT from this
+/// list** — see the test above for where they went. What remains is the genuine
+/// residue: codes a caller can do nothing specific about, collapsed into one
+/// opaque answer on purpose.
 #[tokio::test]
 async fn every_other_store_failure_becomes_one_opaque_internal() {
     for code in [
         Code::Internal,
-        Code::Unavailable,
         Code::Unknown,
         Code::ResourceExhausted,
         Code::PermissionDenied,
         Code::Unauthenticated,
-        Code::DeadlineExceeded,
         Code::Unimplemented,
     ] {
         let status = read_failing_with(code, DB_DETAIL).await;
@@ -659,6 +693,115 @@ async fn an_edit_that_would_untitle_a_task_is_refused_before_anything_is_read() 
     assert_eq!(status.code(), Code::InvalidArgument);
     assert_eq!(status.message(), "a task needs a title");
     assert!(seen.lock().unwrap().get.is_empty());
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// **A BODY-ONLY EDIT WAS IMPOSSIBLE, and this is the shape every real caller
+/// sends.** `EditTaskRequest.title` is empty when a client does not intend to
+/// change the title, and the empty-title check ran BEFORE the mask was resolved —
+/// so the call was refused over a value it was never going to store. The rule was
+/// right; only the place it ran was wrong.
+#[tokio::test]
+async fn a_body_only_edit_is_not_refused_for_a_title_it_never_writes() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        update: Some(Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+        })),
+        ..Default::default()
+    })
+    .await;
+
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        title: String::new(),
+        body: "only the body is being changed".into(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["body".to_string()],
+        }),
+        ..an_edit()
+    }))
+    .await
+    .expect("an edit that writes no title is not an edit that empties one");
+
+    let sent = seen.lock().unwrap().update[0].clone();
+    assert_eq!(
+        sent.update_mask.expect("an edit is always masked").paths,
+        vec!["body"]
+    );
+}
+
+/// **THE STORED BODY SURVIVES A TITLE-ONLY EDIT.**
+///
+/// Asserting only that the mask was narrowed passes against the defect —
+/// `writes::edit_request` set `body: req.body` unconditionally, so the request's
+/// EMPTY body went on the wire under a mask that did not name it, and a `-db`
+/// ignoring the mask would write it. This asserts what actually reached the
+/// store.
+///
+/// `a_stored_task`'s body is a value no request in this file carries, so it can
+/// only have arrived from the read.
+#[tokio::test]
+async fn a_title_only_edit_sends_the_stored_body_rather_than_an_empty_one() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        update: Some(Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+        })),
+        ..Default::default()
+    })
+    .await;
+
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        title: "a title-only edit".into(),
+        // What a title-only client actually sends.
+        body: String::new(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["title".to_string()],
+        }),
+        ..an_edit()
+    }))
+    .await
+    .expect("the edit applied");
+
+    let sent = seen.lock().unwrap().update[0].clone();
+    let task = sent.task.expect("an edit always carries a task");
+    assert_eq!(
+        task.body, "the stored body",
+        "a -db that ignores the mask writes this field, so it must be what was read — an empty \
+         body here erases the stored one during any rollout where the two services disagree"
+    );
+    assert_eq!(
+        task.title, "a title-only edit",
+        "the field the mask DOES name must still be the caller's"
+    );
+}
+
+/// **A MASK NOBODY CAN HONOUR IS REFUSED BEFORE THE STORE IS TOUCHED.** The
+/// decision is pure — it is about the request and nothing else — so the round
+/// trip it used to cost was one whose answer was always going to be discarded.
+#[tokio::test]
+async fn a_mask_no_edit_may_name_is_refused_before_anything_is_read() {
+    let (svc, seen) = wire(MockDb::default()).await;
+
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["status".to_string()],
+            }),
+            ..an_edit()
+        }))
+        .await
+        .expect_err("`status` is not something an edit may name");
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        seen.lock().unwrap().get.is_empty(),
+        "the mask could never have been honoured, so the read was wasted work"
+    );
     assert!(seen.lock().unwrap().update.is_empty());
 }
 

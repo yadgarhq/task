@@ -57,19 +57,42 @@ Two things the loop deliberately does not do:
 - **It never tears down a working channel because DNS failed.** A blip is not a
   reason to stop using endpoints that currently work.
 
-`balance::diff` is a pure function over two address sets, extracted so the part
-that is easy to get silently wrong is testable: re-inserting an unchanged
-endpoint churns connections every tick and looks like working code.
+**The balancing itself is no longer in this repository.** It began here as
+`src/balance.rs`; the gateway needed the identical logic, and anything every
+service needs is implemented once — so it lives in the
+[`yadgar-dial`](https://github.com/yadgarhq/dial) crate, pinned by revision in
+`Cargo.toml`. What remains here is `src/upstream.rs`: this service's decision
+about which transport to reach `task-db` over, handed to `yadgar_dial::connect`
+or `yadgar_dial::connect_tls`.
 
 ## It does not wait for `task-db` to be ready
 
 Deliberately. The twin gates its own boot — probe, migrate, then listen (D69) — so
 a `-db` that is not ready has no endpoint behind the headless Service and
-`balance::connect` fails loudly. Blocking this service's startup on that would
+`upstream::connect` fails loudly. Blocking this service's startup on that would
 turn one module's slow migration into a cascading outage, and under D68 a pod
 stuck in startup is one the autoscaler cannot help. A request that cannot reach
 the store fails with `UNAVAILABLE`, which is recoverable; refusing to start is
 not.
+
+That last sentence is a CONTRACT rather than a description, and `passthrough` in
+`src/service.rs` is where it is kept: a `-db` answering `UNAVAILABLE` or
+`DEADLINE_EXCEEDED` reaches the caller as `UNAVAILABLE`. It used to be folded
+into `INTERNAL`, which made the one recoverable storage failure
+indistinguishable from a bug.
+
+## SIGTERM, not SIGINT
+
+Kubernetes ends a pod by sending **SIGTERM**, then waits out
+`terminationGracePeriodSeconds` before SIGKILL. It never sends SIGINT. So
+`serve::shutdown` listens for both, and it installs the handlers when it is
+CALLED rather than when the future is first polled — a signal arriving in that
+window would otherwise take SIGTERM's default disposition and kill the process
+mid-request.
+
+D23 sets the blast radius. Each caller holds ONE long-lived HTTP/2 connection, so
+what a skipped drain loses is not a slice of traffic but everything that
+connection was carrying.
 
 ## Local development
 
@@ -82,7 +105,31 @@ cargo test     # the rules; they need no engine and no -db
 
 ## Configuration
 
-| variable                        | default             |                             |
-| ------------------------------- | ------------------- | --------------------------- |
-| `TASK_DB_HOST` / `TASK_DB_PORT` | `task-db` / `50051` | the twin's headless Service |
-| `LISTEN`                        | `0.0.0.0:50052`     |                             |
+| variable                        | default             |                                                |
+| ------------------------------- | ------------------- | ---------------------------------------------- |
+| `TASK_DB_HOST` / `TASK_DB_PORT` | `task-db` / `50051` | the twin's headless Service                    |
+| `LISTEN`                        | `0.0.0.0:50052`     | the gRPC address this service binds            |
+| `METRICS_LISTEN`                | `0.0.0.0:9090`      | the Prometheus endpoint (D67)                  |
+| `RUST_LOG`                      | `info`              | a DEFAULT, not `from_default_env`'s silence    |
+| `LISTEN_TLS_ENABLED`            | unset               | exactly `1` to serve TLS; anything else is off |
+| `LISTEN_TLS_CERT_FILE`          | unset               | PEM certificate this service PRESENTS          |
+| `LISTEN_TLS_KEY_FILE`           | unset               | its private key                                |
+| `TASK_DB_TLS_ENABLED`           | unset               | exactly `1` to dial `task-db` over TLS         |
+| `TASK_DB_TLS_CA_FILE`           | unset               | PEM bundle `task-db` is VERIFIED against       |
+| `TASK_DB_TLS_DOMAIN`            | unset               | only when the certificate names something else |
+
+**Two directions, and the prefix says which.** `LISTEN_TLS_*` configures the
+listener — `LISTEN` is already the variable naming the address it binds.
+`TASK_DB_TLS_*` configures the dial, and a dial is named for the upstream it
+reaches. The same rule holds across every service: `iam` reads `LISTEN_TLS_*`
+and `IAM_DB_TLS_*`.
+
+Both groups are **opt-in and off**, and every enable flag is exactly the string
+`1` — a permissive parse is how a setting meant to be off ends up on, and how a
+revert lever stops moving. A flag that is on with a file that is missing,
+unreadable or unusable **refuses the boot naming the file**. It never falls back
+to cleartext.
+
+`RUST_LOG` is listed because the default is this binary's own, not the library's:
+`EnvFilter::from_default_env()` with `RUST_LOG` unset enables NOTHING, and a
+service nobody can observe is one D67 cannot measure either.

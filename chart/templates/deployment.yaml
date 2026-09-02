@@ -5,7 +5,21 @@ metadata:
   labels:
     app: {{ .Chart.Name }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # OMITTED ENTIRELY WHEN KEDA OWNS THE COUNT, and that guard is the whole point
+  # of the condition. KEDA drives a ScaledObject through an HPA, which writes
+  # `spec.replicas` on this Deployment; Argo runs with `selfHeal: true` and no
+  # `ignoreDifferences` for this field, so a rendered `replicas:` is a value Argo
+  # keeps restoring and the autoscaler keeps overwriting. That is not a snap on
+  # each upgrade — it is a CONTINUOUS revert loop, in which a scale-up is undone
+  # within a sync interval and the load that caused it is served by
+  # `replicaCount` pods.
+  #
+  # Rendering nothing hands the field to the HPA, which is what `minReplicas`
+  # exists to floor. `replicaCount` still applies to every deployment that has
+  # not enabled autoscaling, which is the chart's own default (D80).
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       app: {{ .Chart.Name }}
@@ -20,6 +34,16 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
+      # NO SERVICE ACCOUNT TOKEN IN THIS POD. This binary calls no Kubernetes
+      # API: it serves gRPC, dials `task-db`, and reads its configuration from
+      # environment variables and mounted files. Without this line kubelet
+      # projects a token for the default ServiceAccount into every container, so
+      # anything that achieves code execution here starts with a credential for
+      # the API server that nothing was ever meant to use.
+      #
+      # Set to `false` rather than left out: the field DEFAULTS to true, so
+      # absence is the permissive answer.
+      automountServiceAccountToken: false
       # POD-level, and distinct from the container block below. Setting only the
       # container context leaves the pod admitting root — runAsNonRoot is the
       # assertion that actually refuses an image which would run as one, rather
@@ -85,15 +109,15 @@ spec:
             # Rendered only when asked for, so a deployment that has not cut over
             # sends the binary nothing and opens the cleartext listener it has
             # always opened.
-            - name: SERVE_TLS_ENABLED
+            - name: LISTEN_TLS_ENABLED
               value: "1"
             # PATHS, never an issuer-specific resource (D80). Two of them,
             # because a certificate and its key are two files — and naming them
             # separately is what lets the binary say WHICH of the two was missing
             # when only half of a Secret mounted.
-            - name: SERVE_TLS_CERT_FILE
+            - name: LISTEN_TLS_CERT_FILE
               value: /var/run/config/serving-cert/tls.crt
-            - name: SERVE_TLS_KEY_FILE
+            - name: LISTEN_TLS_KEY_FILE
               value: /var/run/config/serving-cert/tls.key
             {{- end }}
           # This service does NOT wait for task-db before listening, so the port
@@ -170,15 +194,15 @@ spec:
             # operator gets. A required mount that cannot be satisfied leaves the
             # pod in ContainerCreating with a FailedMount event about a volume.
             # An optional one mounts an empty directory, the binary finds no file
-            # at SERVE_TLS_CERT_FILE, and it exits at boot naming THAT PATH and
+            # at LISTEN_TLS_CERT_FILE, and it exits at boot naming THAT PATH and
             # saying that TLS was asked for so a plaintext listener is not the
             # answer. Neither starts; only one of them explains itself.
             optional: true
             # NAMED KEYS rather than the whole Secret. An issuer's Secret also
             # carries `ca.crt`, which this pod has no use for, and selecting the
             # two it does need is what renames whatever the issuer called them to
-            # the `tls.crt` and `tls.key` that SERVE_TLS_CERT_FILE and
-            # SERVE_TLS_KEY_FILE name.
+            # the `tls.crt` and `tls.key` that LISTEN_TLS_CERT_FILE and
+            # LISTEN_TLS_KEY_FILE name.
             items:
               - key: {{ required "tls.certSecretKey names the key inside tls.certSecret that holds the certificate and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecretKey | quote }}
                 path: tls.crt
