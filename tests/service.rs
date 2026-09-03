@@ -1194,3 +1194,132 @@ async fn a_remove_of_a_task_the_store_does_not_hold_is_not_found() {
     assert_eq!(status.code(), Code::NotFound);
     assert_eq!(status.message(), "no such task in this scope");
 }
+
+// ---------------------------------------------------------------------------
+// Scope.owner_reads_own_record: the field this service must not lose (ADR-0522).
+// ---------------------------------------------------------------------------
+
+/// A team the requests below do not otherwise name, so an override keyed on it
+/// cannot be produced by a handler reading its own inputs.
+const SETTING_TEAM: &str = "yadgar:team:named-only-by-the-setting";
+
+/// The setting as an organisation that has actually STATED one sends it.
+///
+/// Every field is deliberately away from its zero — `org_value` is a member
+/// rather than `UNSPECIFIED`, the lock is engaged, and the map holds an entry —
+/// so a handler that stamps `Some(InheritedSetting::default())` in place of what
+/// it received fails the equality below rather than passing on the presence
+/// check alone.
+fn a_stated_setting() -> common::InheritedSetting {
+    common::InheritedSetting {
+        org_value: common::SettingValue::Off as i32,
+        org_locked: true,
+        team_override: std::collections::HashMap::from([(
+            SETTING_TEAM.to_string(),
+            common::SettingValue::On as i32,
+        )]),
+    }
+}
+
+/// A caller's scope, written EXHAUSTIVELY on purpose.
+///
+/// This is the first `common::Scope` literal in the repository, and it is the
+/// tripwire the pin bump wanted and did not find: `task-db`'s equivalent fixture
+/// broke with `E0063` when `Scope` grew field 6 and announced it, whereas this
+/// repository held no literal to break and took the field in silence. Adding
+/// `..Default::default()` here would restore that silence for the next field —
+/// including one this hop must forward and does not.
+fn a_caller_scope(setting: Option<common::InheritedSetting>) -> common::Scope {
+    common::Scope {
+        user_id: "yadgar:user:the-owner".into(),
+        project_id: "quinyx/qwfm/named-by-the-caller".into(),
+        team_ids: vec!["yadgar:team:the-caller-still-belongs-to".into()],
+        instance_id: "instance-4711".into(),
+        request_id: "request-4711".into(),
+        owner_reads_own_record: setting,
+    }
+}
+
+/// THE POINT OF THE PIN BUMP, ASSERTED ON THE WIRE.
+///
+/// The gateway attests this setting onto `Scope`; `task-db` resolves it; this
+/// service is the hop in between and forwards `req.scope` whole. At proto
+/// v1.7.1 `Scope` had no field 6 at all, so prost — which DISCARDS unknown
+/// fields rather than round-tripping them — erased it here, and the two merged
+/// cars either side of this hop were inert end to end.
+///
+/// The mock store is served over real loopback, so the assertion is on bytes
+/// that were encoded and decoded rather than on a struct handed across by value.
+/// That is the hop that used to drop the field.
+#[tokio::test]
+async fn a_stated_owner_reads_own_record_reaches_the_store() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        ..Default::default()
+    })
+    .await;
+
+    svc.read_task(Request::new(api::ReadTaskRequest {
+        scope: Some(a_caller_scope(Some(a_stated_setting()))),
+        key: Some(api::read_task_request::Key::Id(CALLER_ID.into())),
+    }))
+    .await
+    .expect("the store had it");
+
+    let sent = seen.lock().unwrap().get[0]
+        .scope
+        .clone()
+        .expect("the store is sent the caller's scope");
+
+    // PRESENCE IS THE ASSERTION. A value assertion alone would be vacuous:
+    // every field of `InheritedSetting::default()` equals the field an absent
+    // message reads as through prost, so `org_value == UNSPECIFIED` is true
+    // whether the setting arrived or was silently dropped.
+    assert!(
+        sent.owner_reads_own_record.is_some(),
+        "the setting the caller stated was erased on the hop to the store"
+    );
+    // And having established presence, that it is the caller's setting rather
+    // than a freshly minted empty one.
+    assert_eq!(sent.owner_reads_own_record, Some(a_stated_setting()));
+}
+
+/// THE OTHER HALF, AND WITHOUT IT THE TEST ABOVE PROVES NOTHING.
+///
+/// A handler that unconditionally stamps `Some(InheritedSetting::default())`
+/// would satisfy an `is_some` check. What the contract needs is that the two
+/// states stay TOLD APART — `common.proto` says an absent message and a present
+/// one holding the zero are one case and both are REFUSED by an enforcing
+/// `-db`, and a hop that manufactures presence turns a refusal into an answer.
+#[tokio::test]
+async fn a_scope_that_states_no_setting_reaches_the_store_still_stating_none() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        ..Default::default()
+    })
+    .await;
+
+    svc.read_task(Request::new(api::ReadTaskRequest {
+        scope: Some(a_caller_scope(None)),
+        key: Some(api::read_task_request::Key::Id(CALLER_ID.into())),
+    }))
+    .await
+    .expect("the store had it");
+
+    let sent = seen.lock().unwrap().get[0]
+        .scope
+        .clone()
+        .expect("the store is sent the caller's scope");
+
+    assert!(
+        sent.owner_reads_own_record.is_none(),
+        "the hop invented a setting the caller never stated"
+    );
+    // The rest of the scope still arrives, so the assertion above is about the
+    // one field rather than about a scope that went missing entirely.
+    assert_eq!(sent.user_id, "yadgar:user:the-owner");
+}
