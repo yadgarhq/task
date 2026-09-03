@@ -18,6 +18,37 @@
 //! deployment and by a hand-assembled Secret anywhere else, and neither this
 //! module nor [`yadgar_dial`] can tell the difference — which is the point.
 //!
+//! # Mutual TLS
+//!
+//! **The transport above is one direction; this is the other.** The CA bundle
+//! authenticates the upstream to this service. A client certificate
+//! authenticates THIS SERVICE to the upstream — ADR-0516, which chose mutual TLS
+//! over a NetworkPolicy because a control the CNI enforces protects an EKS
+//! deployment and protects nothing on kind (D80).
+//!
+//! **A SEPARATE LEVER FROM THE ENCRYPTED TRANSPORT, deliberately.**
+//! `<PREFIX>_TLS_CLIENT_CERT_FILE` and `<PREFIX>_TLS_CLIENT_KEY_FILE` are unset
+//! by default, so a deployment that turns TLS on verifies the upstream and
+//! presents no identity — exactly as it did before. Mutual TLS is then its own
+//! change, revertible on its own, which is what car 1's discipline asks for.
+//!
+//! **AND IT IS A DIFFERENT CERTIFICATE FROM THE ONE THIS SERVICE SERVES.** The
+//! serving leaf is issued for `server auth`, the client leaf for `client auth`,
+//! and a peer that trusts the issuer still refuses a leaf naming the wrong
+//! purpose. One authority issues both.
+//!
+//! **THE CLIENT CERTIFICATE IS LOAD-BEARING FOR AVAILABILITY**, which the
+//! serving one is not in the same way. ADR-0516 says it plainly: an expired
+//! client certificate STOPS this hop rather than weakening it. That is why both
+//! files join [`crate::rotate`]'s watch set in the same change that mounts them
+//! — a process that reads them once and never again works perfectly until the
+//! leaf expires, and then fails hard with nothing having warned.
+//!
+//! **NOTHING HERE CHECKS WHAT THE CERTIFICATE SAYS THE CALLER IS.** The upstream
+//! learns that this deployment issued the leaf, not which service presented it.
+//! Distinguishing callers needs a check against the name in the certificate, and
+//! no such check exists in this estate today.
+//!
 //! **A misconfiguration is an error, never a downgrade.** Asking for TLS without
 //! naming a CA bundle fails here; a bundle that cannot be read, cannot be
 //! decoded, or holds no certificate fails inside `yadgar_dial::connect_tls`.
@@ -32,9 +63,9 @@ use yadgar_dial::{BalanceError, TlsOptions};
 
 /// The environment variables one upstream's transport is configured from.
 ///
-/// Built from a PREFIX rather than written out three times, so the naming stays
-/// mechanical: `<PREFIX>_TLS_ENABLED`, `<PREFIX>_TLS_CA_FILE` and
-/// `<PREFIX>_TLS_DOMAIN`. This service has one upstream, `TASK_DB`; the gateway
+/// Built from a PREFIX rather than written out five times, so the naming stays
+/// mechanical: `<PREFIX>_TLS_ENABLED`, `<PREFIX>_TLS_CA_FILE`, `<PREFIX>_TLS_DOMAIN`,
+/// `<PREFIX>_TLS_CLIENT_CERT_FILE` and `<PREFIX>_TLS_CLIENT_KEY_FILE`. This service has one upstream, `TASK_DB`; the gateway
 /// has two, and uses the identical shape for both.
 pub const TASK_DB: &str = "TASK_DB";
 
@@ -49,6 +80,25 @@ pub enum TlsConfigError {
          holding the authority that signed the upstream's certificate."
     )]
     NoCaFile(&'static str),
+
+    #[error(
+        "{0}_TLS_CLIENT_CERT_FILE names a client certificate but {0}_TLS_CLIENT_KEY_FILE \
+         names no private key. A certificate cannot be presented without the key that \
+         proves it, so this is a deployment mistake rather than a reason to dial with no \
+         identity at all — dialling without one is what leaving BOTH unset means, and it \
+         is the default. Point {0}_TLS_CLIENT_KEY_FILE at the private key belonging to \
+         that certificate."
+    )]
+    ClientCertificateWithoutKey(&'static str),
+
+    #[error(
+        "{0}_TLS_CLIENT_KEY_FILE names a private key but {0}_TLS_CLIENT_CERT_FILE names no \
+         certificate. A key proves a certificate and is worth nothing on its own, so this \
+         is a deployment mistake rather than a reason to dial with no identity at all — \
+         dialling without one is what leaving BOTH unset means, and it is the default. \
+         Point {0}_TLS_CLIENT_CERT_FILE at the certificate that key belongs to."
+    )]
+    ClientKeyWithoutCertificate(&'static str),
 }
 
 /// Server TLS for one upstream: a CA bundle on disk, and optionally the name to
@@ -63,6 +113,26 @@ pub enum TlsConfigError {
 pub struct UpstreamTls {
     ca_file: PathBuf,
     domain: Option<String>,
+    client: Option<ClientIdentity>,
+}
+
+/// The certificate this service PRESENTS to the upstream, and the private key
+/// that proves it — mutual TLS (ADR-0516).
+///
+/// **A DIFFERENT CERTIFICATE FROM THE ONE THIS SERVICE SERVES, and confusing the
+/// two is not an error anybody sees at build time.** A serving leaf is issued for
+/// `server auth` and a client leaf for `client auth`; a peer verifying a client
+/// chain refuses a leaf that names the wrong purpose even though it trusts the
+/// issuer perfectly well. That separation is what lets one authority issue both.
+///
+/// **The two paths live together rather than as two `Option`s**, the same shape
+/// `yadgar_dial::TlsOptions` uses: one without the other is not a configuration,
+/// it is a mistake, and it is caught in [`UpstreamTls::from_lookup`] rather than
+/// at the handshake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClientIdentity {
+    certificate: PathBuf,
+    key: PathBuf,
 }
 
 impl UpstreamTls {
@@ -96,7 +166,12 @@ impl UpstreamTls {
         // reverse mistake is worse: this flag is the revert lever for the
         // cut-over, and a lever that does not move is not one.
         if get("TLS_ENABLED").as_deref() != Some("1") {
-            if get("TLS_CA_FILE").is_some() {
+            // THE CLIENT CERTIFICATE IS NAMED HERE TOO, and leaving it out was
+            // the silent case: an operator who mounts a client leaf and forgets
+            // the flag gets a cleartext hop presenting no identity, and nothing
+            // says so. Mutual TLS is meaningless without the encrypted transport
+            // it runs inside, so this one flag turns both off.
+            if get("TLS_CA_FILE").is_some() || get("TLS_CLIENT_CERT_FILE").is_some() {
                 // NOT an error. Leaving the bundle in place while the flag is
                 // off is exactly how the cut-over gets reverted, so refusing it
                 // would make the lever unusable. It is still worth a line: a
@@ -104,16 +179,32 @@ impl UpstreamTls {
                 // able to see that from the boot log.
                 tracing::warn!(
                     prefix,
-                    "a CA bundle is configured but {prefix}_TLS_ENABLED is not \"1\", so this \
-                     upstream is dialled in CLEARTEXT"
+                    "a CA bundle or a client certificate is configured but \
+                     {prefix}_TLS_ENABLED is not \"1\", so this upstream is dialled in \
+                     CLEARTEXT and presents no identity"
                 );
             }
             return Ok(None);
         }
 
+        // BOTH, OR NEITHER. A certificate with no key cannot be presented and a
+        // key with no certificate proves nothing, so each half alone is a
+        // deployment mistake — and it is refused here rather than left to fail
+        // at a handshake, where the message names neither variable.
+        let client = match (get("TLS_CLIENT_CERT_FILE"), get("TLS_CLIENT_KEY_FILE")) {
+            (None, None) => None,
+            (Some(certificate), Some(key)) => Some(ClientIdentity {
+                certificate: PathBuf::from(certificate),
+                key: PathBuf::from(key),
+            }),
+            (Some(_), None) => return Err(TlsConfigError::ClientCertificateWithoutKey(prefix)),
+            (None, Some(_)) => return Err(TlsConfigError::ClientKeyWithoutCertificate(prefix)),
+        };
+
         Ok(Some(Self {
             ca_file: PathBuf::from(get("TLS_CA_FILE").ok_or(TlsConfigError::NoCaFile(prefix))?),
             domain: get("TLS_DOMAIN"),
+            client,
         }))
     }
 
@@ -128,12 +219,37 @@ impl UpstreamTls {
         self.domain.as_deref()
     }
 
+    /// The certificate this service presents to the upstream, when it presents
+    /// one.
+    ///
+    /// **`None` is the default and is not a degraded state**: mutual TLS is a
+    /// separate lever from the encrypted transport, so a deployment can verify
+    /// the upstream without identifying itself to it.
+    pub fn client_certificate_file(&self) -> Option<&Path> {
+        self.client.as_ref().map(|c| c.certificate.as_path())
+    }
+
+    /// The private key belonging to that certificate. Present exactly when
+    /// [`Self::client_certificate_file`] is.
+    pub fn client_key_file(&self) -> Option<&Path> {
+        self.client.as_ref().map(|c| c.key.as_path())
+    }
+
     /// The same settings as [`yadgar_dial`] takes them.
+    ///
+    /// **The client identity travels with them when one is configured**, so
+    /// there is no second call a caller can forget to make: whatever a
+    /// deployment stated about this upstream is in the value handed to
+    /// `connect_tls`, identity included.
     pub fn options(&self) -> TlsOptions {
         let options = TlsOptions::new(&self.ca_file);
-        match &self.domain {
+        let options = match &self.domain {
             None => options,
             Some(domain) => options.domain_name(domain),
+        };
+        match &self.client {
+            None => options,
+            Some(client) => options.identity(&client.certificate, &client.key),
         }
     }
 }
@@ -166,6 +282,8 @@ mod tests {
     /// The values below are SENTINELS: nothing in `upstream.rs` could produce
     /// either of them, so a test that sees one saw it travel from the lookup.
     const SENTINEL_CA: &str = "/etc/yadgar/aardvark-9f3c/bundle.pem";
+    const SENTINEL_CLIENT_CERT: &str = "/etc/yadgar/aardvark-9f3c/task-caller.pem";
+    const SENTINEL_CLIENT_KEY: &str = "/etc/yadgar/aardvark-9f3c/task-caller-key.pem";
     const SENTINEL_DOMAIN: &str = "task-db.verified-as-this.invalid";
 
     fn lookup<'a>(
@@ -324,6 +442,103 @@ mod tests {
             ("IAM_TLS_ENABLED", "1"),
             ("IAM_TLS_CA_FILE", SENTINEL_CA),
             ("TLS_ENABLED", "1"),
+        ];
+        assert_eq!(
+            UpstreamTls::from_lookup(TASK_DB, lookup(&vars)).unwrap(),
+            None
+        );
+    }
+
+    /// THE DEFAULT: no client certificate, so the dial presents no identity and
+    /// behaves exactly as it did before ADR-0516.
+    #[test]
+    fn no_client_certificate_is_the_default() {
+        let vars = [
+            ("TASK_DB_TLS_ENABLED", "1"),
+            ("TASK_DB_TLS_CA_FILE", SENTINEL_CA),
+        ];
+        let tls = UpstreamTls::from_lookup(TASK_DB, lookup(&vars))
+            .unwrap()
+            .expect("a flag and a bundle enable TLS");
+        assert_eq!(tls.client_certificate_file(), None);
+        assert_eq!(tls.client_key_file(), None);
+    }
+
+    /// BOTH PATHS ARRIVE, proved with names the module could not have chosen for
+    /// itself. This is what `rotate::Inputs::upstream` reads to put them in the
+    /// watch set, so a value that stopped travelling here would silently empty
+    /// half the set.
+    #[test]
+    fn the_client_certificate_and_its_key_both_arrive() {
+        let vars = [
+            ("TASK_DB_TLS_ENABLED", "1"),
+            ("TASK_DB_TLS_CA_FILE", SENTINEL_CA),
+            ("TASK_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+            ("TASK_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+        ];
+        let tls = UpstreamTls::from_lookup(TASK_DB, lookup(&vars))
+            .unwrap()
+            .expect("a flag and a bundle enable TLS");
+        assert_eq!(
+            tls.client_certificate_file(),
+            Some(Path::new(SENTINEL_CLIENT_CERT))
+        );
+        assert_eq!(tls.client_key_file(), Some(Path::new(SENTINEL_CLIENT_KEY)));
+    }
+
+    /// HALF AN IDENTITY IS A DEPLOYMENT MISTAKE, refused at boot naming the
+    /// variable rather than at a handshake naming neither. A certificate cannot
+    /// be presented without its key, and a key on its own proves nothing.
+    #[test]
+    fn half_a_client_identity_is_refused() {
+        let cert_only = [
+            ("TASK_DB_TLS_ENABLED", "1"),
+            ("TASK_DB_TLS_CA_FILE", SENTINEL_CA),
+            ("TASK_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+        ];
+        assert!(matches!(
+            UpstreamTls::from_lookup(TASK_DB, lookup(&cert_only)),
+            Err(TlsConfigError::ClientCertificateWithoutKey(TASK_DB))
+        ));
+
+        let key_only = [
+            ("TASK_DB_TLS_ENABLED", "1"),
+            ("TASK_DB_TLS_CA_FILE", SENTINEL_CA),
+            ("TASK_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+        ];
+        assert!(matches!(
+            UpstreamTls::from_lookup(TASK_DB, lookup(&key_only)),
+            Err(TlsConfigError::ClientKeyWithoutCertificate(TASK_DB))
+        ));
+    }
+
+    /// AN EMPTY VALUE IS AN UNSET ONE, the same rule the CA bundle already gets.
+    /// A values override that nulls the Secret name renders an empty string, and
+    /// treating that as a configured path would fail the boot over a deployment
+    /// that simply asked for no identity.
+    #[test]
+    fn an_empty_client_path_is_the_same_as_an_unset_one() {
+        let vars = [
+            ("TASK_DB_TLS_ENABLED", "1"),
+            ("TASK_DB_TLS_CA_FILE", SENTINEL_CA),
+            ("TASK_DB_TLS_CLIENT_CERT_FILE", "  "),
+            ("TASK_DB_TLS_CLIENT_KEY_FILE", ""),
+        ];
+        let tls = UpstreamTls::from_lookup(TASK_DB, lookup(&vars))
+            .unwrap()
+            .expect("a flag and a bundle enable TLS");
+        assert_eq!(tls.client_certificate_file(), None);
+    }
+
+    /// A CLIENT CERTIFICATE WITHOUT THE FLAG IS THE REVERTED STATE, not an
+    /// error. Mutual TLS runs inside the encrypted transport, so the one flag
+    /// turns both off, and leaving the paths in place is how the cut-over gets
+    /// pulled back.
+    #[test]
+    fn a_client_certificate_alone_does_not_enable_tls() {
+        let vars = [
+            ("TASK_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+            ("TASK_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
         ];
         assert_eq!(
             UpstreamTls::from_lookup(TASK_DB, lookup(&vars)).unwrap(),

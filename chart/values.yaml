@@ -68,6 +68,54 @@ taskDb:
     # certificate issued for something else, such as a per-namespace FQDN.
     domain: ""
 
+    # WHO THIS SERVICE SAYS IT IS WHEN IT DIALS task-db — mutual TLS (ADR-0516).
+    #
+    # A THIRD DIRECTION, and it is not either of the two elsewhere in this file.
+    # `tls` below is what task SERVES; `caSecret` above is how task VERIFIES
+    # task-db. This is what task PRESENTS to task-db, so task-db can authenticate
+    # the caller rather than accepting anything that reaches the port.
+    #
+    # WHY A CERTIFICATE RATHER THAN A NetworkPolicy: ADR-0516. A NetworkPolicy is
+    # enforced by the CNI, so the same manifest protects an EKS deployment and
+    # protects nothing on kind — a control that keeps working while it stops
+    # protecting, which is D80's second and worse failure. A certificate check is
+    # enforced by the services themselves and holds identically everywhere. The
+    # NetworkPolicy still ships, as a second layer rather than as the choice.
+    #
+    # EMPTY, AND THAT IS ITS OWN LEVER. Turning `enabled` on above encrypts the
+    # hop and presents NO identity, exactly as before. Naming a Secret here is a
+    # separate change that can be reverted on its own, which is the discipline
+    # this cut-over is being done under.
+    #
+    # A DIFFERENT CERTIFICATE FROM `tls.certSecret` BELOW, and the difference is
+    # not cosmetic. A serving leaf is issued for `server auth` and this one for
+    # `client auth`; a peer that trusts the issuer perfectly well still refuses a
+    # leaf naming the wrong purpose. One authority issues both.
+    #
+    # IT ROTATES, AND IT IS WATCHED. The mount is a DIRECTORY, never subPath, and
+    # both files join the rotation watch set described under `tlsRotation` below.
+    # That matters MORE here than for the serving certificate: ADR-0516 records
+    # that an expired client leaf STOPS this hop rather than degrading it, so a
+    # process that read the file once and never again works perfectly until the
+    # expiry date and then fails hard.
+    #
+    # THE NAME IN THE CERTIFICATE IS `task-caller`, WHICH IS NOT A SERVICE NAME
+    # and is not meant to resolve. Nothing checks it today: task-db's
+    # `client_ca_root` authenticates the DEPLOYMENT that issued the leaf, not
+    # which service presented it. Distinguishing callers is a later change.
+    clientCertSecret: ""
+    # The key inside that Secret holding the certificate, mounted as
+    # `client.crt`. Named rather than assumed, for the reason `caSecretKey` gives.
+    clientCertSecretKey: tls.crt
+    # The key inside that Secret holding the private key, mounted as
+    # `client.key`. Named for the same reason.
+    #
+    # A PRIVATE KEY DOES ENTER THIS POD HERE, unlike the CA mount above, and that
+    # is correct: it is this pod's own key, and a certificate cannot be presented
+    # without it. Both keys are selected by name, so nothing else in the Secret
+    # travels with them.
+    clientKeySecretKey: tls.key
+
 # The TRANSPORT THIS SERVICE SERVES, which is the other half of `taskDb.tls`
 # above: that one encrypts the hop this pod DIALS, this one encrypts the hop the
 # gateway dials to reach this pod. Both halves have to exist before either is
@@ -120,6 +168,58 @@ tls:
   # is free to call them something else.
   certSecretKey: tls.crt
   keySecretKey: tls.key
+
+# HOW A RENEWED CERTIFICATE ACTUALLY REACHES THE PROCESS.
+#
+# Every certificate above is read ONCE, when the listener is built or the dial is
+# made, and tonic cannot swap a running server's TLS configuration. cert-manager
+# renews 30 days before expiry and kubelet refreshes the mounted files — each
+# Secret is mounted as a DIRECTORY rather than with subPath precisely so it does —
+# but the process would go on using its day-0 material until something restarted
+# it (ADR-0523).
+#
+# So task hashes the TLS files it read at boot — the serving certificate, its key,
+# the CA bundle task-db is verified against, and the client certificate and key
+# task presents to task-db — and when one of them changes it logs which, and the
+# old and new fingerprint, waits out this pod's splay, drains, and exits 0.
+# Kubelet restarts the container and the new process reads the fresh files.
+#
+# THE CLIENT CERTIFICATE IS WHAT THIS MATTERS MOST FOR. ADR-0516 records that an
+# expired client leaf STOPS a hop rather than weakening it, so a process that read
+# it once and never again works perfectly until its expiry date and then cannot
+# reach its own store. The serving leaf degrades what callers see; this one takes
+# the hop away.
+#
+# A HASH RATHER THAN A MODIFICATION TIME, and that is not a detail. Kubelet
+# rotates a mounted Secret by renaming a new `..data` symlink over the old one, so
+# every path resolves to a new inode with a new mtime on EVERY resync, changed or
+# not. An mtime check restarts both replicas for nothing.
+#
+# THE FAILURE MODE IS THE POINT: if the watcher dies you get the old behaviour,
+# never worse. `yadgar_tls_certificate_not_after_seconds` is the other half — it
+# reports the expiry of the certificates this process actually loaded, one series
+# each, told apart by a `kind` label carrying `serving` or `client`. So a watcher
+# that stopped working is still visible as a leaf ageing out.
+#
+# UNLIKE iam, THE WATCHER IDLES ON A DEFAULT INSTALL. This service reads no
+# security material outside its transport, so with everything above off the watch
+# set is empty and nothing is polled. The schedule below is still parsed at boot
+# in that case: a value an operator set and the binary cannot use is an error
+# whether or not the watcher would have run.
+tlsRotation:
+  # How often the files are re-hashed. Reading a handful of small files a minute
+  # costs nothing, and the deadline this protects is 30 days wide.
+  pollSeconds: 60
+  # THE LONGEST A POD WAITS BEFORE EXITING, drawn per pod inside that range.
+  #
+  # Both replicas see the refreshed file inside the same kubelet sync window, so
+  # an unsplayed exit can drop both at once — and the PodDisruptionBudget does
+  # NOT govern a self-exit, it constrains eviction. This is the only control
+  # there is. Five minutes against 30 days of slack is free.
+  #
+  # `0` exits immediately, which is what a single-replica or a development
+  # deployment wants.
+  splayMaxSeconds: 300
 
 # D68: scale on CONCURRENCY, not CPU. A -db waits on MariaDB and a logic service
 # waits on its -db, so both saturate at low CPU — a CPU-driven HPA stays quiet

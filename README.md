@@ -94,6 +94,64 @@ D23 sets the blast radius. Each caller holds ONE long-lived HTTP/2 connection, s
 what a skipped drain loses is not a slice of traffic but everything that
 connection was carrying.
 
+**The drain is bounded now, because something other than a signal can start
+one.** `rotate` ends the serve itself, and nothing outside the process bounds a
+drain the process began: `terminationGracePeriodSeconds` never runs for a
+self-exit, and tokio keeps its signal handler installed after the rotation arm
+wins the `select!`, so a later SIGTERM is swallowed and only SIGKILL is left.
+`serve::DRAIN_BUDGET` is 25s against the default 30s grace period; on expiry the
+process logs an error and ends anyway. Its clock starts when shutdown is
+REQUESTED — `tests/drain.rs` is the regression that keeps a budget measuring the
+server's whole life from coming back.
+
+## A renewed certificate arrives by restart, not by reload
+
+The certificate this service presents is read ONCE, when the listener is built,
+and the client certificate it presents to `task-db` is read ONCE, inside the
+dial. `tonic 0.14` cannot swap a running server's TLS configuration, and nothing
+re-reads a dialled channel's identity. cert-manager renews 30 days before expiry
+and kubelet refreshes the mounted files — the chart mounts those Secrets as
+DIRECTORIES rather than with `subPath` precisely so it does — but nothing would
+make the process read them again (ADR-0523).
+
+So `rotate` hashes the files `main` opened, one digest per file, as each is read:
+the serving certificate, its key, the CA bundle `task-db` is verified against, and
+the client certificate and key this service presents to `task-db` (ADR-0516).
+When one of them changes it logs which file, and the old and new leaf
+fingerprint, waits out this pod's splay, drains, and returns. **A rotated
+certificate is not an error, so the process exits 0.**
+
+**The client certificate is the member of that set with the worst failure.**
+ADR-0516 records that an expired CLIENT leaf STOPS a hop rather than weakening
+it, so this service would keep serving and stop being able to reach its own
+store. Both files are mounted as a directory and both are watched, in the same
+change that mounted them.
+
+**A hash, never a modification time.** Kubelet rotates a mounted Secret by
+renaming a new `..data` symlink over the old one, so every path resolves to a new
+inode with a fresh mtime on every resync, changed or not. An mtime check would
+restart both replicas for nothing. `tests/tls_rotation.rs` performs that exact
+swap, including the case where the new generation holds identical bytes.
+
+**The splay is the only thing separating the replicas.** They see the refreshed
+file inside the same kubelet sync window, and a PodDisruptionBudget constrains
+eviction — it does not govern a process that exits on its own.
+
+**And if the watcher dies you get the old behaviour, never worse.** An unreadable
+file is not a changed one, and an empty watch set means no watch — which, unlike
+`iam`, is exactly what a cleartext deployment of this service has.
+`yadgar_tls_certificate_not_after_seconds` is the half that makes the failure
+loud: one series per certificate this process loaded, told apart by a `kind`
+label carrying `serving` or `client`.
+
+**`src/rotate.rs` is a COPY of `iam/src/rotate.rs`**, and its header enumerates
+the four places the two differ. ADR-0523 asks for the core to be lifted into
+shared code before a third copy exists; this change defers that deliberately
+because shared crates here are separate repositories consumed by git tag, so a
+lift needs a fourth repository merged and tagged before this one could compile.
+The lift is its own change, and it carries the five copies of `serve::shutdown`
+with it.
+
 ## Local development
 
 ```bash
@@ -105,24 +163,30 @@ cargo test     # the rules; they need no engine and no -db
 
 ## Configuration
 
-| variable                        | default             |                                                |
-| ------------------------------- | ------------------- | ---------------------------------------------- |
-| `TASK_DB_HOST` / `TASK_DB_PORT` | `task-db` / `50051` | the twin's headless Service                    |
-| `LISTEN`                        | `0.0.0.0:50052`     | the gRPC address this service binds            |
-| `METRICS_LISTEN`                | `0.0.0.0:9090`      | the Prometheus endpoint (D67)                  |
-| `RUST_LOG`                      | `info`              | a DEFAULT, not `from_default_env`'s silence    |
-| `LISTEN_TLS_ENABLED`            | unset               | exactly `1` to serve TLS; anything else is off |
-| `LISTEN_TLS_CERT_FILE`          | unset               | PEM certificate this service PRESENTS          |
-| `LISTEN_TLS_KEY_FILE`           | unset               | its private key                                |
-| `TASK_DB_TLS_ENABLED`           | unset               | exactly `1` to dial `task-db` over TLS         |
-| `TASK_DB_TLS_CA_FILE`           | unset               | PEM bundle `task-db` is VERIFIED against       |
-| `TASK_DB_TLS_DOMAIN`            | unset               | only when the certificate names something else |
+| variable                        | default             |                                                                                                                                                                                                                                                                                    |
+| ------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASK_DB_HOST` / `TASK_DB_PORT` | `task-db` / `50051` | the twin's headless Service                                                                                                                                                                                                                                                        |
+| `LISTEN`                        | `0.0.0.0:50052`     | the gRPC address this service binds                                                                                                                                                                                                                                                |
+| `METRICS_LISTEN`                | `0.0.0.0:9090`      | the Prometheus endpoint (D67)                                                                                                                                                                                                                                                      |
+| `RUST_LOG`                      | `info`              | a DEFAULT, not `from_default_env`'s silence                                                                                                                                                                                                                                        |
+| `LISTEN_TLS_ENABLED`            | unset               | exactly `1` to serve TLS; anything else is off                                                                                                                                                                                                                                     |
+| `LISTEN_TLS_CERT_FILE`          | unset               | PEM certificate this service PRESENTS                                                                                                                                                                                                                                              |
+| `LISTEN_TLS_KEY_FILE`           | unset               | its private key                                                                                                                                                                                                                                                                    |
+| `TASK_DB_TLS_ENABLED`           | unset               | exactly `1` to dial `task-db` over TLS                                                                                                                                                                                                                                             |
+| `TASK_DB_TLS_CA_FILE`           | unset               | PEM bundle `task-db` is VERIFIED against                                                                                                                                                                                                                                           |
+| `TASK_DB_TLS_DOMAIN`            | unset               | only when the certificate names something else                                                                                                                                                                                                                                     |
+| `TASK_DB_TLS_CLIENT_CERT_FILE`  | unset               | the certificate this service PRESENTS to `task-db` — mutual TLS (ADR-0516)                                                                                                                                                                                                         |
+| `TASK_DB_TLS_CLIENT_KEY_FILE`   | unset               | its private key. Both or neither: half an identity is refused at boot                                                                                                                                                                                                              |
+| `TLS_ROTATION_POLL_SECS`        | `60`                | how often the TLS files read at boot are re-hashed. A CHANGE ends the serve: the process drains and exits 0 so kubelet restarts it onto the new material. `0` is REFUSED at boot — it is a hot loop, not a way of turning the watcher off. Parsed at boot whether or not TLS is on |
+| `TLS_ROTATION_SPLAY_MAX_SECS`   | `300`               | the longest this pod waits before that exit, drawn per pod inside the range. Both replicas see the same rotation at once and a PDB does not govern a self-exit, so this is the only thing keeping them apart. `0` exits at once                                                    |
 
-**Two directions, and the prefix says which.** `LISTEN_TLS_*` configures the
+**Three directions, and the prefix says which.** `LISTEN_TLS_*` configures the
 listener — `LISTEN` is already the variable naming the address it binds.
 `TASK_DB_TLS_*` configures the dial, and a dial is named for the upstream it
-reaches. The same rule holds across every service: `iam` reads `LISTEN_TLS_*`
-and `IAM_DB_TLS_*`.
+reaches. Within the dial, `TASK_DB_TLS_CA_FILE` is how this service VERIFIES
+`task-db` and `TASK_DB_TLS_CLIENT_*` is what it PRESENTS to `task-db` — the same
+word, opposite directions. The rule holds across every service: `iam` reads
+`LISTEN_TLS_*` and `IAM_DB_TLS_*`.
 
 Both groups are **opt-in and off**, and every enable flag is exactly the string
 `1` — a permissive parse is how a setting meant to be off ends up on, and how a

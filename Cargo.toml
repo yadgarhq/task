@@ -29,17 +29,33 @@ tonic = { version = "0.14", default-features = false, features = [
   "tls-ring",
 ] }
 tonic-prost = "0.14"
+# The rotation watcher (ADR-0523) parses the leaf it loaded to gauge its expiry
+# and hashes every TLS file it read to notice a change. The same crates `iam`
+# uses for the same module, at the same versions — this is a copy of it, and a
+# copy that drifted on a PEM parser would be one that disagreed about what a
+# certificate is.
+rustls-pki-types = { version = "1", features = ["std"] }
+x509-parser = "0.18"
+sha2 = "0.10"
+# The metrics FACADE only. The binary installs the exporter.
+metrics = "0.24"
 # The shared instrumentation seam (D67). Pinned by release tag, like every other
 # in-org crate — a branch is a moving target, a published tag is not, and
 # Cargo.lock records the revision each tag resolved to.
 # Client-side balancing, shared rather than copied. This began life as
 # src/balance.rs here; the gateway needed the identical logic and the invariant
 # is that anything every service needs is implemented once.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.1.0" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.1.3" }
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.0", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 http = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -49,7 +65,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+  "net",
+  "time",
+  "io-util",
+] }
+metrics-util = { version = "0.20", features = ["debugging"] }
 # `tests/service.rs` serves a scripted TaskDbService on loopback and points the
 # real handlers at it, so the codec, the trailers and the Status round-trip are
 # exercised rather than stubbed. `TcpListenerStream` is what lets the listener be

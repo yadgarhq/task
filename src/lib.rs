@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod rotate;
 pub mod rules;
 pub mod serve;
 pub mod service;
