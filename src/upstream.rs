@@ -395,11 +395,19 @@ mod tests {
     /// they only inspect the configuration — and would ship a cleartext dial
     /// wearing a TLS configuration.
     ///
-    /// `yadgar_dial::connect_tls` checks the CA bundle BEFORE it resolves the
+    /// `yadgar_dial::connect_tls` checks the CA bundle BEFORE it dials the
     /// host, and `connect` does not check bundles at all. So a bundle that does
     /// not exist, against a host that does not resolve, tells the two apart:
-    /// only the TLS path can answer `CaUnreadable`. Drop the `Some` arm and this
-    /// reports `Dns` instead.
+    /// only the TLS path can answer `CaUnreadable`. Drop the `Some` arm and
+    /// this returns `Ok`.
+    ///
+    /// **THAT LAST SENTENCE USED TO SAY `Dns`, and the pin move to `dial`
+    /// v0.2.0 is what changed it.** A cleartext dial at a name that does not
+    /// resolve is no longer an error at all (ADR-0532), so the cleartext arm
+    /// answers `Ok` rather than a different error. The discrimination survives
+    /// — an unusable bundle is still refused before a channel exists — and
+    /// `a_cleartext_dial_reads_no_bundle` below asserts the two answers against
+    /// each other rather than each against a constant.
     #[tokio::test]
     async fn a_tls_dial_goes_through_connect_tls_and_not_through_connect() {
         let vars = [
@@ -420,16 +428,48 @@ mod tests {
     }
 
     /// The other direction, so the case above cannot start passing because
-    /// everything became TLS. A cleartext dial reads no bundle and fails on the
-    /// name, which is the behaviour this service has always had.
+    /// everything became TLS.
+    ///
+    /// **AN ABSENT `task-db` IS NO LONGER A FAILED DIAL, and this case is
+    /// where the pin move to `dial` v0.2.0 announced itself.** It asserted
+    /// `BalanceError::Dns` and went RED on the bump. ADR-0532 made the boot dial
+    /// lazy: a name with no Service behind it yet is seeded into the balancer
+    /// and dialled, so `connect` hands back a channel and the failure moves to
+    /// the request. `Dns` and `DnsTimedOut` remain `BalanceError` variants, and
+    /// as far as this repository can tell no public entry point of that crate
+    /// returns either one now: `resolve` is private, `connect_with` warns and
+    /// continues with an empty set, and the refresh loop reports through
+    /// `still_absent` and continues. Nothing here tests that claim about
+    /// another crate's internals, so it is written as a reading rather than a
+    /// property.
+    ///
+    /// **THIS IS A DIFFERENTIAL PAIR, not two assertions against constants.**
+    /// Each `assert!` below IS against a constant — that is unavoidable and not
+    /// the point. What the case buys is that the two calls differ in ONE thing,
+    /// the `tls` argument: same host, same port, same function. So a `connect`
+    /// that ignored that argument could not pass both, which is the mutant
+    /// `is_ok()` on its own would let through.
     #[tokio::test]
     async fn a_cleartext_dial_reads_no_bundle() {
+        let vars = [
+            ("TASK_DB_TLS_ENABLED", "1"),
+            ("TASK_DB_TLS_CA_FILE", SENTINEL_CA),
+        ];
+        let tls = UpstreamTls::from_lookup(TASK_DB, lookup(&vars))
+            .unwrap()
+            .unwrap();
+
+        let cleartext = connect(UNRESOLVABLE, 50051, None).await;
+        let encrypted = connect(UNRESOLVABLE, 50051, Some(&tls)).await;
+
         assert!(
-            matches!(
-                connect(UNRESOLVABLE, 50051, None).await,
-                Err(BalanceError::Dns { .. })
-            ),
-            "a cleartext dial must go straight to the resolver"
+            cleartext.is_ok(),
+            "a name that does not resolve must not fail the dial: {:?}",
+            cleartext.err()
+        );
+        assert!(
+            matches!(encrypted, Err(BalanceError::CaUnreadable { .. })),
+            "the same host with a bundle must still read it: {encrypted:?}"
         );
     }
 
