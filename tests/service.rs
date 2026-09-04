@@ -2,8 +2,8 @@
 //!
 //! `service.rs` had no tests at all, and `passthrough` decides every status code
 //! this API ever returns. A handler could collapse `FAILED_PRECONDITION` — the
-//! one code whose contract is "re-read and retry" — into `INTERNAL`, and nothing
-//! in the repository would have noticed.
+//! one code whose contract is a refusal a re-read may clear — into `INTERNAL`,
+//! and nothing in the repository would have noticed.
 //!
 //! THESE RUN A REAL SERVER. The mock is a `TaskDbService` served over loopback,
 //! not a hand-rolled stand-in for the client, because the properties under test
@@ -298,14 +298,34 @@ async fn a_store_not_found_reaches_the_caller_as_not_found() {
 
 /// The code a client is contractually told to retry on. Folding it into
 /// `INTERNAL` would turn a recoverable conflict into an outage.
+///
+/// **AND THE ADVICE MUST BE FOLLOWABLE, WHICH IS WHY THIS ASSERTS THE WHOLE
+/// STRING.** The old message said "re-read and retry" unconditionally. After
+/// ADR-0522 enforcement landed in `task-db`, an owner who left a team can
+/// `ReadTask` their own `TEAM`-visible record and is still refused the edit — so
+/// the re-read SUCCEEDS and returns the same version, and a client obeying that
+/// advice re-sends a byte-identical request for ever. `src/service.rs` already
+/// refuses a forbidden status transition with `INVALID_ARGUMENT` for exactly
+/// this reason: "A code that invites a retry which can never succeed is worse
+/// than a plain refusal — a client obeying the contract loops."
+///
+/// The three re-read outcomes a caller can OBSERVE are what the advice now
+/// branches on, and the three causes stay a disjunction so the string discloses
+/// no more than the code does: a caller who reaches the record already knows it
+/// exists, and one who cannot gets `NOT_FOUND` from the re-read. Whether a row
+/// is there is not decidable from this message.
+///
+/// `assert_eq!` rather than `contains`: the message IS the contract here, so a
+/// substring match would let half of it drift away.
 #[tokio::test]
-async fn a_version_conflict_reaches_the_caller_as_failed_precondition() {
+async fn a_version_conflict_reaches_the_caller_with_advice_it_can_follow() {
     let status = read_failing_with(Code::FailedPrecondition, DB_DETAIL).await;
     assert_eq!(status.code(), Code::FailedPrecondition);
-    assert!(
-        status.message().contains("re-read and retry"),
-        "the code says retry but the message does not: {}",
-        status.message()
+    assert_eq!(
+        status.message(),
+        "a version mismatch, no such task in this scope, or a task you may read but not \
+         modify. Re-read: if the version has moved, retry with the new one. If the read \
+         returns the same version, or returns nothing, retrying will fail identically."
     );
 }
 

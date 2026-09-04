@@ -48,6 +48,7 @@
 
 pub use yadgar_lifecycle::rotate::{
     watch, File, Inputs, Material, Presented, Schedule, ScheduleError, CERTIFICATE_NOT_AFTER,
+    WATCHED_FILES_UNREADABLE,
 };
 
 use crate::serve::ServeTls;

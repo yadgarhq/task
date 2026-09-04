@@ -52,9 +52,10 @@ impl Task {
 
 /// A `-db` failure is passed through with its CODE intact but not its message.
 ///
-/// The code is the caller's contract — `FAILED_PRECONDITION` means "re-read and
-/// retry", `NOT_FOUND` means what it says — and collapsing everything to
-/// `INTERNAL` would destroy that. The message is not passed through: it may name
+/// The code is the caller's contract — `FAILED_PRECONDITION` means a refusal a
+/// re-read MAY clear, `NOT_FOUND` means what it says — and collapsing everything
+/// to `INTERNAL` would destroy that. The word "may" is load-bearing and the arm
+/// below carries why. The message is not passed through: it may name
 /// tables and columns, and a client of the public API has no business seeing the
 /// storage layer's vocabulary.
 ///
@@ -79,8 +80,31 @@ fn passthrough(status: Status, op: &str) -> Status {
     );
     match status.code() {
         tonic::Code::NotFound => Status::not_found("no such task in this scope"),
+        // THE ADVICE IS CONDITIONAL ON WHAT THE CALLER CAN OBSERVE, and it has
+        // to be. This used to say "re-read and retry" unconditionally, which was
+        // followable only while the causes agreed: a caller who could not edit a
+        // record could not read it either, so the re-read failed and the caller
+        // stopped. ADR-0522 grants an owner who left a team the READ of their own
+        // TEAM-visible record and deliberately does not widen the edit — so the
+        // re-read now SUCCEEDS and returns the same version, and a client obeying
+        // the old advice re-sent a byte-identical request for ever. The rule this
+        // broke is stated a hundred lines below, at the `may_transition` refusal:
+        // a code that invites a retry which can never succeed is worse than a
+        // plain refusal.
+        //
+        // THREE DISJUNCTS DISCLOSE NO MORE THAN TWO DID. A caller who reaches the
+        // record already knows it exists; one who cannot gets NOT_FOUND from the
+        // re-read and learns nothing it could not learn anyway. Whether a row is
+        // there is not decidable from this string.
+        //
+        // `task-db`'s own refusal was fixed to the same shape in task-db#33. This
+        // is NOT that message forwarded — see the paragraph above on why the
+        // store's text never reaches a caller — it is the same defect fixed
+        // independently at the boundary that owns the words an end caller sees.
         tonic::Code::FailedPrecondition => Status::failed_precondition(
-            "the task changed since you read it, or you may not modify it — re-read and retry",
+            "a version mismatch, no such task in this scope, or a task you may read but not \
+             modify. Re-read: if the version has moved, retry with the new one. If the read \
+             returns the same version, or returns nothing, retrying will fail identically.",
         ),
         tonic::Code::InvalidArgument => Status::invalid_argument("invalid request"),
         // The store could not serialise this write against a concurrent one, and
@@ -413,8 +437,8 @@ impl TaskService for Task {
                 // boundary and not the rules.
                 //
                 // INVALID_ARGUMENT, not FAILED_PRECONDITION. `passthrough`
-                // documents the latter as "re-read and retry", and there is
-                // nothing to re-read: DROPPED -> OPEN is refused by the rule
+                // documents the latter as a refusal a re-read may clear, and
+                // there is nothing to re-read: DROPPED -> OPEN is refused by the rule
                 // itself and will be refused identically forever. A code that
                 // invites a retry which can never succeed is worse than a plain
                 // refusal — a client obeying the contract loops.
