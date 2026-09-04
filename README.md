@@ -115,8 +115,8 @@ part of the crash loop this change genuinely removes.
 
 Kubernetes ends a pod by sending **SIGTERM**, then waits out
 `terminationGracePeriodSeconds` before SIGKILL. It never sends SIGINT. So
-`serve::shutdown` listens for both, and it installs the handlers when it is
-CALLED rather than when the future is first polled — a signal arriving in that
+`yadgar_lifecycle::shutdown` listens for both, and it installs the handlers when
+it is CALLED rather than when the future is first polled — a signal arriving in that
 window would otherwise take SIGTERM's default disposition and kill the process
 mid-request.
 
@@ -129,10 +129,10 @@ one.** `rotate` ends the serve itself, and nothing outside the process bounds a
 drain the process began: `terminationGracePeriodSeconds` never runs for a
 self-exit, and tokio keeps its signal handler installed after the rotation arm
 wins the `select!`, so a later SIGTERM is swallowed and only SIGKILL is left.
-`serve::DRAIN_BUDGET` is 25s against the default 30s grace period; on expiry the
-process logs an error and ends anyway. Its clock starts when shutdown is
-REQUESTED — `tests/drain.rs` is the regression that keeps a budget measuring the
-server's whole life from coming back.
+`yadgar_lifecycle::DRAIN_BUDGET` is 25s against the default 30s grace period; on
+expiry the process logs an error and ends anyway. Its clock starts when shutdown
+is REQUESTED, and the crate's `tests/drain.rs` is the regression that keeps a
+budget measuring the server's whole life from coming back.
 
 ## A renewed certificate arrives by restart, not by reload
 
@@ -160,8 +160,9 @@ change that mounted them.
 **A hash, never a modification time.** Kubelet rotates a mounted Secret by
 renaming a new `..data` symlink over the old one, so every path resolves to a new
 inode with a fresh mtime on every resync, changed or not. An mtime check would
-restart both replicas for nothing. `tests/tls_rotation.rs` performs that exact
-swap, including the case where the new generation holds identical bytes.
+restart both replicas for nothing. `yadgar-lifecycle`'s `tests/rotation.rs`
+performs that exact swap, including the case where the new generation holds
+identical bytes.
 
 **The splay is the only thing separating the replicas.** They see the refreshed
 file inside the same kubelet sync window, and a PodDisruptionBudget constrains
@@ -174,13 +175,17 @@ file is not a changed one, and an empty watch set means no watch — which, unli
 loud: one series per certificate this process loaded, told apart by a `kind`
 label carrying `serving` or `client`.
 
-**`src/rotate.rs` is a COPY of `iam/src/rotate.rs`**, and its header enumerates
-the four places the two differ. ADR-0523 asks for the core to be lifted into
-shared code before a third copy exists; this change defers that deliberately
-because shared crates here are separate repositories consumed by git tag, so a
-lift needs a fourth repository merged and tagged before this one could compile.
-The lift is its own change, and it carries the five copies of `serve::shutdown`
-with it.
+**The watcher itself is `yadgar-lifecycle`'s now**, pinned by tag per ADR-0526.
+`src/rotate.rs` was a near-byte-identical copy of `iam/src/rotate.rs`, with
+`gateway` carrying a third, which is the state ADR-0523 asked to be ended before
+it existed. What is left in this repository is `rotate::watch_set` — the one
+expression naming what a `task` reads at boot — and the two `Material`
+implementations that say which files its listener and its upstream each read.
+
+**That function is the point of the lift, not the de-duplication.** The set used
+to be two builder calls in `main.rs`, and no test here spawns the binary: either
+could be deleted and every test still passed. `main.rs` calls `watch_set` now and
+`tests/assembly.rs` calls the same function, so that edit turns a test red.
 
 ## Local development
 

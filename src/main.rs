@@ -60,6 +60,7 @@
 
 use std::net::SocketAddr;
 
+use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
 use yadgar_task::rotate;
 use yadgar_task::serve::{self, ServeTls, LISTEN};
@@ -100,14 +101,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls = ServeTls::from_env(LISTEN).map_err(|e| e.to_string())?;
     let mut server = serve::builder(tls.as_ref()).map_err(|e| e.to_string())?;
 
-    // THE BASELINE IS TAKEN HERE, BESIDE THE CODE THAT LOADED THE FILES, and
-    // that is why the set is assembled as boot proceeds rather than at the end.
-    // Deferring the first reading to the watcher's first poll would put the rest
-    // of boot — the `task-db` dial — inside a window where a kubelet swap makes
-    // the NEW file the baseline: the real rotation is then never noticed, and
-    // the gauge describes a certificate the listener is not serving.
-    let mut tls_inputs = rotate::Inputs::default().listener(tls.as_ref());
-
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
     let db_host = env_or("TASK_DB_HOST", "task-db");
@@ -134,6 +127,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same reason the gateway stringifies `Limits::parse`.
     let db_tls = UpstreamTls::from_env(TASK_DB).map_err(|e| e.to_string())?;
 
+    // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION AND BEFORE THE
+    // DIAL (ADR-0523). The baseline is the bytes each file held when this
+    // process read them, and every entry is hashed as `watch_set` folds it —
+    // deferring the first reading to the watcher's first poll would put the rest
+    // of boot inside a window where a kubelet swap quietly becomes the baseline,
+    // and the real rotation would never be noticed.
+    //
+    // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be two builder calls
+    // forty lines apart in this function, where nothing could reach them: no
+    // test spawns this binary, so deleting either compiled and passed
+    // everything. The list lives in `rotate::watch_set` now and
+    // `tests/assembly.rs` calls it.
+    let tls_inputs = rotate::watch_set(tls.as_ref(), db_tls.as_ref());
+
     // PARSED AT BOOT WHETHER OR NOT ANY TLS IS CONFIGURED. A value an operator
     // set and this binary cannot use is a mistake to refuse, not one to paper
     // over with a default nobody chose — and refusing it here means it is
@@ -152,12 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls = db_tls.is_some(),
         "connected to task-db"
     );
-
-    // THE CA BUNDLE AND THE CLIENT IDENTITY TOGETHER (ADR-0516, ADR-0523). The
-    // client certificate is read once inside `connect_tls`, out of a directory
-    // mount that rotates, and an expired one STOPS this hop rather than merely
-    // degrading it.
-    tls_inputs = tls_inputs.upstream(db_tls.as_ref());
 
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure here
@@ -181,11 +182,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
 
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
-    // than an accident of where the line sits. `serve::shutdown` installs both
-    // signal handlers when it is CALLED — a SIGTERM arriving between here and
+    // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
+    // installs both signal handlers when it is CALLED — a SIGTERM arriving between here and
     // the first poll of the future would otherwise take the process's default
     // disposition and kill it outright.
-    let signals = serve::shutdown().map_err(|e| {
+    let signals = shutdown().map_err(|e| {
         format!("the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one")
     })?;
 
@@ -195,7 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         watching = tls_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
-        drain_budget_secs = serve::DRAIN_BUDGET.as_secs(),
+        drain_budget_secs = DRAIN_BUDGET.as_secs(),
         "task listening"
     );
 
@@ -218,10 +219,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             () = rotate::watch(tls_inputs, schedule) => {}
         }
     };
-    match serve::drain_within(serving, ask_to_stop, stop, serve::DRAIN_BUDGET).await {
-        serve::Drain::Finished(result) => result?,
-        serve::Drain::Overran => tracing::error!(
-            budget_secs = serve::DRAIN_BUDGET.as_secs(),
+    match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
+        Drain::Finished(result) => result?,
+        Drain::Overran => tracing::error!(
+            budget_secs = DRAIN_BUDGET.as_secs(),
             "the drain did not finish within its budget; ending anyway with calls still in \
              flight. A request blocked this long is the thing to look at"
         ),
