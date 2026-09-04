@@ -29,16 +29,15 @@ tonic = { version = "0.14", default-features = false, features = [
   "tls-ring",
 ] }
 tonic-prost = "0.14"
-# The rotation watcher (ADR-0523) parses the leaf it loaded to gauge its expiry
-# and hashes every TLS file it read to notice a change. The same crates `iam`
-# uses for the same module, at the same versions — this is a copy of it, and a
-# copy that drifted on a PEM parser would be one that disagreed about what a
-# certificate is.
-rustls-pki-types = { version = "1", features = ["std"] }
-x509-parser = "0.18"
-sha2 = "0.10"
-# The metrics FACADE only. The binary installs the exporter.
-metrics = "0.24"
+# How this process starts, stops and restarts: ADR-0523's exit-on-change
+# rotation watcher, the SIGTERM drain, and the budget that bounds it. It was
+# three files in this repository and two others, and the copies had begun to
+# drift — a PEM parser that drifted would be one that disagreed about what a
+# certificate is. The PEM and X.509 parsers and the hash are ITS dependencies
+# now, so they are gone from this manifest.
+#
+# Pinned by a published tag per ADR-0526, like every other in-org crate.
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.0" }
 # The shared instrumentation seam (D67). Pinned by release tag, like every other
 # in-org crate — a branch is a moving target, a published tag is not, and
 # Cargo.lock records the revision each tag resolved to.
@@ -73,6 +72,11 @@ tokio = { version = "1", features = [
   "time",
   "io-util",
 ] }
+# `with_local_recorder`, beside `metrics-util`'s `DebuggingRecorder`: the only
+# way `tests/assembly.rs` can assert that the gauge this service publishes
+# carries `service = "task"`. The FACADE only, and a dev-dependency now — the
+# binary installs the exporter and `yadgar-lifecycle` owns the gauge.
+metrics = "0.24"
 metrics-util = { version = "0.20", features = ["debugging"] }
 # `tests/service.rs` serves a scripted TaskDbService on loopback and points the
 # real handlers at it, so the codec, the trailers and the Status round-trip are

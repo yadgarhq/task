@@ -505,9 +505,9 @@ mod tests {
     }
 
     /// BOTH PATHS ARRIVE, proved with names the module could not have chosen for
-    /// itself. This is what `rotate::Inputs::upstream` reads to put them in the
-    /// watch set, so a value that stopped travelling here would silently empty
-    /// half the set.
+    /// itself. This is what `UpstreamTls`'s `Material` implementation reads to
+    /// put them in the watch set, so a value that stopped travelling here would
+    /// silently empty half the set.
     #[test]
     fn the_client_certificate_and_its_key_both_arrive() {
         let vars = [
