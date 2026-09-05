@@ -37,7 +37,7 @@ tonic-prost = "0.14"
 # now, so they are gone from this manifest.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.2" }
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.3" }
 # The shared instrumentation seam (D67). Pinned by release tag, like every other
 # in-org crate — a branch is a moving target, a published tag is not, and
 # Cargo.lock records the revision each tag resolved to.
@@ -45,7 +45,7 @@ yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v
 # src/balance.rs here; the gateway needed the identical logic and the invariant
 # is that anything every service needs is implemented once.
 yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.1" }
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.0", features = ["grpc"] }
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.1", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
 tokio = { version = "1", features = [
