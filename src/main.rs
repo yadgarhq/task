@@ -127,6 +127,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same reason the gateway stringifies `Limits::parse`.
     let db_tls = UpstreamTls::from_env(TASK_DB).map_err(|e| e.to_string())?;
 
+    // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
+    // `yadgarhq/config` renders into the `shared` ConfigMap, mounted at
+    // `/etc/yadgar/config/shared/shared.yaml`. There is no compiled-in default
+    // behind it any more: an absent, empty, or half-written document refuses the
+    // boot and names the file. The chart still sets TLS_ROTATION_POLL_SECS and
+    // TLS_ROTATION_SPLAY_MAX_SECS — this binary no longer reads either, but they
+    // stay so a rollout that lands this chart before this binary's digest still
+    // resolves a schedule on the old one. The runbook is `yadgarhq/deploy`'s
+    // MIGRATION_NOTES.md, steps 2a and 2b — NOT this repository's, which has no
+    // such section.
+    let config = rotate::Configuration::mounted();
+
     // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION AND BEFORE THE
     // DIAL (ADR-0523). The baseline is the bytes each file held when this
     // process read them, and every entry is hashed as `watch_set` folds it —
@@ -134,19 +146,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // of boot inside a window where a kubelet swap quietly becomes the baseline,
     // and the real rotation would never be noticed.
     //
+    // THE MOUNTED DOCUMENT JOINS THE SAME SET, as a third `Material` — an
+    // operator editing `shared.yaml` now restarts this pod exactly as editing a
+    // certificate would.
+    //
     // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be two builder calls
     // forty lines apart in this function, where nothing could reach them: no
     // test spawns this binary, so deleting either compiled and passed
     // everything. The list lives in `rotate::watch_set` now and
     // `tests/assembly.rs` calls it.
-    let tls_inputs = rotate::watch_set(tls.as_ref(), db_tls.as_ref());
+    let watch_inputs = rotate::watch_set(tls.as_ref(), db_tls.as_ref(), &config);
 
-    // PARSED AT BOOT WHETHER OR NOT ANY TLS IS CONFIGURED. A value an operator
-    // set and this binary cannot use is a mistake to refuse, not one to paper
-    // over with a default nobody chose — and refusing it here means it is
-    // refused on a cleartext deployment too, which is where it would otherwise
-    // sit unnoticed until the cut-over.
-    let schedule = rotate::Schedule::from_env().map_err(|e| e.to_string())?;
+    // READ FROM THE SAME DOCUMENT THE WATCH SET JUST JOINED, whether or not any
+    // TLS is configured. A value the document names and this binary cannot use
+    // is a mistake to refuse, not one to paper over with a default nobody
+    // chose — and refusing it here means it is refused on a cleartext
+    // deployment too, which is where it would otherwise sit unnoticed until the
+    // cut-over.
+    let schedule = config.schedule().map_err(|e| e.to_string())?;
     let channel = upstream::connect(&db_host, db_port, db_tls.as_ref())
         .await
         // Same reasoning, and it matters more here: `BalanceError`'s messages
@@ -174,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // AFTER THE EXPORTER, NEVER BEFORE IT. A value recorded before there is a
     // recorder is a value nobody ever sees.
-    tls_inputs.export_not_after();
+    watch_inputs.export_not_after();
 
     // Named on the way out, for the reason given on TASK_DB_PORT above.
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052")
@@ -193,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         %addr,
         tls = tls.is_some(),
-        watching = tls_inputs.watched().len(),
+        watching = watch_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
         drain_budget_secs = DRAIN_BUDGET.as_secs(),
@@ -216,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stop = async {
         tokio::select! {
             () = signals => {}
-            () = rotate::watch(tls_inputs, schedule) => {}
+            () = rotate::watch(watch_inputs, schedule) => {}
         }
     };
     match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {

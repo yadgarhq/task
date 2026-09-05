@@ -201,11 +201,17 @@ tls:
 # each, told apart by a `kind` label carrying `serving` or `client`. So a watcher
 # that stopped working is still visible as a leaf ageing out.
 #
-# UNLIKE iam, THE WATCHER IDLES ON A DEFAULT INSTALL. This service reads no
-# security material outside its transport, so with everything above off the watch
-# set is empty and nothing is polled. The schedule below is still parsed at boot
-# in that case: a value an operator set and the binary cannot use is an error
-# whether or not the watcher would have run.
+# THE WATCHER NO LONGER IDLES ON A DEFAULT INSTALL, and this paragraph used to
+# say it did. With everything above off the watch set used to be empty and
+# nothing was polled; since the mounted configuration document joined the set
+# unconditionally (step 2a, ADR-0569, ADR-0570), every pod polls
+# `shared/shared.yaml` on any install and will drain and exit when an operator
+# edits it. That is ADR-0523 working, not a fault.
+#
+# THE TWO VALUES BELOW ARE NO LONGER READ BY THIS BINARY EITHER. They are
+# rendered so that a rollout landing this chart before this binary's digest
+# still resolves a schedule on the old one, and step 2b deletes them once that
+# digest has landed — see `yadgarhq/deploy`'s MIGRATION_NOTES.md.
 tlsRotation:
   # How often the files are re-hashed. Reading a handful of small files a minute
   # costs nothing, and the deadline this protects is 30 days wide.
