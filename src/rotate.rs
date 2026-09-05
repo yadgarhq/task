@@ -47,8 +47,8 @@
 //! SAME function, so deleting a member from the list below turns a test red.
 
 pub use yadgar_lifecycle::rotate::{
-    watch, File, Inputs, Material, Presented, Schedule, ScheduleError, CERTIFICATE_NOT_AFTER,
-    WATCHED_FILES_UNREADABLE,
+    watch, Configuration, File, Inputs, Material, Presented, Schedule, ScheduleError,
+    CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
 use crate::serve::ServeTls;
@@ -106,15 +106,30 @@ impl Material for UpstreamTls {
 ///
 /// **THE LIST IS THE ASSERTION.** A service lists what it HAS. TLS is opt-in at
 /// both ends here and off by default, and `Option<M>: Material` folds an absent
-/// one to nothing, so neither argument needs a branch. A watch set that is empty
-/// because nothing is configured is the ordinary cleartext deployment, and
-/// [`yadgar_lifecycle::rotate::watch`] never ends on one.
+/// one to nothing, so neither TLS argument needs a branch.
+///
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE THIRD MEMBER, AND IT IS NOT
+/// OPTIONAL (step 2a).** `config` is `shared/shared.yaml`, mounted from
+/// `yadgarhq/config`'s `shared` ConfigMap, and it is a [`Material`] like the
+/// other two: `Configuration` implements the trait by returning the one file it
+/// read its schedule from (`yadgar_lifecycle::rotate::Configuration::files`), so
+/// folding it in here joins the document to the ADR-0523 watch set through the
+/// same `Inputs::also` path the listener and the upstream identity already take.
+/// Unlike them it takes `&Configuration` rather than `Option<&Configuration>`
+/// and is folded LAST — every deployment mounts it, so a watch set with neither
+/// TLS setting configured is no longer empty the way `each_configured_half_
+/// contributes_on_its_own` used to assert: an operator editing `shared.yaml`
+/// restarts this pod exactly as editing a certificate would.
 ///
 /// Called from `main.rs` INSIDE boot, beside the code that read these files:
 /// every entry is hashed as it is added, so the baseline is the bytes the
 /// process actually loaded. Collecting paths and reading them when the watcher
 /// first polls would put the rest of boot inside a window where a kubelet swap
 /// quietly becomes the baseline, and the real rotation would never be noticed.
-pub fn watch_set(listener: Option<&ServeTls>, upstream: Option<&UpstreamTls>) -> Inputs {
-    Inputs::of(SERVICE, &[&listener, &upstream])
+pub fn watch_set(
+    listener: Option<&ServeTls>,
+    upstream: Option<&UpstreamTls>,
+    config: &Configuration,
+) -> Inputs {
+    Inputs::of(SERVICE, &[&listener, &upstream, config])
 }
