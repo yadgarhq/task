@@ -67,8 +67,36 @@ use yadgar_task::serve::{self, ServeTls, LISTEN};
 use yadgar_task::service::Task;
 use yadgar_task::upstream::{self, UpstreamTls, TASK_DB};
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// One configuration knob, read from its ONE source, with no compiled-in
+/// default behind it (ADR-0569).
+///
+/// This replaced `env_or(key, default)`, and the deletion is the point rather
+/// than the rename: while the helper took a `default` argument, every knob in
+/// this binary had somewhere for a fallback to live, and a fallback is invisible
+/// at the point of use, survives an upgrade unnoticed, and makes the effective
+/// setting depend on which layer a reader happens to inspect.
+///
+/// AN EMPTY VALUE REFUSES TOO, and with its own message. A set-but-empty
+/// variable and an absent one collapsing into a single branch is a defect this
+/// estate found three separate times in one week: Helm renders an unset value as
+/// `""`, so the empty case is what a nulled chart value actually produces, and it
+/// is the one an operator is most likely to hit. This repository has no
+/// exception to the rule: every knob `task` reads is required, and none of them
+/// treats an empty value as a declared state.
+fn env_required(key: &str) -> Result<String, String> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(format!(
+            "{key} is set but EMPTY. It has no compiled-in default (ADR-0569), so there is \
+             nothing to fall back to. The chart renders it; a values override that nulls it \
+             produces exactly this."
+        )),
+        Err(_) => Err(format!(
+            "{key} is NOT SET. It has no compiled-in default (ADR-0569): this process reads \
+             it from the environment alone and refuses to start rather than invent a value. \
+             The chart renders it."
+        )),
+    }
 }
 
 #[tokio::main]
@@ -103,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
-    let db_host = env_or("TASK_DB_HOST", "task-db");
+    let db_host = env_required("TASK_DB_HOST")?;
     // STRINGIFIED AND NAMED, for the same reason as every other error in this
     // function: `main` returns `Box<dyn Error>`, which Rust prints with DEBUG. A
     // bare `?` here yields `ParseIntError { kind: InvalidDigit }`, and the two
@@ -111,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // output is `AddrParseError(())` tells an operator neither which variable was
     // wrong nor what it held. These three were the last bare `?`s left beside the
     // comments explaining why nothing else is one.
-    let db_port: u16 = env_or("TASK_DB_PORT", "50051")
+    let db_port: u16 = env_required("TASK_DB_PORT")?
         .parse()
         .map_err(|e| format!("TASK_DB_PORT is not a port number: {e}"))?;
 
@@ -182,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is logged and ignored: a service that cannot export metrics should still
     // serve traffic, which is D25's rule applied to the metrics path too.
     // Named on the way out, for the reason given on TASK_DB_PORT above.
-    let metrics_addr: SocketAddr = env_or("METRICS_LISTEN", "0.0.0.0:9090")
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
         .parse()
         .map_err(|e| format!("METRICS_LISTEN is not a host:port address: {e}"))?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
@@ -194,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     watch_inputs.export_not_after();
 
     // Named on the way out, for the reason given on TASK_DB_PORT above.
-    let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052")
+    let addr: SocketAddr = env_required("LISTEN")?
         .parse()
         .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
 
@@ -246,4 +274,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_required;
+
+    // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
+    // runs these on threads of one process, so tests sharing a variable name
+    // would pass or fail depending on scheduling.
+
+    /// The case a naive test omits, and the only one that proves the value is
+    /// USED. A test that merely asserts "boot succeeds" passes just as happily
+    /// with a compiled-in default still in place behind the read.
+    #[test]
+    fn a_set_value_is_returned_verbatim() {
+        std::env::set_var("YADGAR_TEST_REQUIRED_PRESENT", "0.0.0.0:8080");
+        assert_eq!(
+            env_required("YADGAR_TEST_REQUIRED_PRESENT").as_deref(),
+            Ok("0.0.0.0:8080")
+        );
+    }
+
+    #[test]
+    fn an_absent_knob_refuses_and_names_itself() {
+        std::env::remove_var("YADGAR_TEST_REQUIRED_ABSENT");
+        let err = env_required("YADGAR_TEST_REQUIRED_ABSENT").unwrap_err();
+        assert!(
+            err.contains("YADGAR_TEST_REQUIRED_ABSENT"),
+            "the refusal must name the knob, got: {err}"
+        );
+        assert!(err.contains("NOT SET"), "got: {err}");
+    }
+
+    /// **THE CASE THAT DISCRIMINATES.** Helm renders an unset value as `""`, so
+    /// a nulled chart value arrives here as set-but-empty rather than as absent.
+    /// An implementation that collapses the two into one branch is the defect
+    /// this estate found three separate times in one week, so the messages are
+    /// asserted to DIFFER rather than merely to exist.
+    #[test]
+    fn an_empty_knob_refuses_with_its_own_message() {
+        std::env::set_var("YADGAR_TEST_REQUIRED_EMPTY", "");
+        std::env::remove_var("YADGAR_TEST_REQUIRED_EMPTY_ABSENT");
+        let empty = env_required("YADGAR_TEST_REQUIRED_EMPTY").unwrap_err();
+        let absent = env_required("YADGAR_TEST_REQUIRED_EMPTY_ABSENT").unwrap_err();
+        assert!(empty.contains("set but EMPTY"), "got: {empty}");
+        assert!(
+            empty.replace("YADGAR_TEST_REQUIRED_EMPTY", "K")
+                != absent.replace("YADGAR_TEST_REQUIRED_EMPTY_ABSENT", "K"),
+            "empty and absent must not share one message"
+        );
+    }
 }
