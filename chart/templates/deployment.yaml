@@ -81,6 +81,15 @@ spec:
               value: {{ .Values.taskDb.host | quote }}
             - name: TASK_DB_PORT
               value: {{ .Values.taskDb.port | quote }}
+            # STATED HERE BECAUSE THE BINARY NO LONGER CARRIES A DEFAULT
+            # (ADR-0569). Both used to fall back to a compiled-in value when
+            # unset; that fallback is gone, so a value it renders nowhere is a
+            # pod that refuses to boot. LISTEN's port must agree with the
+            # containerPort in the ports block above.
+            - name: LISTEN
+              value: "0.0.0.0:50052"
+            - name: METRICS_LISTEN
+              value: "0.0.0.0:9090"
             {{- if .Values.taskDb.tls.enabled }}
             # RENDERED ONLY WHEN TLS IS ASKED FOR, so a deployment that has not
             # cut over sends the binary nothing at all and takes the cleartext
