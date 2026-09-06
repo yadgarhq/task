@@ -217,6 +217,7 @@ impl ServeTls {
 }
 
 fn read(path: &Path, what: &'static str) -> Result<Vec<u8>, ServeTlsError> {
+    // ADR-0523-WATCHED: ServeTls
     std::fs::read(path).map_err(|source| ServeTlsError::Unreadable {
         what,
         path: path.to_path_buf(),
