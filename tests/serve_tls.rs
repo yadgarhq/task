@@ -34,7 +34,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Barrier, OnceLock};
 use std::time::Duration;
 
 use rcgen::{
@@ -147,9 +147,15 @@ impl TempPem {
     }
 }
 
-/// The property [`unique_name`] exists for, and it is deterministic: `pid` and
-/// `run_id` are constant within this process, so two names differ if and only if
-/// the counter made them differ.
+/// The SEQUENTIAL property, and it is a mutation guard rather than a
+/// reproduction — said plainly because the distinction was measured, and
+/// because this test alone read as coverage of ledger 531 for four months. It
+/// PASSES against the clock-based name it was written for: same-thread readings
+/// of `SystemTime::now()` advance by tens of nanoseconds and never repeat, so a
+/// sequential assertion cannot see the defect at all.
+///
+/// It is still worth keeping. `pid` and `run_id` are constant within this
+/// process, so two names differ if and only if the counter made them differ.
 ///
 /// MUTATION: replace `fetch_add(1, ..)` with `load(..)` and this fails on every
 /// run rather than one run in some number.
@@ -159,6 +165,45 @@ fn two_temporary_names_are_never_the_same_name() {
 
     let many: HashSet<String> = (0..1000).map(|_| unique_name()).collect();
     assert_eq!(many.len(), 1000, "1000 names must be 1000 distinct names");
+}
+
+/// THE CONCURRENT PROPERTY, which is the one that reproduces the defect, and
+/// the reason it is here: this repository fixed the name first and never
+/// carried the test that fails against the broken one. Run against the
+/// clock-based name on this machine it failed on every run of three, reporting
+/// **2856, 3008 and 3502 of 32000 names collided across 16 threads** — the
+/// mechanism behind ledger 531 stated as an assertion rather than as a probe in
+/// a comment.
+/// Cross-thread readings of `SystemTime::now()` repeat constantly; same-thread
+/// ones do not (ledger 707).
+#[test]
+fn concurrent_names_are_all_distinct() {
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 2000;
+
+    let start = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                (0..PER_THREAD).map(|_| unique_name()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let all: Vec<String> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let distinct: HashSet<&String> = all.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        THREADS * PER_THREAD,
+        "{} of {} names collided across {THREADS} threads",
+        THREADS * PER_THREAD - distinct.len(),
+        THREADS * PER_THREAD
+    );
 }
 
 impl Drop for TempPem {
@@ -203,6 +248,12 @@ async fn serve_on_localhost(tls: Option<&ServeTls>) -> u16 {
     port
 }
 
+/// How many ports to try before giving up on finding one free everywhere. The
+/// count is NAMED rather than inlined so the panic below can state it; the
+/// number is unchanged, because lowering it is a behaviour change with no
+/// measurement behind it.
+const BIND_ATTEMPTS: usize = 50;
+
 /// One ephemeral port, bound on EVERY address the name resolves to.
 ///
 /// **THE KERNEL PICKS THE PORT FOR ONE ADDRESS AND PROMISES NOTHING ABOUT THE
@@ -217,11 +268,20 @@ async fn serve_on_localhost(tls: Option<&ServeTls>) -> u16 {
 /// acquisition is dropped and retried with a fresh port. Retrying is honest
 /// here: the failure is another process holding a number, which the next
 /// number does not have.
+///
+/// **RETRYING IS ONLY HONEST FOR A PORT SOMEBODY ELSE HOLDS.** Every other bind
+/// error is permanent, so retrying one spends fifty ports to learn nothing and
+/// then blames port exhaustion for it. The case that makes this concrete: on a
+/// host with IPv6 disabled where `localhost` still resolves `::1`, every bind on
+/// `::1` returns `EADDRNOTAVAIL`. So `AddrInUse` is retried and every other
+/// error names the address it happened on — the form `yadgar-dial`'s
+/// `tests/common/mod.rs` already carries, which this rig cited as its precedent
+/// and then did not adopt (ledger 708).
 async fn bind_one_port_on_every_address(addrs: &[SocketAddr]) -> (u16, Vec<TcpListener>) {
-    for _ in 0..50 {
+    for _ in 0..BIND_ATTEMPTS {
         let first = TcpListener::bind(addrs[0])
             .await
-            .expect("an ephemeral port on the first address");
+            .unwrap_or_else(|e| panic!("no free port on {}: {e}", addrs[0].ip()));
         let port = first.local_addr().unwrap().port();
 
         let mut listeners = vec![first];
@@ -230,7 +290,8 @@ async fn bind_one_port_on_every_address(addrs: &[SocketAddr]) -> (u16, Vec<TcpLi
                 Ok(listener) => listeners.push(listener),
                 // Dropping `listeners` releases the port on every address it was
                 // taken on, so the next attempt starts from nothing held.
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => break,
+                Err(e) => panic!("binding {} on port {port}: {e}", addr.ip()),
             }
         }
         if listeners.len() == addrs.len() {
@@ -238,9 +299,41 @@ async fn bind_one_port_on_every_address(addrs: &[SocketAddr]) -> (u16, Vec<TcpLi
         }
     }
     panic!(
-        "no ephemeral port was free on all {} addresses",
+        "no ephemeral port was free on all {} addresses in {BIND_ATTEMPTS} attempts",
         addrs.len()
     );
+}
+
+/// A PERMANENT bind failure on a LATER address names that address, rather than
+/// being spent as one of [`BIND_ATTEMPTS`] retries.
+///
+/// The failure is a real one rather than a mocked one: `192.0.2.0/24` is
+/// TEST-NET-1, reserved for documentation and assigned to no interface, so
+/// binding it returns `EADDRNOTAVAIL`. Against the `Err(_) => break` this
+/// replaces, the case panicked with "no ephemeral port was free on all 2
+/// addresses" — port exhaustion, which is the wrong diagnosis and the whole of
+/// ledger 708.
+#[tokio::test]
+#[should_panic(expected = "binding 192.0.2.1")]
+async fn a_permanent_failure_on_a_later_address_is_reported_not_retried() {
+    let addrs = [
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        SocketAddr::from(([192, 0, 2, 1], 0)),
+    ];
+    bind_one_port_on_every_address(&addrs).await;
+}
+
+/// The same property on the FIRST address, which is a SEPARATE path through the
+/// same function and the likelier one to meet a disabled address family:
+/// `localhost` resolves `::1` AHEAD of `127.0.0.1` on this machine, so a host
+/// with IPv6 off fails on `addrs[0]` before the loop is ever reached. That bind
+/// used to carry `.expect("an ephemeral port on the first address")`, which
+/// named no address and reported the wrong cause just as the loop did.
+#[tokio::test]
+#[should_panic(expected = "no free port on 192.0.2.1")]
+async fn a_permanent_failure_on_the_first_address_is_reported_not_retried() {
+    let addrs = [SocketAddr::from(([192, 0, 2, 1], 0))];
+    bind_one_port_on_every_address(&addrs).await;
 }
 
 fn spawn(listener: TcpListener, tls: Option<&ServeTls>) {
