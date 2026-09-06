@@ -99,6 +99,41 @@ fn env_required(key: &str) -> Result<String, String> {
     }
 }
 
+/// The `task-db` boot refusal, flattened through the estate's one error-chain
+/// walker (ledger 733, ledger 740, ADR-0591) instead of a second copy.
+///
+/// **THE ONLY `to_string()` SITE IN THIS FILE THAT TAKES IT.** Every other
+/// refusal here — `ServeTls`, `UpstreamTls`, `rotate::Configuration` — already
+/// returns a complete sentence with nothing further under it worth a walk.
+/// `upstream::connect` is different: it returns `yadgar_dial::BalanceError`,
+/// and `BalanceError::Tls` wraps a `tonic::transport::Error` whose entire
+/// `Display` is the two words `transport error` — measured, this is the one
+/// place in this file where the head of the chain is a dead end and the reason
+/// sits one `source()` hop below it. `gateway#44` measured the same signature
+/// at its own two call sites and took the walk there for the identical reason;
+/// this is the same class, ledger 740, reaching the two repositories `gateway`
+/// does not dial.
+///
+/// **NOT A SECOND FLATTENER.** The body is a call to
+/// `yadgar_telemetry::diagnose::chain` and nothing else. It exists as a named
+/// function only because `main` is a binary target: every `map_err` closure
+/// inside it is unreachable from a test, so routing this one call through a
+/// seam is what gives the property somewhere to be asserted. Reverting this
+/// body to `error.to_string()` turns
+/// `a_refusal_carries_the_layer_below_transport_error` red.
+///
+/// **THE DUPLICATION `gateway#44` ACCEPTED APPLIES HERE UNCHANGED.**
+/// `BalanceError` has ten variants, six of which carry `#[source]` — and all
+/// six also interpolate `{source}` into their own `#[error]` string, `Tls`
+/// included. So the walk appends a duplicate tail on every one of them: a CA
+/// bundle that cannot be read renders `... (os error 2). TLS was requested \
+/// ...: No such file or directory (os error 2)`. That is a known defect
+/// (ledger 737, tracked in `yadgar-dial`, not fixed here) and is accepted as
+/// the cost of reaching the one layer this file would otherwise lose.
+fn refusal(error: &dyn std::error::Error) -> String {
+    yadgar_telemetry::diagnose::chain(error)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -194,11 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schedule = config.schedule().map_err(|e| e.to_string())?;
     let channel = upstream::connect(&db_host, db_port, db_tls.as_ref())
         .await
-        // Same reasoning, and it matters more here: `BalanceError`'s messages
-        // are paragraphs explaining that an empty bundle trusts nobody and that
-        // a missing one is not a reason to connect in cleartext. Debug prints
-        // the struct and throws all of that away.
-        .map_err(|e| e.to_string())?;
+        // `refusal` rather than `to_string()` (ledger 733, ledger 740): see its
+        // own doc comment for why this is the one site in this file that takes
+        // the chain walk. `BalanceError`'s other messages are already complete
+        // paragraphs explaining that an empty bundle trusts nobody and that a
+        // missing one is not a reason to connect in cleartext — `Tls` is not
+        // one of them, and Debug would print the struct and throw all of that
+        // away regardless.
+        .map_err(|e| refusal(&e))?;
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
         tls = db_tls.is_some(),
@@ -278,7 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::env_required;
+    use super::{env_required, refusal};
 
     // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
     // runs these on threads of one process, so tests sharing a variable name
@@ -324,5 +362,123 @@ mod tests {
                 != absent.replace("YADGAR_TEST_REQUIRED_EMPTY_ABSENT", "K"),
             "empty and absent must not share one message"
         );
+    }
+
+    /// THE ONE THING LEDGER 733/740 IS ABOUT, against the REAL error rather
+    /// than a fixture that could be shaped to pass.
+    ///
+    /// `tonic::transport::Error`'s whole `Display` is the two words `transport
+    /// error`, and `BalanceError::Tls` interpolates exactly that — so the
+    /// sentence `main` used to print for an unusable transport was `TLS could
+    /// not be configured: transport error`, which names no file, no key and no
+    /// reason. What went wrong sits one layer BELOW tonic's error and is
+    /// reachable only by walking `source()`.
+    ///
+    /// **BOTH RENDERINGS ARE ASSERTED, and the negative one is the point.** A
+    /// test that only checked `refusal` contains the reason would pass against
+    /// a `to_string()` that happened to carry it; asserting that `to_string()`
+    /// does NOT is what shows the layer is genuinely lost, which is the
+    /// finding rather than a matched absence.
+    ///
+    /// MUTATION: replace `refusal`'s body with `error.to_string()` and this
+    /// fails.
+    ///
+    /// The error is produced by `yadgar_task::upstream::connect` — the same
+    /// call `main` makes — given a bundle that is a real authority and a
+    /// verification domain `rustls::ServerName` refuses. No dial is involved:
+    /// the domain is rejected while `yadgar_dial::connect_tls` builds the
+    /// tonic endpoint, before anything is resolved.
+    #[tokio::test]
+    async fn a_refusal_carries_the_layer_below_transport_error() {
+        let ca = MintedCa::new();
+        let tls = upstream_tls(ca.path(), "not a server name");
+
+        let error = yadgar_task::upstream::connect("task-db", 50051, Some(&tls))
+            .await
+            .expect_err("a domain rustls cannot parse must refuse before any dial");
+
+        assert!(
+            refusal(&error).contains("invalid dns name"),
+            "the refusal must carry the layer below tonic's `transport error`; got: {:?}",
+            refusal(&error)
+        );
+        assert!(
+            !error.to_string().contains("invalid dns name"),
+            "if the head already carried the reason there would be nothing to walk \
+             for, and this test would be certifying itself; got: {:?}",
+            error.to_string()
+        );
+    }
+
+    /// `UpstreamTls` assembled the way a DEPLOYMENT assembles it — through
+    /// `from_lookup` over the `TASK_DB_TLS_*` names — rather than by hand, so
+    /// the test cannot configure a shape `main` could never produce.
+    fn upstream_tls(ca_file: &std::path::Path, domain: &str) -> yadgar_task::upstream::UpstreamTls {
+        let vars = [
+            ("TASK_DB_TLS_ENABLED".to_string(), "1".to_string()),
+            (
+                "TASK_DB_TLS_CA_FILE".to_string(),
+                ca_file.display().to_string(),
+            ),
+            ("TASK_DB_TLS_DOMAIN".to_string(), domain.to_string()),
+        ];
+        yadgar_task::upstream::UpstreamTls::from_lookup(yadgar_task::upstream::TASK_DB, |key| {
+            vars.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+        })
+        .expect("a flag, a bundle and a domain are a valid configuration")
+        .expect("the flag is set, so TLS is on")
+    }
+
+    /// A CA bundle that is a REAL authority, minted per run and deleted after.
+    ///
+    /// It has to be real: an empty or unparsable bundle is refused by
+    /// `TlsOptions::prepare` BEFORE the endpoint is built, so it would produce
+    /// `CaEmpty` and never reach the variant under test. Minted rather than
+    /// checked in, for the reason every other rig in this repository gives — a
+    /// fixture key in the repository is a secret in the repository.
+    ///
+    /// The name carries a COUNTER as well as the pid: `cargo test` runs these
+    /// on threads of one process, and a clock is a timestamp rather than a
+    /// nonce (ledger 706, 710, 729).
+    struct MintedCa(std::path::PathBuf);
+
+    impl MintedCa {
+        fn new() -> Self {
+            use rcgen::{
+                BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
+                KeyUsagePurpose,
+            };
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+            let key = KeyPair::generate().expect("a key pair");
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("parameters");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            params.distinguished_name.push(
+                DnType::CommonName,
+                "yadgar-task boot-refusal test authority",
+            );
+            let ca = CertifiedIssuer::self_signed(params, key).expect("a self-signed authority");
+
+            let path = std::env::temp_dir().join(format!(
+                "yadgar-task-refusal-{}-{}.pem",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&path, ca.pem()).expect("the bundle must be written");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for MintedCa {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 }
