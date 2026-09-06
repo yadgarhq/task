@@ -22,7 +22,10 @@
 //! fixture key in the repository is a secret in the repository, and it expires on
 //! a date nobody is watching.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, OnceLock};
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rcgen::{
@@ -147,16 +150,71 @@ impl Drop for Mount {
     }
 }
 
-/// A name no other case in this run can collide with.
-fn unique() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
+/// One reading of the clock per PROCESS, so two runs that the OS gave the same
+/// recycled pid do not name the same files. It varies per run and never
+/// within one, which is what leaves [`unique`] with exactly one varying part
+/// (same mechanism as `tests/serve_tls.rs::run_id`, ledger 707/710).
+fn run_id() -> u128 {
+    static RUN: OnceLock<u128> = OnceLock::new();
+    *RUN.get_or_init(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    })
+}
+
+/// A name no other case in this run can collide with, unique within this
+/// process by CONSTRUCTION.
+///
+/// **THE CLOCK IS NOT A UNIQUENESS SOURCE ACROSS THREADS** — tests in this
+/// binary share a pid and run on threads, so two concurrent nanosecond
+/// readings can land on the same value and collide (ledger 531, ledger 707,
+/// ledger 710). The counter is the ONLY part that varies within a run.
+fn unique() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        run_id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// THE CONCURRENT PROPERTY (ledger 710, same mechanism as ledger 707's
+/// `tests/serve_tls.rs::concurrent_names_are_all_distinct`): a clock read is
+/// not a nonce across threads. Tests in this binary share a pid and run on
+/// threads, so two concurrent calls to `unique()` can read the same
+/// nanosecond and collide — and `Mount`/its config counterpart then share a
+/// directory, one `Drop` deletes it, and the other fails with `NotFound`.
+#[test]
+fn concurrent_names_are_all_distinct() {
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 2000;
+
+    let start = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                (0..PER_THREAD).map(|_| unique()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let all: Vec<String> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let distinct: HashSet<&String> = all.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        THREADS * PER_THREAD,
+        "{} of {} names collided across {THREADS} threads",
+        THREADS * PER_THREAD - distinct.len(),
+        THREADS * PER_THREAD
+    );
 }
 
 /// The mounted document `yadgarhq/config` renders into the `shared` ConfigMap
