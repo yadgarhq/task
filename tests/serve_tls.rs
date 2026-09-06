@@ -570,3 +570,42 @@ async fn a_certificate_and_a_key_that_do_not_match_refuse_the_boot() {
         "a certificate that does not belong to the key must refuse the boot: {outcome:?}"
     );
 }
+
+/// THE REFUSAL ABOVE HAS TO SAY WHAT WAS WRONG, and the case above cannot tell.
+///
+/// `matches!` on the variant passes whether `detail` was built by walking the
+/// error's `source()` chain or by a bare `e.to_string()` — so on its own it is a
+/// certifying fixture, green under both. That is the exact defect telemetry#12
+/// corrected in the shared unit `serve::builder` now calls.
+///
+/// **The three layers, measured rather than remembered.** The head is
+/// `tonic::transport::Error`, whose whole `Display` is the two words `transport
+/// error`; under it rustls says `keys may not be consistent`; under THAT is
+/// `KeyMismatch`. Neither inner layer's text appears in the head, so a `detail`
+/// carrying `KeyMismatch` was reached by two `source()` hops and cannot have
+/// come from the head alone. Reverting the call site to `e.to_string()` leaves
+/// `detail` as exactly `transport error` and turns this red — which is why the
+/// assertion is on the INNERMOST layer rather than the middle one.
+#[tokio::test]
+async fn the_refusal_names_the_reason_rather_than_just_transport_error() {
+    let served = pki(SERVED_NAME);
+    let other = pki(SERVED_NAME);
+    let cert = TempPem::with(&served.cert_pem);
+    let key = TempPem::with(&other.key_pem);
+
+    let tls = serve_tls(cert.path(), key.path());
+    let Err(ServeTlsError::Unusable { detail, .. }) = serve::builder(Some(&tls)) else {
+        panic!("a certificate that does not belong to the key must refuse the boot");
+    };
+
+    assert!(
+        detail.contains("KeyMismatch"),
+        "the detail must carry the layer UNDER tonic's `transport error`, which is \
+         the only part naming what was wrong; got: {detail:?}"
+    );
+    assert_ne!(
+        detail.trim(),
+        "transport error",
+        "the head of the chain alone says nothing an operator can act on"
+    );
+}
