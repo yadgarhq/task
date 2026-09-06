@@ -47,6 +47,13 @@
 use std::path::{Path, PathBuf};
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
+// THE ONE ERROR-CHAIN FLATTENER FOR THE ESTATE (ADR-0591). The body that used to
+// sit below `builder` in this file was one of five — `iam`, `iam-db`, `task-db`,
+// `project-db` and here — byte-identical apart from local names, under TWO
+// names: `chain` in the first two and `describe` in the other three. It is
+// deleted rather than left beside the shared one, because a consolidation that
+// adds a sixth copy without removing the five is worse than none.
+use yadgar_telemetry::diagnose::chain;
 
 /// The environment variables this service's own listener is configured from:
 /// `LISTEN_TLS_ENABLED`, `LISTEN_TLS_CERT_FILE` and `LISTEN_TLS_KEY_FILE`.
@@ -251,25 +258,8 @@ pub fn builder(tls: Option<&ServeTls>) -> Result<Server, ServeTlsError> {
         .map_err(|e| ServeTlsError::Unusable {
             cert: tls.cert_file.clone(),
             key: tls.key_file.clone(),
-            detail: describe(&e),
+            detail: chain(&e),
         })
-}
-
-/// Flatten an error and everything under it into one sentence.
-///
-/// `tonic::transport::Error` displays as "transport error" and keeps what
-/// actually went wrong in its source — so the message an operator needs is the
-/// CHAIN, not the head of it. Losing it is the same class of mistake as printing
-/// `Debug` from `main`.
-fn describe(error: &dyn std::error::Error) -> String {
-    let mut out = error.to_string();
-    let mut source = error.source();
-    while let Some(next) = source {
-        out.push_str(": ");
-        out.push_str(&next.to_string());
-        source = next.source();
-    }
-    out
 }
 
 #[cfg(test)]
