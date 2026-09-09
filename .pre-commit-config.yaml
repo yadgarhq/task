@@ -21,8 +21,14 @@ repos:
   # Shared, from yadgarhq/actions (D62). IMMUTABLE rev: pre-commit caches a rev
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
+  #
+  # v1.18.2 -> v1.18.3 IS ONE COMMIT, and it is the one `complexity` below needs.
+  # actions#69 (ADR-0636) taught the gate that a file named `tests.rs` carrying a
+  # real `#[test]` is test code. Without it `src/upstream/tests.rs` is measured as
+  # production and the adoption this change exists for cannot land. Nothing else
+  # is in the range, so no other hook's behaviour moves with the bump.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.2
+    rev: v1.18.3
     hooks:
       - id: gitleaks
       - id: prettier
@@ -36,6 +42,19 @@ repos:
       - id: actionlint
       - id: cargo-fmt
       - id: cargo-clippy
+      # THE COMPLEXITY PAIR, adopted here for the first time. `complexity` is the
+      # line-count ceiling — 500 per file, 120 per function — and
+      # `cargo-clippy-complexity` is the lint that measures what a line count
+      # cannot: nesting and argument count. They are complementary and neither
+      # replaces the other, which is why both ids are listed rather than one.
+      #
+      # This repository was OVER the file ceiling on two files and over the
+      # function ceiling on two functions when the ids were added. It is under
+      # both now, on real seams, and the PR that did it records each one. Adopting
+      # the gate without that work first would have meant starting with an
+      # exemption list, which is how a limit stops meaning anything.
+      - id: complexity
+      - id: cargo-clippy-complexity
       - id: cargo-deny
       - id: observe-coverage
       - id: helm-lint

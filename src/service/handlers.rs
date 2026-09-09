@@ -1,0 +1,430 @@
+//! The six `TaskService` handlers.
+//!
+//! Split out of `service.rs` for the file ceiling, along the seam its parent's
+//! `mod handlers;` documents: the trait implementation is here, and everything
+//! it calls — `tel_scope`, `passthrough`, `Task`'s own methods — stayed there.
+//! Nothing about what any of them does changed in the move.
+
+use tonic::{Request, Response, Status};
+use yadgar_telemetry::estimator::Class;
+use yadgar_telemetry::grpc::status_name;
+use yadgar_telemetry::observe::{Call, Outcome};
+use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
+
+use super::{passthrough, tel_scope, Task};
+use crate::pb::yadgar::task::v1 as db;
+use crate::pb::yadgar::taskapi::v1 as api;
+use crate::pb::yadgar::taskapi::v1::task_service_server::TaskService;
+use crate::writes;
+
+#[tonic::async_trait]
+impl TaskService for Task {
+    async fn create_task(
+        &self,
+        request: Request<api::CreateTaskRequest>,
+    ) -> Result<Response<api::CreateTaskResponse>, Status> {
+        let req = request.into_inner();
+        // Started BEFORE the work, so the duration covers the handler and the
+        // scope is captured before the request is consumed by the -db call.
+        let call = Call::start(
+            "task",
+            "CreateTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
+
+        call.run(
+            async move {
+                if req.title.trim().is_empty() {
+                    // A rule, not a storage constraint: an untitled task is unfindable by
+                    // the humans who have to triage it. The column would happily take it.
+                    return Err(Status::invalid_argument("a task needs a title"));
+                }
+
+                let created = self
+                    .db
+                    .clone()
+                    .create_task(db::CreateTaskRequest {
+                        idempotency: req.idempotency,
+                        scope: req.scope,
+                        task: Some(db::Task {
+                            title: req.title,
+                            body: req.body,
+                            status: db::TaskStatus::Open as i32,
+                            tags: req.tags,
+                            links: req.links,
+                            ..Default::default()
+                        }),
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "create"))?
+                    .into_inner();
+
+                let response = api::CreateTaskResponse {
+                    meta: created.meta,
+                    number: created.number,
+                };
+
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn read_task(
+        &self,
+        request: Request<api::ReadTaskRequest>,
+    ) -> Result<Response<api::ReadTaskResponse>, Status> {
+        let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "ReadTask",
+            Kind::Read,
+            tel_scope(req.scope.as_ref()),
+        );
+
+        call.run(
+            async move {
+                let key = match req.key {
+                    Some(api::read_task_request::Key::Id(id)) => db::get_task_request::Key::Id(id),
+                    Some(api::read_task_request::Key::Number(n)) => {
+                        db::get_task_request::Key::Number(n)
+                    }
+                    None => {
+                        return Err(Status::invalid_argument("one of id or number is required"))
+                    }
+                };
+
+                let got = self
+                    .db
+                    .clone()
+                    .get_task(db::GetTaskRequest {
+                        scope: req.scope,
+                        key: Some(key),
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "read"))?
+                    .into_inner();
+
+                let response = api::ReadTaskResponse { task: got.task };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn find_tasks(
+        &self,
+        request: Request<api::FindTasksRequest>,
+    ) -> Result<Response<api::FindTasksResponse>, Status> {
+        let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "FindTasks",
+            Kind::Read,
+            tel_scope(req.scope.as_ref()),
+        );
+
+        call.run(
+            async move {
+                let found = self
+                    .db
+                    .clone()
+                    .list_tasks(db::ListTasksRequest {
+                        scope: req.scope,
+                        statuses: req.statuses,
+                        page_size: req.page_size,
+                        page_token: req.page_token,
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "find"))?
+                    .into_inner();
+
+                let response = api::FindTasksResponse {
+                    tasks: found.tasks,
+                    next_page_token: found.next_page_token,
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                // The row count for a list is the LIST, not one.
+                rows: r.tasks.len() as u32,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn edit_task(
+        &self,
+        request: Request<api::EditTaskRequest>,
+    ) -> Result<Response<api::EditTaskResponse>, Status> {
+        let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "EditTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
+
+        call.run(
+            async move {
+                // THE MASK FIRST, before the store is touched at all. Resolving it
+                // is a pure decision about the request, so a mask naming a field
+                // no edit may write is refused here rather than after a `get_task`
+                // round trip whose answer was always going to be discarded.
+                let paths = writes::requested_paths(req.update_mask.as_ref())?;
+
+                // THE TITLE RULE, and it applies only to an edit that WRITES a
+                // title. It used to run before the mask was resolved, which made a
+                // body-only edit impossible: `EditTaskRequest.title` is empty when
+                // a caller does not intend to change it, and this refused the call
+                // over a value it was never going to store. The rule itself is
+                // unchanged — an untitled task is unfindable by the humans who
+                // have to triage it — it simply now applies where a title is
+                // actually at stake.
+                if paths.contains(&"title") && req.title.trim().is_empty() {
+                    return Err(Status::invalid_argument("a task needs a title"));
+                }
+
+                // The read is kept for what it actually provides: NOT_FOUND for a
+                // task that is not there or not visible, before anything is
+                // written. Its STATUS is no longer what keeps an edit from
+                // changing one — `writes::edit_request` masks the column out, so
+                // the rule is in the request rather than in this handler's
+                // discipline. It now also supplies the fields the mask does NOT
+                // name, for the rollout reason `edit_request` documents.
+                let current = self
+                    .db
+                    .clone()
+                    .get_task(db::GetTaskRequest {
+                        scope: req.scope.clone(),
+                        key: Some(db::get_task_request::Key::Id(req.id.clone())),
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "edit-read"))?
+                    .into_inner()
+                    .task
+                    .ok_or_else(|| Status::not_found("no such task in this scope"))?;
+
+                let updated = self
+                    .db
+                    .clone()
+                    .update_task(writes::edit_request(req, &current, &paths))
+                    .await
+                    .map_err(|e| passthrough(e, "edit"))?
+                    .into_inner();
+
+                let response = api::EditTaskResponse { meta: updated.meta };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    /// KNOWN CONTRACT GAP, recorded here rather than papered over: on an
+    /// IDEMPOTENT REPLAY, `from` reports the status the task is already in.
+    ///
+    /// The read below runs before the write. On the retry of a transition that
+    /// was already applied, it returns the NEW status; `rules::may_transition`
+    /// waves `(to, to)` through as an identity no-op; `task-db` replays the
+    /// recorded response without writing; and `from` comes back equal to `to`.
+    ///
+    /// That is exactly the guarantee the field exists to give. `taskapi.proto`
+    /// says `from` is there "so a caller that raced another writer sees what
+    /// actually happened rather than assuming its own read was current" — and on
+    /// this path it carries no information at all.
+    ///
+    /// IT CANNOT BE FIXED HERE. Nothing this service can reach holds the prior
+    /// status. `UpdateTaskResponse` carries `meta` and nothing else, identically
+    /// at proto v1.2.0 and v1.6.0, and `task-db`'s idempotency row persists that
+    /// same response — so even a change confined to `-db` has nowhere to put the
+    /// answer. Closing it needs a new field on `UpdateTaskResponse` in
+    /// yadgarhq/proto first, after which the store's replay carries the true
+    /// predecessor and this handler reports it instead of its own read.
+    ///
+    /// Deriving one instead would be worse than the gap: several statuses lead to
+    /// any given target, so a guess is indistinguishable from an answer.
+    async fn transition_task(
+        &self,
+        request: Request<api::TransitionTaskRequest>,
+    ) -> Result<Response<api::TransitionTaskResponse>, Status> {
+        let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "TransitionTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
+
+        call.run(
+            async move {
+                // THE DECISION, ALL OF IT, BEFORE THE WRITE. See
+                // `Task::decide_transition` for what it settles, and for why
+                // the refusal it can raise is INVALID_ARGUMENT.
+                let (current, from, to) = self.decide_transition(&req).await?;
+
+                // THE WRITE BELOW CARRIES `req.expect_version`, NOT
+                // `current.meta.version`, AND THAT IS DELIBERATE. A scanner reads
+                // the read-then-check-then-write above as a race and proposes
+                // substituting the version just read. Doing so would introduce a
+                // real defect, so the reasoning is recorded here rather than left
+                // to be rediscovered.
+                //
+                // `expect_version` is the CALLER'S claim about what it saw. It is
+                // the compare half of a compare-and-set, and it exists to refuse a
+                // caller that acted on a stale read. Replacing it with a version
+                // this service read microseconds ago launders a stale expectation
+                // into a fresh one: a write that must be refused would then
+                // succeed, and the caller would never learn it had overwritten
+                // somebody else's change.
+                //
+                // THERE IS NO ARM THAT SKIPS THE COMPARE. `task-db`'s
+                // `write.rs::update` binds `expect_version` into the WHERE clause
+                // of every UPDATE — `WHERE id = ? AND version = ? AND deleted_at
+                // IS NULL AND <reach>` — and a mismatch makes `rows_affected()`
+                // zero, which it turns into FAILED_PRECONDITION. Zero is not a
+                // wildcard there; it is simply a version no row holds.
+                //
+                // A SECOND CHECK HERE WOULD CATCH NOTHING. Only the comparison
+                // inside the store's transaction is atomic with the write. One
+                // added here passes in exactly the cases the CAS passes, and in
+                // the racing case — a writer committing between this read and that
+                // UPDATE — it passes too, because it is reading the same stale row.
+                //
+                // THE CAS IS ALSO WHAT MAKES THE RULE CHECK ABOVE SOUND. Any
+                // change that could invalidate `may_transition(from, to)` is a
+                // change of STATUS, a status change is a write, and every write
+                // bumps `version` — so the racing writer this handler cannot see
+                // is one the CAS refuses on its behalf.
+                //
+                // ONE LOOSE END, AND IT IS IN EXACTLY ONE PLACE. A review claimed
+                // `expect_version + 1` is live code both here and in
+                // `task-db/src/write.rs`. IT IS NOT. In THIS crate the expression
+                // survives only as the WORDS of the comment directly below, which
+                // describes what this handler used to do and no longer does;
+                // there is no such arithmetic on any executable line here.
+                //
+                // In `task-db/src/write.rs` it IS live: the SQL sets `version =
+                // version + 1`, and the response's `Meta.version` is then computed
+                // as `req.expect_version + 1` rather than read back. That is
+                // correct only BECAUSE the CAS guarantees the stored version
+                // equalled `expect_version`. If that side is ever changed to read
+                // the version back, the change belongs there alone — this
+                // repository holds no second copy to keep in step.
+                //
+                // The STORE'S meta, as `edit_task` already does. This used to
+                // discard the response and synthesise one from the request —
+                // `id` from `req.id`, `version` from `expect_version + 1` — which
+                // asserted two things this service cannot know: that `-db`
+                // increments by exactly one, and that no other Meta field the
+                // store fills in differs from the zero value. On a replay the
+                // second is plainly false, since the version is the ORIGINAL
+                // write's and the project comes from the scope. A synthesised
+                // envelope is a guess wearing the shape of an answer.
+                let updated = self
+                    .db
+                    .clone()
+                    .update_task(writes::transition_request(req, &current, to))
+                    .await
+                    .map_err(|e| passthrough(e, "transition"))?
+                    .into_inner();
+
+                let response = api::TransitionTaskResponse {
+                    meta: updated.meta,
+                    from: from as i32,
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn remove_task(
+        &self,
+        request: Request<api::RemoveTaskRequest>,
+    ) -> Result<Response<api::RemoveTaskResponse>, Status> {
+        let req = request.into_inner();
+        let call = Call::start(
+            "task",
+            "RemoveTask",
+            Kind::Write,
+            tel_scope(req.scope.as_ref()),
+        );
+
+        call.run(
+            async move {
+                self.db
+                    .clone()
+                    .delete_task(db::DeleteTaskRequest {
+                        idempotency: req.idempotency,
+                        scope: req.scope,
+                        id: req.id,
+                        expect_version: req.expect_version,
+                    })
+                    .await
+                    .map_err(|e| passthrough(e, "remove"))?;
+                // No payload to measure: RemoveTaskResponse is empty. Recording it
+                // anyway matters — a call that returns nothing still costs time and still
+                // belongs in the count, and omitting it would make deletes invisible.
+                Ok(api::RemoveTaskResponse {})
+            },
+            |_| Outcome {
+                status: "OK",
+                // RemoveTaskResponse is empty — nothing to measure. Recorded
+                // anyway: a delete costs time and belongs in the count.
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
+    }
+}
