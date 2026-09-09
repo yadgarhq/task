@@ -58,14 +58,13 @@
 //! Dialling or listening in cleartext instead is the silent downgrade this whole
 //! change exists to remove, so there is no path here that does it.
 
-use std::net::SocketAddr;
-
-use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
-use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
 use yadgar_task::rotate;
 use yadgar_task::serve::{self, ServeTls, LISTEN};
-use yadgar_task::service::Task;
 use yadgar_task::upstream::{self, UpstreamTls, TASK_DB};
+
+/// Boot steps that would not fit here: see the module's own note on why a
+/// binary-only module rather than more of this file.
+mod boot;
 
 /// One configuration knob, read from its ONE source, with no compiled-in
 /// default behind it (ADR-0569).
@@ -136,21 +135,7 @@ fn refusal(error: &dyn std::error::Error) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .json()
-        // A DEFAULT, because from_default_env() with RUST_LOG unset enables
-        // NOTHING — the service runs silently and its boot sequence, its
-        // capability probe result and its errors all vanish. Found by deploying:
-        // two replicas were Running and `kubectl logs` returned nothing at all,
-        // so the only way to see why one had restarted was the previous
-        // container's exit output.
-        //
-        // A service nobody can observe is one D67 cannot measure either.
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    boot::install_logging();
 
     // FIRST, before a socket of any kind is opened. The identity this service
     // presents is read and CHECKED here — the PEM decoded, the certificate
@@ -162,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that opens in cleartext because TLS configuration failed, and with one
     // construction site there is nowhere else to write it.
     let tls = ServeTls::from_env(LISTEN).map_err(|e| e.to_string())?;
-    let mut server = serve::builder(tls.as_ref()).map_err(|e| e.to_string())?;
+    let server = serve::builder(tls.as_ref()).map_err(|e| e.to_string())?;
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
@@ -243,75 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "connected to task-db"
     );
 
-    // The BINARY installs the exporter, never the library — a library that
-    // installs one picks the backend for every service linking it. A failure here
-    // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
-    // Named on the way out, for the reason given on TASK_DB_PORT above.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
-        .parse()
-        .map_err(|e| format!("METRICS_LISTEN is not a host:port address: {e}"))?;
-    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
-        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
-    }
-
-    // AFTER THE EXPORTER, NEVER BEFORE IT. A value recorded before there is a
-    // recorder is a value nobody ever sees.
-    watch_inputs.export_not_after();
-
-    // Named on the way out, for the reason given on TASK_DB_PORT above.
-    let addr: SocketAddr = env_required("LISTEN")?
-        .parse()
-        .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
-
-    // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
-    // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
-    // installs both signal handlers when it is CALLED — a SIGTERM arriving between here and
-    // the first poll of the future would otherwise take the process's default
-    // disposition and kill it outright.
-    let signals = shutdown().map_err(|e| {
-        format!("the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one")
-    })?;
-
-    tracing::info!(
-        %addr,
-        tls = tls.is_some(),
-        watching = watch_inputs.watched().len(),
-        rotation_poll_secs = schedule.poll().as_secs(),
-        rotation_splay_max_secs = schedule.splay_max().as_secs(),
-        drain_budget_secs = DRAIN_BUDGET.as_secs(),
-        "task listening"
-    );
-
-    // THE SERVER IS SPAWNED AND ASKED TO STOP THROUGH A CHANNEL, rather than
-    // handed the shutdown future directly, because the drain has to be BOUNDED
-    // and a budget's clock must start when shutdown is REQUESTED. A `timeout`
-    // around the serving future itself would bound the server's whole life
-    // instead, and end the process one budget after boot, on every boot.
-    let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
-    let serving = tokio::spawn(
-        server
-            .add_service(TaskServiceServer::new(Task::new(channel)))
-            .serve_with_shutdown(addr, async {
-                let _ = stop_requested.await;
-            }),
-    );
-    let stop = async {
-        tokio::select! {
-            () = signals => {}
-            () = rotate::watch(watch_inputs, schedule) => {}
-        }
-    };
-    match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
-        Drain::Finished(result) => result?,
-        Drain::Overran => tracing::error!(
-            budget_secs = DRAIN_BUDGET.as_secs(),
-            "the drain did not finish within its budget; ending anyway with calls still in \
-             flight. A request blocked this long is the thing to look at"
-        ),
-    }
-
-    Ok(())
+    boot::serve_until_drained(server, tls, channel, watch_inputs, schedule).await
 }
 
 #[cfg(test)]
