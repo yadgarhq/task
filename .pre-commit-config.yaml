@@ -28,7 +28,7 @@ repos:
   # production and the adoption this change exists for cannot land. Nothing else
   # is in the range, so no other hook's behaviour moves with the bump.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.3
+    rev: v1.20.0
     hooks:
       - id: gitleaks
       - id: prettier
@@ -73,3 +73,16 @@ repos:
       # ADR-0523-WATCHED naming a src/rotate.rs material, or ADR-0523-UNWATCHED
       # with a reason. This repository had never run it before this PR.
       - id: boot-reads-watched
+      # LEDGER 837. `hooks/no_test_skips.py` refuses a test that stops
+      # running — a skip marker, an unsatisfiable cfg, an environment-probe
+      # guard at the first statement, a narrowed `cargo test`/pytest
+      # invocation, or a captured run whose exit code is suppressed.
+      # ADR-0577: a published hook nobody references gates nothing, and this
+      # one gates this repository for the first time with this line.
+      #
+      # THE REV ALSO CARRIES v1.19.0's `observe-coverage` Rule B tightening
+      # (resolving callees and route handlers crate-wide rather than
+      # file-local); it changes nothing this repository's own
+      # `observe-coverage` hook enforces. See the PR body for the
+      # measurement.
+      - id: no-test-skips
