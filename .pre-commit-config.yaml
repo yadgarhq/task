@@ -28,7 +28,7 @@ repos:
   # production and the adoption this change exists for cannot land. Nothing else
   # is in the range, so no other hook's behaviour moves with the bump.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.20.0
+    rev: v1.20.1
     hooks:
       - id: gitleaks
       - id: prettier
