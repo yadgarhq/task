@@ -270,3 +270,8 @@ topologySpread:
   maxSkew: 1
   topologyKey: kubernetes.io/hostname
   whenUnsatisfiable: ScheduleAnyway
+
+networkPolicy:
+  enabled: false
+  clients: [gateway]
+  scrapeFrom: {}
