@@ -26,6 +26,19 @@
 //! over a NetworkPolicy because a control the CNI enforces protects an EKS
 //! deployment and protects nothing on kind (D80).
 //!
+//! **THAT PREMISE IS WITHDRAWN — ADR-0688 (2026-09-14).** `kindest/kindnetd:
+//! v20260528-9350166c` runs the kube-network-policies controller and logs
+//! `Policy engine is ready`; enforcement was measured live in the `yadgar`
+//! namespace on 2026-09-12. A NetworkPolicy protects this hop on kind too.
+//! ADR-0594, as amended by ADR-0686, ranks mutual TLS and an ingress
+//! NetworkPolicy as EQUAL controls — but only on a hop where both sides hold a
+//! leaf this deployment issued AND verifies. On this hop that is not yet true:
+//! `task-db`'s `boot::serve_tls` builds `ServerTlsConfig` with `.identity(..)`
+//! only, never `.client_ca_root(..)`, so the certificate this module presents
+//! is not checked. Today the NetworkPolicy is the only BUILT control on this
+//! hop; the certificate stays load-bearing for availability, per the rest of
+//! this section, once the server side of mutual TLS lands.
+//!
 //! **A SEPARATE LEVER FROM THE ENCRYPTED TRANSPORT, deliberately.**
 //! `<PREFIX>_TLS_CLIENT_CERT_FILE` and `<PREFIX>_TLS_CLIENT_KEY_FILE` are unset
 //! by default, so a deployment that turns TLS on verifies the upstream and
