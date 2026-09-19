@@ -402,10 +402,14 @@ spec:
               drop: [ALL]
           volumeMounts:
             # THE CONFIGURATION REPOSITORY'S SHARED CONFIGMAP (ADR-0569,
-            # ADR-0570, step 2a): the knobs every service reads. ADR-0740 moved
-            # this service's own document out of `yadgarhq/config` and out of
-            # this mount, because exactly one service read it, which is not
-            # "more than one" — the bar `yadgarhq/config` now keeps.
+            # ADR-0570, step 2a): the knobs every service reads. This service's
+            # own document, `chart/config/task.yaml`, held zero knobs and had
+            # zero readers, so the mount that named it carried nothing and is
+            # deleted here. ADR-0740 keeps a document in `yadgarhq/config` only
+            # when MORE THAN ONE service reads it — `task.yaml` never cleared
+            # that bar even at one reader, because it had none. `config` still
+            # renders the now-unmounted `task` ConfigMap as of this PR; dropping
+            # the empty document itself is a separate, following pull request.
             #
             # DIRECTORIES, NEVER `subPath`. A subPath mount is copied once at
             # container start and kubelet never updates it, so the file would be
