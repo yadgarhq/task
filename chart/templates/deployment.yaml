@@ -401,9 +401,15 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
-            # THE CONFIGURATION REPOSITORY'S TWO CONFIGMAPS (ADR-0569, ADR-0570,
-            # step 2a): the knobs every service reads, and this service's own —
-            # empty today, mounted anyway so it is ready the day it is not.
+            # THE CONFIGURATION REPOSITORY'S SHARED CONFIGMAP (ADR-0569,
+            # ADR-0570, step 2a): the knobs every service reads. This service's
+            # own document, `chart/config/task.yaml`, held zero knobs and had
+            # zero readers, so the mount that named it carried nothing and is
+            # deleted here. ADR-0740 keeps a document in `yadgarhq/config` only
+            # when MORE THAN ONE service reads it — `task.yaml` never cleared
+            # that bar even at one reader, because it had none. `config` still
+            # renders the now-unmounted `task` ConfigMap as of this PR; dropping
+            # the empty document itself is a separate, following pull request.
             #
             # DIRECTORIES, NEVER `subPath`. A subPath mount is copied once at
             # container start and kubelet never updates it, so the file would be
@@ -413,31 +419,12 @@ spec:
             #
             # NO `optional: true`, unlike every Secret mount below. The default,
             # `false`, is what makes kubelet refuse to start this pod at all
-            # while `shared` or `task` is absent — `ContainerCreating` naming
-            # the missing ConfigMap — rather than starting it with an empty
-            # directory the binary would then refuse to read from anyway
+            # while `shared` is absent — `ContainerCreating` naming the missing
+            # ConfigMap — rather than starting it with an empty directory the
+            # binary would then refuse to read from anyway
             # (`ScheduleError::Absent`).
-            #
-            # **`task` IS MOUNTED, AND TODAY IT IS NEITHER READ NOR WATCHED.**
-            # `yadgar-lifecycle`'s `Configuration::under(root)` yields exactly one
-            # path, `root/shared/shared.yaml`; the crate has no API for a
-            # per-service document, so `config-task` is in no process's
-            # ADR-0523 watch set. Two things follow and both are deliberate. The
-            # `optional: false` reasoning above is true of `shared` and NOT of
-            # this one — an absent `task` ConfigMap blocks the pod for no
-            # functional benefit, which is accepted so that both mounts are
-            # governed by one rule rather than two. And the day this file gains
-            # its first knob, Argo will sync it and kubelet will swap it and NO
-            # POD WILL RESTART, so the new value never takes effect and nothing
-            # reports that — the exact failure ADR-0570 names for `envFrom`,
-            # reproduced through a file mount. THE MOUNT IS READY; JOINING THIS
-            # DOCUMENT TO THE WATCH SET IS A FURTHER CHANGE, and it belongs in
-            # the same pull request as the first task-only knob.
             - name: config-shared
               mountPath: /etc/yadgar/config/shared
-              readOnly: true
-            - name: config-task
-              mountPath: /etc/yadgar/config/task
               readOnly: true
             {{- if .Values.taskDb.tls.enabled }}
             # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
@@ -468,14 +455,11 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
-        # The two ConfigMaps `yadgarhq/config` renders, same reasoning as the
-        # mounts above: unconditional, a directory each, never optional.
+        # The ConfigMap `yadgarhq/config` renders, same reasoning as the mount
+        # above: unconditional, a directory, never optional.
         - name: config-shared
           configMap:
             name: shared
-        - name: config-task
-          configMap:
-            name: task
         {{- if .Values.taskDb.tls.enabled }}
         - name: task-db-ca
           secret:
