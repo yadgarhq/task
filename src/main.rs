@@ -133,8 +133,31 @@ fn refusal(error: &dyn std::error::Error) -> String {
     yadgar_telemetry::diagnose::chain(error)
 }
 
+/// The process entry point: run the service, and print a refusal as its SENTENCE.
+///
+/// **NOT `main() -> Result`** (ledger 1258). Rust prints a `main` that returns
+/// `Err` with DEBUG, so even a refusal already converted to its sentence
+/// arrived quoted and escaped — `Error: "LISTEN_TLS_ENABLED is set but …"` —
+/// and a typed error that skipped the conversion arrived as its variant name.
+/// ADR-0569 asks a refusal to name the knob and where it is set; an operator
+/// reading a crash loop must get that as plain text. `tests/boot_message.rs`
+/// runs the binary and holds it. Shape and wording follow `iam-db`'s `main`.
+///
+/// The exit status is unchanged: an `Err` from `main` exits 1, and so does
+/// `ExitCode::FAILURE`. A drain — after SIGTERM or after a rotation — still
+/// returns `Ok(())` and exits 0, which `tests/exit_chain.rs` holds (ledger 748).
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     boot::install_logging();
 
     // FIRST, before a socket of any kind is opened. The identity this service
@@ -152,13 +175,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
     let db_host = env_required("TASK_DB_HOST")?;
-    // STRINGIFIED AND NAMED, for the same reason as every other error in this
-    // function: `main` returns `Box<dyn Error>`, which Rust prints with DEBUG. A
-    // bare `?` here yields `ParseIntError { kind: InvalidDigit }`, and the two
-    // addresses below yield `AddrParseError(())` — a CrashLoop whose entire
-    // output is `AddrParseError(())` tells an operator neither which variable was
-    // wrong nor what it held. These three were the last bare `?`s left beside the
-    // comments explaining why nothing else is one.
+    // NAMED on the way out. A bare `?` here would print the parse error alone —
+    // `invalid digit found in string`, and for the two addresses in `boot`
+    // `invalid socket address syntax` — which tells an operator neither which
+    // variable was wrong nor what it held. (While `main` returned `Result` it
+    // was worse: Debug printed `ParseIntError { kind: InvalidDigit }` and
+    // `AddrParseError(())`.)
     let db_port: u16 = env_required("TASK_DB_PORT")?
         .parse()
         .map_err(|e| format!("TASK_DB_PORT is not a port number: {e}"))?;
@@ -168,11 +190,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // serves TLS yet, so the cut-over is a later change that can be reverted on
     // its own.
     //
-    // `.to_string()` on the way out, and not decoration: `main` returns
-    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
-    // `NoCaFile("TASK_DB")` on the operator's terminal instead of the sentence
-    // saying which variable is missing and why cleartext is not the answer. The
-    // same reason the gateway stringifies `Limits::parse`.
+    // `.to_string()` on the way out. It dates from when `main` returned
+    // `Result` and Rust printed a bare `?` here with Debug, as
+    // `NoCaFile("TASK_DB")`. `main` prints Display now, so the conversion no
+    // longer changes what the operator reads; it stays as the sentence it
+    // always produced.
     let db_tls = UpstreamTls::from_env(TASK_DB).map_err(|e| e.to_string())?;
 
     // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
@@ -200,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be two builder calls
     // forty lines apart in this function, where nothing could reach them: no
-    // test spawns this binary, so deleting either compiled and passed
+    // test spawned this binary then, so deleting either compiled and passed
     // everything. The list lives in `rotate::watch_set` now and
     // `tests/assembly.rs` calls it.
     let watch_inputs = rotate::watch_set(tls.as_ref(), db_tls.as_ref(), &config);
@@ -219,8 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the chain walk. `BalanceError`'s other messages are already complete
         // paragraphs explaining that an empty bundle trusts nobody and that a
         // missing one is not a reason to connect in cleartext — `Tls` is not
-        // one of them, and Debug would print the struct and throw all of that
-        // away regardless.
+        // one of them.
         .map_err(|e| refusal(&e))?;
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
