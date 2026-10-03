@@ -1,4 +1,12 @@
-{{- if .Values.autoscaling.enabled }}
+{{- if and (kindIs "map" .Values.autoscaling) .Values.autoscaling.enabled }}
+# ADR-0850: this is the FIRST READER of `autoscaling.enabled` in this chart's render —
+# helm renders `scaledobject.yaml` before `templates/render-checks.yaml` reads it — so it
+# carries its own `kindIs "map"` guard rather than relying on that file alone. Without it,
+# `autoscaling: "x"` RAISES a go/template panic here, naming neither the chart nor the
+# key, before `render-checks.yaml`'s named refusal ever runs. The guard only
+# SHORT-CIRCUITS the render of this object; `render-checks.yaml`'s own arms still fail
+# the whole chart render for a shape this `and` merely skips past.
+#
 # KEDA, not a bare HPA (D68): it wraps a plain HPA for the concurrency cases,
 # handles queue depth natively for the write path, and gives scale-to-zero for a
 # disabled plugin (D1). One mechanism instead of prometheus-adapter plus special
