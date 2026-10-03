@@ -1,0 +1,88 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "yadgar/task",
+  "$comment": "ADR-0847 (closed schemas; render checks own types) and ADR-0850 (closure is per chart — this file closes only the keys `task` itself owns). Untyped closure at every block, typed nowhere: a mapping becomes `properties` + `additionalProperties: false` with no `type`, so a scalar or null written where a block belongs passes THIS schema and reaches render-checks.yaml instead (ADR-0794/0797, landed by D-M ledger 1135, task#71) — `autoscaling: \"x\"` is that file's territory, not this one's. A leaf is `{}`: no type, no enum, no default, no required. task ships no retained typed leaf (unlike gateway's toolsPoll.intervalSeconds or the twins' database.migrationLockTimeoutSeconds), so nothing here is exempted from that rule, and `required` on any new key stays out of this PR by design — tls.enabled and taskDb.tls.enabled get `required` in C-SVb (ADR-0845, ADR-0857/K-8), never in D-S. Open maps, and why: `global` (every module in the parent's coalesced tree receives it whether or not this chart's own templates read `.Values.global`, ADR-0850 — an undeclared `global` refuses the parent's own default render); `resources` (templates/deployment.yaml does `toYaml .Values.resources` unexamined); `rollingUpdate` (`{{- with .Values.rollingUpdate }}` writes back whatever map it is handed, so `rollingUpdate: {}` returning the field to Kubernetes' own default has to stay legal). `networkPolicy.clients` is a list, not a block, and lists are `{}` too: its items are unindexed strings (`range $clients`), not gateway's typed peer objects — this chart's copy of networkpolicy.yaml is not gateway's. The two keys `values.yaml` omits by design (extras, measured by grepping `chart/templates` for `.Values` paths `values.yaml` does not declare): `image.digest` (templates/deployment.yaml reads it to build the published image reference; ci-release rewrites it at package time, D65) and `networkPolicy.scrapeFrom.namespace` (values.yaml ships `scrapeFrom: {}`; templates/networkpolicy.yaml reads the nested key directly) — both declared as leaves inside otherwise-closed blocks, so `scrapeFrom` is a closed one-key block rather than staying the open map its empty default would otherwise draft.",
+  "properties": {
+    "image": {
+      "properties": {
+        "repository": {},
+        "tag": {},
+        "digest": {}
+      },
+      "additionalProperties": false
+    },
+    "replicaCount": {},
+    "resources": {},
+    "taskDb": {
+      "properties": {
+        "host": {},
+        "port": {},
+        "tls": {
+          "properties": {
+            "enabled": {},
+            "caSecret": {},
+            "caSecretKey": {},
+            "domain": {},
+            "clientCertSecret": {},
+            "clientCertSecretKey": {},
+            "clientKeySecretKey": {}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "tls": {
+      "properties": {
+        "enabled": {},
+        "certSecret": {},
+        "certSecretKey": {},
+        "keySecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "autoscaling": {
+      "properties": {
+        "enabled": {},
+        "kedaOperator": {
+          "properties": {
+            "apiVersion": {}
+          },
+          "additionalProperties": false
+        },
+        "minReplicas": {},
+        "maxReplicas": {},
+        "threshold": {},
+        "prometheusAddress": {}
+      },
+      "additionalProperties": false
+    },
+    "preStopSleepSeconds": {},
+    "terminationGracePeriodSeconds": {},
+    "rollingUpdate": {},
+    "topologySpread": {
+      "properties": {
+        "enabled": {},
+        "maxSkew": {},
+        "topologyKey": {},
+        "whenUnsatisfiable": {}
+      },
+      "additionalProperties": false
+    },
+    "networkPolicy": {
+      "properties": {
+        "enabled": {},
+        "clients": {},
+        "scrapeFrom": {
+          "properties": {
+            "namespace": {}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "global": {}
+  },
+  "additionalProperties": false
+}
