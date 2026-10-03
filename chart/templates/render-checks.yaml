@@ -33,64 +33,72 @@ every CRD-backed group with no cluster, so a check reachable at the defaults wou
 refuse every offline render.
 */}}
 {{/*
-THE SHAPE OF `autoscaling` AND `autoscaling.enabled`, REFUSED BEFORE EITHER TOGGLE READS THEM.
+THE SHAPE OF `autoscaling` AND `autoscaling.enabled`, REFUSED BEFORE THIS CHECK READS
+THEM (ledger 1135).
 
-`templates/scaledobject.yaml` and the KEDA check below both gate on
-`{{ if .Values.autoscaling.enabled }}` — a BARE TRUTHINESS TEST, which is FAIL-OPEN on a
-string. Measured on helm 3.20.2 and 4.3.0, identically: `autoscaling.enabled: "false"` and
-`"no"` — which read as OFF to any human — CREATE a ScaledObject.
+`{{- if .Values.autoscaling.enabled }}` BELOW, AND `templates/scaledobject.yaml`'s
+own gate, are BARE TRUTHINESS TESTS, which are FAIL-OPEN on a string. Measured on
+helm 3.20.2 and 4.3.0, identically:
 
-ADR-0850 (extending ADR-0797) IS THE GOVERNING RULE: a bool toggle a template reads is
-validated with `kindIs "bool"` ON THE RAW VALUE, and the reading template carries its own
-shape guard rather than relying only on this file. Not `kindIs "map"` on `enabled` itself —
-that is ADR-0794's rule for a key whose value is a BLOCK, and `enabled`'s value is a bool.
-Never on the result of a `default`: sprig's `default` substitutes on an EMPTY value, so
-`false`, `0`, `""` and `[]` all collapse into the default and the kind test then covers
-exactly the non-empty scalars.
+  false, 0, null, {}, []   render no ScaledObject
+  true                     renders one
+  "false", "no", "true", 1 render one
 
-`autoscaling` ITSELF GETS THE ADR-0794 IDIOM — `hasKey` for presence, `kindIs "map"` for
-shape — BECAUSE IT IS READ AT A DOTTED PATH. `.Values.autoscaling.enabled` on a non-map
-`autoscaling` does not refuse, it RAISES: measured on helm 4.3.0, a go/template panic
-naming the field it failed on, with no chart name and no key name in it (see
-`scripts/tests/test_render_checks.py`'s `RAISE_MARKERS` for the exact wording this file
-may never quote). `database.create` in the `-db` charts has no sibling guard on
-`.Values.database` because nothing else in this file reads a dotted path off it before the
-`kindIs "bool"` arm does; `autoscaling.enabled` does, so the guard that stops the panic goes
-here, first.
+So `autoscaling.enabled: "false"` — which reads as OFF to any human, and is what a
+`--set-string`, a templated overlay or a quoted values file produces — CREATES A
+SCALEDOBJECT. ADR-0797 is the governing rule for this arm: a values key a helm
+condition reads, and that this chart DECLARES, is validated with `kindIs "bool"` ON
+THE RAW VALUE, `hasKey` first because `kindOf` cannot tell a deleted key from an
+absent one.
 
-`hasKey` COMES FIRST BECAUSE `kindOf` CANNOT TELL A DELETED KEY FROM AN ABSENT ONE — it
-answers `invalid` for both. Helm DELETES a null-valued key when some chart in the tree
-declares it, and restores no default: this chart's own `values.yaml` declares both
-`autoscaling` and `autoscaling.enabled`, so a values file that OMITS either key gets that
-default back and `hasKey` is true for it. `hasKey` is false only when a values file wrote the
-key with NO VALUE and helm deleted it.
+ONE LEVEL UP, `autoscaling` ITSELF IS READ AS A BLOCK, NOT A TOGGLE, by both this
+check and `templates/scaledobject.yaml`. Measured: a values file setting
+`autoscaling: "x"` crashes `templates/scaledobject.yaml` with a raw Go template
+error naming no key at all, because `.enabled` cannot be read off a non-map.
+ADR-0794 is the governing rule for THIS arm: shape is tested with `kindIs "map"`
+ON THE RAW VALUE, `hasKey` first, for the same reason.
 
-THE REFUSAL TEXT MAY NOT QUOTE THE RAISE TEXT IT REPLACES (ADR-0794). A refusal and a raise
-both exit 1, so the only thing that tells them apart is the message —
-`scripts/tests/test_render_checks.py::test_the_shape_refusal_does_not_quote_a_raise` holds
-the banned markers and reads this whole file for them.
+ADR-0850 is why BOTH templates need their own copy of this: a `fail` here aborts the
+whole render, but which template's unguarded read panics first is not under this
+chart's control (measured: `scaledobject.yaml` panics before this file's `fail` is
+ever reached), so `templates/scaledobject.yaml` carries its own `kindIs "map"` guard
+rather than relying on this one running first.
+
+THE REFUSAL TEXT MAY NOT QUOTE THE RAISE TEXT IT REPLACES (ADR-0794) — a refusal and
+a raise both exit 1, so the message is the only thing that tells them apart.
+`scripts/tests/test_render_checks.py` holds the banned markers in one place and
+reads this whole file for them; the nine-shape table beside it is the gate on this
+block.
 */}}
 {{- if not (hasKey .Values "autoscaling") }}
 {{- fail (join "" (list
-      "task: `autoscaling` is absent from the values, so `autoscaling.enabled` cannot be "
-      "read. Helm deletes a null-valued key that a chart in the tree declares, and restores "
-      "no default, so a values file writing `autoscaling:` with no value leaves this chart "
-      "with nothing under it. Write the keys you mean, or omit `autoscaling` entirely and "
-      "this chart's own defaults apply.")) }}
+      "task: `autoscaling` is absent from the values, so `autoscaling.enabled` cannot be read. "
+      "Helm deletes a null-valued key that a chart in the tree declares, and restores no "
+      "default, so a values file writing `autoscaling:` with no value leaves this chart with "
+      "nothing under it. Write the keys you mean, or omit `autoscaling` entirely and this "
+      "chart's own defaults apply.")) }}
 {{- end }}
 {{- if not (kindIs "map" .Values.autoscaling) }}
 {{- fail (printf (join "" (list
-      "task: `autoscaling` must be a map and is %s (%s). `autoscaling.enabled` cannot be "
-      "read from a non-map value. Write the keys you mean under `autoscaling:`."))
+      "task: `autoscaling` must be a map and is %s (%s). `autoscaling.enabled` is read from "
+      "inside it, and a non-map here crashes the template with a raw Go error naming no key "
+      "at all. Write `autoscaling:` as a block, with `enabled: true` or `enabled: false` "
+      "inside it."))
       (kindOf .Values.autoscaling) (toJson .Values.autoscaling)) }}
+{{- end }}
+{{- if not (hasKey .Values.autoscaling "enabled") }}
+{{- fail (join "" (list
+      "task: `autoscaling.enabled` is absent. This chart's `values.yaml` declares it false, so "
+      "it is missing only when a values file wrote `enabled:` with NO VALUE — helm deletes a "
+      "null-valued key a chart declares and restores no default. Write `autoscaling.enabled: "
+      "false` to leave autoscaling off, or `true` to turn it on.")) }}
 {{- end }}
 {{- if not (kindIs "bool" .Values.autoscaling.enabled) }}
 {{- fail (printf (join "" (list
-      "task: `autoscaling.enabled` must be true or false and is %s (%s). A string, number, "
-      "map or list here is not a toggle: the template gates on bare truthiness, so "
-      "\"false\", \"no\", \"true\" and 1 all CREATE a ScaledObject while {}, 0, [] and an "
-      "absent key do not, and nothing tells you which one you wrote. Write the bare word "
-      "`true` or `false`."))
+      "task: `autoscaling.enabled` must be true or false and is %s (%s). A string, number, map "
+      "or list here is not a toggle: the template gates on bare truthiness, so \"false\", "
+      "\"no\", \"true\" and 1 all CREATE a ScaledObject while {}, 0 and [] do not, and nothing "
+      "tells you which one you wrote. Write the bare word `true` or `false`."))
       (kindOf .Values.autoscaling.enabled) (toJson .Values.autoscaling.enabled)) }}
 {{- end }}
 {{- if .Values.autoscaling.enabled }}

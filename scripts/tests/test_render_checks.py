@@ -743,94 +743,73 @@ def test_the_checks_are_unreachable_at_the_chart_defaults():
 
 
 # ── THE SHAPE OF `autoscaling` AND `autoscaling.enabled`, LEDGER 1135 ────────────
-# `templates/scaledobject.yaml` and `templates/render-checks.yaml`'s KEDA check both
-# gated on a BARE TRUTHINESS TEST, which is FAIL-OPEN on a string. Measured on helm
-# 3.20.2 and 4.3.0, identically: `autoscaling.enabled: "false"` and `"no"` — which
-# read as OFF to any human — CREATED a ScaledObject. ADR-0850 (extending ADR-0797)
-# is the rule the refusal implements: `kindIs "bool"` on the RAW value, with `hasKey`
-# first because `kindOf` answers `invalid` both for a deleted key and for an absent
-# one and cannot tell them apart.
+# Both `templates/render-checks.yaml` and `templates/scaledobject.yaml` gated on
+# `{{- if .Values.autoscaling.enabled }}`, a BARE TRUTHINESS TEST. Measured
+# identically on helm 3.20.2 and 4.3.0: that is FAIL-OPEN on a string —
+# `autoscaling.enabled: "false"` rendered a ScaledObject — and it is a RAW CRASH
+# the moment `autoscaling` itself is not a map, because `.enabled` is then read off
+# a non-map value. ADR-0797 governs the `enabled` arm (`kindIs "bool"`, `hasKey`
+# first); ADR-0794 governs the `autoscaling` arm one level up, because `autoscaling`
+# is read as a BLOCK rather than a toggle (`kindIs "map"`, `hasKey` first).
 #
-# THE IDIOM IS ADAPTED, NOT COPIED, from `yadgarhq/iam-db`'s
-# `scripts/tests/test_render_checks.py::SHAPE_ARMS` (ADR-0679's idiom, not its exact
-# table): that file guards `database.create`, a key nothing else reads at a dotted
-# path, so it has no `kindIs "map"` arm on `.Values.database` itself. This chart's
-# `autoscaling.enabled` IS read at a dotted path off `autoscaling`, so a present
-# non-map `autoscaling` RAISES rather than refuses without the extra arm — see
-# `templates/render-checks.yaml`'s own docstring for the measurement.
+# THE TABLE AND ARM NAMES ARE COPIED FROM `yadgarhq/iam#90` (ADR-0679), not
+# re-derived for this chart: both charts read `autoscaling.enabled` at the same
+# dotted path behind the same two-level shape.
 
-# THE GROUP EVERY SHAPE RENDER NAMES, AND IT IS NOT OPTIONAL. Without it the truthy
-# shapes abort at the KEDA capability check instead of at the shape refusal, and a
-# red case built on the exit code alone would redden for the renderer's reason while
-# reading as correct. Every refusal below exits 1 (ADR-0794), so every assertion
-# discriminates on the MESSAGE.
 KEDA_API_VERSIONS = ("--api-versions", "keda.sh/v1alpha1")
 
-# THE THREE ARMS OF THE REFUSAL, each with the phrase its message is recognised by
-# and the line that opens its block in the template. Two things follow from having
-# both: every arm gets its OWN red case below (a construction that strips one arm
-# and proves the shapes it owns stop being refused), and no arm can be satisfied by
-# another arm's message.
+# THE FOUR ARMS OF THE REFUSAL, each with the phrase its message is recognised by
+# and the line that opens its block in the template. Every arm gets its own red
+# case below (`test_stripping_an_arm_of_the_refusal_reddens_the_shapes_it_owns`),
+# so no arm can be satisfied by another arm's message.
 SHAPE_ARMS = {
     "autoscaling-absent": (
         "`autoscaling` is absent from the values",
         '{{- if not (hasKey .Values "autoscaling") }}',
     ),
-    "autoscaling-not-map": (
+    "autoscaling-not-a-map": (
         "`autoscaling` must be a map",
         '{{- if not (kindIs "map" .Values.autoscaling) }}',
     ),
-    "enabled-not-bool": (
+    "enabled-absent": (
+        "`autoscaling.enabled` is absent.",
+        '{{- if not (hasKey .Values.autoscaling "enabled") }}',
+    ),
+    "enabled-not-a-bool": (
         "`autoscaling.enabled` must be true or false",
         '{{- if not (kindIs "bool" .Values.autoscaling.enabled) }}',
     ),
 }
 
-# TEXT A REFUSAL MAY NOT CONTAIN (ADR-0794). Writing the raise text a refusal
-# REPLACES into the refusal string made an assertion of the form
-# `raise_text not in message` false-green forever, because the marker is then in
-# both. Asserted explicitly, so a later edit cannot reintroduce it quietly.
+# TEXT A REFUSAL MAY NOT CONTAIN (ADR-0794): the raise text it replaces, so an
+# assertion of the form `raise_text not in message` stays discriminating.
 RAISE_MARKERS = ("error calling", "nil pointer", "can't evaluate field")
 
-# EVERY SHAPE A VALUES FILE CAN WRITE AT `autoscaling` / `autoscaling.enabled`, with
-# the outcome each one MUST have. The bodies are WHOLE FILES and are written in one
-# go (`shape_overlay` below asserts it): an earlier measurement in this estate
-# appended a key to an overlay, silently nested it under a sibling, and produced a
-# table where every shape read as permitted — including the ones that refuse.
-#
-# `("render", n)` means exit 0 with n ScaledObject objects. `("refuse", arm, kind)`
-# means exit 1 with THAT arm's phrase, and — where `kind` is not None — the helm KIND
-# NAME the message must print. The kind name is per row rather than shared: asserting
-# only the common phrase would pass an implementation that called every shape a bool.
+# EVERY SHAPE A VALUES FILE CAN WRITE AT `autoscaling` / `autoscaling.enabled`,
+# with the outcome each one MUST have. `("render", n)` means exit 0 with n
+# ScaledObjects. `("refuse", arm, kind)` means exit 1 with THAT arm's phrase, and —
+# where the arm is a kind test — the helm KIND NAME the message must print.
 SHAPES = (
     ("bool-false", "autoscaling:\n  enabled: false\n", ("render", 0)),
     ("bool-true", "autoscaling:\n  enabled: true\n", ("render", 1)),
-    ("string-false", 'autoscaling:\n  enabled: "false"\n', ("refuse", "enabled-not-bool", "string")),
-    ("string-no", 'autoscaling:\n  enabled: "no"\n', ("refuse", "enabled-not-bool", "string")),
-    ("number-zero", "autoscaling:\n  enabled: 0\n", ("refuse", "enabled-not-bool", "float64")),
-    ("empty-map", "autoscaling:\n  enabled: {}\n", ("refuse", "enabled-not-bool", "map")),
-    # THE DELETED KEY, and it is the dangerous one ADR-0797 names. Helm DELETES a
-    # null-valued key that a chart in the tree declares and restores no default, so
-    # this reaches the template as `enabled` ABSENT — measured, on both helm lines —
-    # while a values file that simply OMITS `enabled` gets this chart's own `false`
-    # back with `hasKey` true. There is no dedicated `hasKey` arm for `enabled`
-    # itself (unlike `database.create` in `iam-db`): `kindIs "bool"` on a deleted key
-    # reads `invalid`, which is already not `bool`, so the existing arm catches it
-    # without a raise — `autoscaling` was already proven to be a map above.
-    ("enabled-null", "autoscaling:\n  enabled:\n", ("refuse", "enabled-not-bool", "invalid")),
-    # THE SAME DELETION ONE LEVEL UP, and it is what makes the `autoscaling-absent`
-    # arm reachable. Without this row that arm has no shape of its own and could be
-    # deleted with this suite still green.
+    ("string-false", 'autoscaling:\n  enabled: "false"\n', ("refuse", "enabled-not-a-bool", "string")),
+    ("string-no", 'autoscaling:\n  enabled: "no"\n', ("refuse", "enabled-not-a-bool", "string")),
+    ("number-zero", "autoscaling:\n  enabled: 0\n", ("refuse", "enabled-not-a-bool", "float64")),
+    ("empty-map", "autoscaling:\n  enabled: {}\n", ("refuse", "enabled-not-a-bool", "map")),
+    # THE DELETED KEY: helm deletes a null-valued key that a chart in the tree
+    # declares and restores no default, so this reaches the template as `enabled`
+    # ABSENT, not as `enabled: null`.
+    ("enabled-null", "autoscaling:\n  enabled:\n", ("refuse", "enabled-absent", None)),
+    # THE SHAPE THAT CRASHES WITHOUT THE `autoscaling` ARM (measured: `can't
+    # evaluate field enabled in type interface {}` from `scaledobject.yaml`, before
+    # this guard existed).
+    ("autoscaling-string", 'autoscaling: "x"\n', ("refuse", "autoscaling-not-a-map", "string")),
+    # THE SAME DELETION ONE LEVEL UP, which is what makes the first arm falsifiable.
     ("autoscaling-null", "autoscaling:\n", ("refuse", "autoscaling-absent", None)),
-    # THE RAISE THIS WHOLE SECTION EXISTS TO PREVENT. Measured before
-    # `autoscaling-not-map` existed: helm 4.3.0 reported
-    # "can't evaluate field enabled in type interface {}" from `templates/
-    # scaledobject.yaml`, a go/template panic naming neither the chart nor the key.
-    ("autoscaling-not-map", "autoscaling: x\n", ("refuse", "autoscaling-not-map", "string")),
 )
 
-# THE COUNTS, LITERALS. A gate that reports how many shapes it examined turns a
-# deleted row into a red suite rather than into a quieter pass.
+# THE COUNTS, LITERALS, for the reason every expected count in this estate is one: a
+# number derived from the thing under test agrees with whatever that happens to be.
 EXPECTED_SHAPES = 9
 EXPECTED_SHAPES_REFUSED = 7
 EXPECTED_SHAPES_RENDERED = 2
@@ -962,7 +941,7 @@ def test_the_shape_harness_measures_what_it_claims_to(tmp_path):
 
     refusing = render_the_shape(CHART, 'autoscaling:\n  enabled: "false"\n', tmp_path / "refusing")
     assert refusing.returncode != 0, refusing.stdout
-    assert SHAPE_ARMS["enabled-not-bool"][0] in refusing.stderr, refusing.stderr
+    assert SHAPE_ARMS["enabled-not-a-bool"][0] in refusing.stderr, refusing.stderr
 
 
 def test_every_writable_shape_of_the_toggle_is_a_bool_or_refused(tmp_path):
@@ -996,11 +975,11 @@ def test_every_writable_shape_of_the_toggle_is_a_bool_or_refused(tmp_path):
 def test_stripping_an_arm_of_the_refusal_reddens_the_shapes_it_owns(tmp_path):
     """THE RED CASE, CONSTRUCTED, and run ONCE PER ARM rather than once for the guard.
 
-    A single red case that deleted the `kindIs "bool"` block would leave the two
-    other arms unfalsifiable — either could be deleted with this suite still green,
-    which is the exact shape of guard ADR-0797 was written about: one that reads as
-    complete and is not. So each arm is stripped in turn and the shapes it owns are
-    asserted to stop being refused for its reason.
+    A single red case that deleted the `kindIs "bool"` block would leave the three
+    other arms unfalsifiable — any one of them could be deleted with this suite
+    still green, which is the exact shape of guard ADR-0797 was written about: one
+    that reads as complete and is not. So each arm is stripped in turn and the
+    shapes it owns are asserted to stop being refused for its reason.
     """
     exercised = 0
     for arm, (phrase, opening) in sorted(SHAPE_ARMS.items()):
@@ -1042,7 +1021,7 @@ def test_stripping_the_kind_test_puts_the_two_wrong_on_shapes_back(tmp_path):
     copy = tmp_path / "chart"
     shutil.copytree(CHART, copy)
     template = copy / "templates" / "render-checks.yaml"
-    template.write_text(strip_arm(template.read_text(), SHAPE_ARMS["enabled-not-bool"][1]))
+    template.write_text(strip_arm(template.read_text(), SHAPE_ARMS["enabled-not-a-bool"][1]))
 
     wrong_on = ("string-false", "string-no")
     bodies = {label: body for label, body, _ in SHAPES}
