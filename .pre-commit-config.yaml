@@ -155,23 +155,3 @@ repos:
         entry: pytest scripts/tests/ -q
         pass_filenames: false
         always_run: true
-      # LEDGER 748: the exit chain, run against the real binary on every commit.
-      # `tests/exit_chain.rs` (and the `LISTEN` case of `tests/boot_message.rs`)
-      # put the binary in a private mount namespace with `unshare -rm`, because
-      # it reads `/etc/yadgar/config/shared/shared.yaml` from a fixed path.
-      #
-      # HERE AS WELL AS IN `ci-pr.yaml`'s `cargo test --all-features`, because a
-      # GitHub-hosted Ubuntu 24.04 runner may refuse unprivileged user namespaces
-      # (AppArmor's `kernel.apparmor_restrict_unprivileged_userns`). If it does,
-      # the CI run of these tests fails loudly rather than skipping — and this
-      # hook is what keeps the chain checked on every developer machine until
-      # the runner is cleared. It narrows nothing: the whole of each target runs.
-      #
-      # `language: system`: the toolchain is the repository's own
-      # `rust-toolchain.toml`, as for the cargo hooks above.
-      - id: cargo-test-exit-chain
-        name: cargo test (exit chain, real binary)
-        language: system
-        entry: cargo test --all-features --test exit_chain --test boot_message
-        pass_filenames: false
-        always_run: true
