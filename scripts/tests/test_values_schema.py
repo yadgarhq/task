@@ -395,11 +395,13 @@ def test_two_levels_down_typo_is_refused_by_name(tmp_path):
 
 # ── RED CASES: `tls.enabled` AND `taskDb.tls.enabled` CARRY NO DEFAULT (ADR-0845) ──
 #
-# Schema refusals below assert the key AND its path only, never helm's
-# wording (helm 3.18.4 phrases a `required`/`type` miss differently from
-# 3.20.2 and 4.3.0 — correction 5). Render-check refusals assert the exact
-# designed sentence, because that text is this chart's own and does not vary
-# by helm version.
+# Schema refusals below assert the stable WRAPPER sentence plus the key and
+# its path segment only, never helm's per-leaf wording — measured identical
+# on 4.3.0 and 3.20.2 ("at '/tls': missing property 'enabled'") and 3.18.4
+# ("tls: enabled is required"); only the wrapper below is common to both.
+# Render-check refusals assert the exact designed sentence, because that
+# text is this chart's own and does not vary by helm version.
+SCHEMA_REFUSAL_WRAPPER = "values don't meet the specifications of the schema(s)"
 
 
 @pytest.mark.parametrize(
@@ -412,6 +414,7 @@ def test_enabled_wrong_type_is_refused_by_the_schema_naming_key_and_path(
     body = {key: {"enabled": "true"}} if key == "tls" else {"taskDb": {"tls": {"enabled": "true"}}}
     result = render("-f", values_file(tmp_path, f"wt-{key}", body))
     assert result.returncode != 0, result.stdout
+    assert SCHEMA_REFUSAL_WRAPPER in result.stderr, result.stderr
     assert "enabled" in result.stderr
     assert parent.split(".")[-1] in result.stderr or parent in result.stderr
 
@@ -428,7 +431,9 @@ def test_enabled_null_is_refused_by_the_schema_naming_the_key(tmp_path, path):
     body = {"tls": {"enabled": None}} if path == "tls" else {"taskDb": {"tls": {"enabled": None}}}
     result = render("-f", values_file(tmp_path, f"null-{path}", body))
     assert result.returncode != 0, result.stdout
+    assert SCHEMA_REFUSAL_WRAPPER in result.stderr, result.stderr
     assert "enabled" in result.stderr
+    assert path in result.stderr
 
 
 def test_tls_block_null_is_refused_naming_tls_by_the_render_check(tmp_path):
@@ -459,24 +464,191 @@ def test_tls_not_a_map_is_refused_naming_tls_by_the_render_check(tmp_path):
     assert "`tls` must be a map and is string" in result.stderr
 
 
-def test_tls_enabled_true_renders_and_is_neutral_against_origin_main(tmp_path):
-    """THE CARD'S OWN GOLDEN: with both switches explicit and the same image
-    ref, HEAD's render must equal origin/main's render of the SAME chart with
-    the equivalent `--set` (origin/main's `tls.enabled`/`taskDb.tls.enabled`
-    still had a chart default of `false`, so origin/main needs the override
-    stated explicitly too). See `test_render_checks.py` for the full diff;
-    this is the narrower half that belongs with the schema — nothing about
-    turning TLS on trips the closure this file owns.
+# ── RED CASES: K-1 asserts the RENDERED VALUE, not just a successful render ──
+
+
+def deployment_env(stdout: str) -> dict[str, str]:
+    """The `env:` list of this chart's one Deployment, as a name -> value
+    map. PURE. A substring check on raw YAML text cannot tell `"1"` apart
+    from a comment that happens to mention it; this reads the actual
+    rendered field.
+    """
+    for doc in yaml.safe_load_all(stdout):
+        if isinstance(doc, dict) and doc.get("kind") == "Deployment":
+            env = doc["spec"]["template"]["spec"]["containers"][0]["env"]
+            return {item["name"]: item.get("value") for item in env}
+    raise AssertionError("no Deployment in this render")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_k1_unconditional_render_matches_the_switch(tmp_path, enabled):
+    body = {"tls": {"enabled": enabled}, "taskDb": {"tls": {"enabled": enabled}}}
+    result = render("-f", values_file(tmp_path, f"k1-{enabled}", body))
+    assert result.returncode == 0, result.stderr
+    env = deployment_env(result.stdout)
+    want = "1" if enabled else "0"
+    assert env["LISTEN_TLS_ENABLED"] == want, env
+    assert env["TASK_DB_TLS_ENABLED"] == want, env
+
+
+# ── RED CASES: B-U5E's `tls.clientAuth` (ADR-0854, coordinator convention) ──
+
+
+def test_client_auth_unquoted_off_is_refused_by_name(tmp_path):
+    """YAML 1.1 reads a bare `off` as the boolean `false` (convention item 1):
+    `clientAuth: off` parses to `false`, not the string `"off"`.
     """
     result = render(
-        "-f",
-        values_file(
-            tmp_path,
-            "golden",
-            {"tls": {"enabled": True}, "taskDb": {"tls": {"enabled": True}}},
-        ),
+        "-f", values_file(tmp_path, "ca-bare-off", "tls:\n  enabled: true\n  clientAuth: off\n")
     )
+    assert result.returncode != 0, result.stdout
+    assert "`tls.clientAuth` must be a quoted string" in result.stderr
+    assert "write `clientAuth: \"off\"`" in result.stderr
+
+
+def test_client_auth_optional_refuses_with_the_not_enforced_yet_sentence(tmp_path):
+    body = {"tls": {"enabled": True, "clientAuth": "optional"}}
+    result = render("-f", values_file(tmp_path, "ca-optional", body))
+    assert result.returncode != 0, result.stdout
+    assert "`tls.clientAuth: optional` is not enforced yet" in result.stderr
+
+
+def test_client_auth_required_refuses_with_the_not_enforced_yet_sentence(tmp_path):
+    body = {"tls": {"enabled": True, "clientAuth": "required"}}
+    result = render("-f", values_file(tmp_path, "ca-required", body))
+    assert result.returncode != 0, result.stdout
+    assert "`tls.clientAuth: required` is not enforced yet" in result.stderr
+
+
+def test_client_auth_bogus_value_is_refused(tmp_path):
+    body = {"tls": {"enabled": True, "clientAuth": "bogus"}}
+    result = render("-f", values_file(tmp_path, "ca-bogus", body))
+    assert result.returncode != 0, result.stdout
+    assert "must be `off`, `optional` or `required`" in result.stderr
+    assert "bogus" in result.stderr
+
+
+def test_client_auth_off_renders_the_env_var(tmp_path):
+    body = {"tls": {"enabled": True, "clientAuth": "off"}}
+    result = render("-f", values_file(tmp_path, "ca-off", body))
     assert result.returncode == 0, result.stderr
+    assert deployment_env(result.stdout)["LISTEN_TLS_CLIENT_AUTH"] == "off"
+
+
+def test_client_auth_absent_renders_no_client_auth_fields(tmp_path):
+    """Convention item 6: an absent key must render NOTHING B-U5E adds — not
+    the env vars, not the mount, not the volume. `tls.enabled: true` alone
+    (what `chart/ci/values.yaml` already ships) is the fixture.
+    """
+    result = render()
+    assert result.returncode == 0, result.stderr
+    env = deployment_env(result.stdout)
+    assert "LISTEN_TLS_CLIENT_AUTH" not in env
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in env
+    assert "client-ca" not in result.stdout
+
+
+def test_client_ca_secret_empty_renders_no_client_ca_fields(tmp_path):
+    """Convention item 4: `clientCaSecret: ""` must not render
+    `secretName: ""` — the gate is on TRUTHINESS, not `hasKey`.
+    """
+    body = {"tls": {"enabled": True, "clientAuth": "off", "clientCaSecret": ""}}
+    result = render("-f", values_file(tmp_path, "ca-secret-empty", body))
+    assert result.returncode == 0, result.stderr
+    env = deployment_env(result.stdout)
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in env
+    assert "client-ca" not in result.stdout
+    # The OTHER B-U5E field is unaffected: `clientAuth: "off"` still renders.
+    assert env["LISTEN_TLS_CLIENT_AUTH"] == "off"
+
+
+def test_client_auth_fields_do_not_render_when_tls_is_off(tmp_path):
+    """Convention item 3: client auth is nested under `tls.enabled`, not a
+    sibling of it. A deployment that has not cut over `tls.enabled` sees no
+    difference from stating `clientAuth` at all.
+    """
+    body = {
+        "tls": {
+            "enabled": False,
+            "clientAuth": "off",
+            "clientCaSecret": "task-client-ca",
+            "clientCaSecretKey": "ca.crt",
+        }
+    }
+    result = render("-f", values_file(tmp_path, "ca-tls-off", body))
+    assert result.returncode == 0, result.stderr
+    env = deployment_env(result.stdout)
+    assert "LISTEN_TLS_CLIENT_AUTH" not in env
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in env
+    assert "client-ca" not in result.stdout
+
+
+def origin_main_chart(tmp_path: Path) -> Path:
+    """A real copy of `origin/main`'s `chart/` tree, extracted with `git
+    show` rather than reconstructed by hand — the golden comparison below
+    is only honest against the chart that actually shipped before this PR,
+    not against a guess at what it looked like.
+    """
+    dest = tmp_path / "origin-main-chart"
+    listing = subprocess.run(
+        ["git", "-C", str(REPO), "ls-tree", "-r", "--name-only", "origin/main", "--", "chart"],
+        capture_output=True,
+        text=True,
+    )
+    assert listing.returncode == 0 and listing.stdout.strip(), (
+        f"could not list origin/main's chart/ tree: {listing.stderr}"
+    )
+    for relpath in listing.stdout.splitlines():
+        blob = subprocess.run(
+            ["git", "-C", str(REPO), "show", f"origin/main:{relpath}"],
+            capture_output=True,
+            text=True,
+        )
+        assert blob.returncode == 0, f"could not read origin/main:{relpath}: {blob.stderr}"
+        target = dest / Path(relpath).relative_to("chart")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(blob.stdout)
+    return dest
+
+
+def rendered_objects(stdout: str) -> list:
+    """Every parsed object in a render, sorted by kind. PURE.
+
+    Comparing PARSED objects rather than text is what makes this a render
+    comparison rather than a comment-diff: `yaml.safe_load_all` drops every
+    comment on the way in, and this chart's own prose is the overwhelming
+    majority of what changed in this PR's diff of `templates/deployment.yaml`.
+    Sorted by `kind` alone, which is enough here — this chart renders at most
+    one object of each kind.
+    """
+    objects = [doc for doc in yaml.safe_load_all(stdout) if isinstance(doc, dict)]
+    return sorted(objects, key=lambda d: d.get("kind", ""))
+
+
+def test_tls_enabled_true_renders_and_is_neutral_against_origin_main(tmp_path):
+    """THE CARD'S OWN GOLDEN (ADR-0645, K-1): with both switches explicit and
+    the same image ref, HEAD's render must equal origin/main's render of the
+    SAME chart with the equivalent override (origin/main's `tls.enabled`/
+    `taskDb.tls.enabled` still had a chart default of `false`, so it needs
+    the override stated explicitly too, same as HEAD does since this PR
+    removed that default). Compared as PARSED objects, not text, so neither
+    side's own prose — which is most of this PR's diff of
+    `templates/deployment.yaml` — can register as a difference.
+    """
+    overlay = values_file(
+        tmp_path,
+        "golden",
+        {"tls": {"enabled": True}, "taskDb": {"tls": {"enabled": True}}},
+    )
+
+    head = render("-f", overlay)
+    assert head.returncode == 0, head.stderr
+
+    old_chart = origin_main_chart(tmp_path)
+    main = helm("template", "x", str(old_chart), "-f", overlay)
+    assert main.returncode == 0, main.stderr
+
+    assert rendered_objects(head.stdout) == rendered_objects(main.stdout)
 
 
 def lint_bare() -> subprocess.CompletedProcess[str]:
@@ -498,8 +670,11 @@ def test_a_bare_lint_refuses_the_missing_tls_enabled():
     mutation check.
     """
     result = lint_bare()
+    combined = result.stdout + result.stderr
     assert result.returncode != 0, result.stdout
-    assert "enabled" in (result.stdout + result.stderr)
+    assert SCHEMA_REFUSAL_WRAPPER in combined, combined
+    assert "enabled" in combined
+    assert "tls" in combined
 
 
 def test_dropping_tls_required_degrades_the_bare_lint_message(tmp_path):

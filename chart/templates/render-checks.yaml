@@ -147,8 +147,8 @@ shape is proved sound.
       "task: `tls` is absent from the values, so `tls.enabled` cannot be read. "
       "Helm deletes a null-valued key that a chart in the tree declares, and "
       "restores no default, so a values file writing `tls:` with no value leaves "
-      "this chart with nothing under it. Write the keys you mean, or omit `tls` "
-      "entirely and this chart's own defaults apply.")) }}
+      "this chart with nothing under it. Write the keys you mean: `tls.enabled` "
+      "has no default (ADR-0845) and must be `true` or `false`.")) }}
 {{- end }}
 {{- if not (kindIs "map" .Values.tls) }}
 {{- fail (printf (join "" (list
@@ -169,9 +169,9 @@ shape is proved sound.
 {{- fail (printf (join "" (list
       "task: `tls.enabled` must be true or false and is %s (%s). A string, "
       "number, map or list here is not a toggle: the chart renders "
-      "LISTEN_TLS_ENABLED from it unconditionally, so a quoted or typed value is "
-      "misread rather than refused until the pod either fails to boot or serves "
-      "the wrong transport. Write the bare word `true` or `false`."))
+      "LISTEN_TLS_ENABLED from it unconditionally, so a quoted or typed value "
+      "would be misread rather than refused until the pod either fails to boot "
+      "or serves the wrong transport. Write the bare word `true` or `false`."))
       (kindOf .Values.tls.enabled) (toJson .Values.tls.enabled)) }}
 {{- end }}
 {{- if not (hasKey .Values "taskDb") }}
@@ -180,8 +180,8 @@ shape is proved sound.
       "be read. Helm deletes a null-valued key that a chart in the tree "
       "declares, and restores no default, so a values file writing `taskDb:` "
       "with no value leaves this chart with nothing under it. Write the keys "
-      "you mean, or omit `taskDb` entirely and this chart's own defaults "
-      "apply.")) }}
+      "you mean: `taskDb.tls.enabled` has no default (ADR-0845) and must be "
+      "`true` or `false`.")) }}
 {{- end }}
 {{- if not (kindIs "map" .Values.taskDb) }}
 {{- fail (printf (join "" (list
@@ -195,9 +195,9 @@ shape is proved sound.
       "task: `taskDb.tls` is absent from the values, so `taskDb.tls.enabled` "
       "cannot be read. Helm deletes a null-valued key that a chart in the tree "
       "declares, and restores no default, so a values file writing `taskDb: "
-      "{tls:}` with no value leaves this chart with nothing under it. Write the "
-      "keys you mean, or omit `taskDb.tls` entirely and this chart's own "
-      "defaults apply.")) }}
+      "{tls:}` with no value leaves this chart with nothing under it. Write "
+      "the keys you mean: `taskDb.tls.enabled` has no default (ADR-0845) and "
+      "must be `true` or `false`.")) }}
 {{- end }}
 {{- if not (kindIs "map" .Values.taskDb.tls) }}
 {{- fail (printf (join "" (list
@@ -219,14 +219,15 @@ shape is proved sound.
       "task: `taskDb.tls.enabled` must be true or false and is %s (%s). A "
       "string, number, map or list here is not a toggle: the chart renders "
       "TASK_DB_TLS_ENABLED from it unconditionally, so a quoted or typed value "
-      "is misread rather than refused until the pod either fails to boot or "
-      "dials the wrong transport. Write the bare word `true` or `false`."))
+      "would be misread rather than refused until the pod either fails to boot "
+      "or dials the wrong transport. Write the bare word `true` or `false`."))
       (kindOf .Values.taskDb.tls.enabled) (toJson .Values.taskDb.tls.enabled)) }}
 {{- end }}
 
 {{/*
 B-U5E EXPAND: `tls.clientAuth`, `tls.clientCaSecret` and `tls.clientCaSecretKey`
-(ADR-0854, folded into this card per the plan's B-U5E card).
+(ADR-0854, folded into this card per the plan's B-U5E card and the
+coordinator's cross-repo convention, scratchpad/sweep/B-U5E-convention.md).
 
 NONE OF THIS CHANGES THE BINARY. `src/serve.rs` does not read
 LISTEN_TLS_CLIENT_AUTH at all yet — B-U5 is the unit that adopts it. This
@@ -242,8 +243,24 @@ and `required` are refused HERE rather than rendered: shipping either today
 would have an adopter believe client certificates are checked when nothing
 checks them. Only `off` — ADR-0854's "emergency value" — is accepted before
 B-U5 lifts this gate (K-8 step 1).
+
+`kindIs "string"` GUARDS EVERY `eq`/`ne` BELOW, and it has to run FIRST. YAML
+1.1 reads a BARE `off` (no quotes) as the boolean `false` — `clientAuth: off`
+parses to `false`, not the string `"off"` — so `eq .Values.tls.clientAuth
+"optional"` against a bool argument is a Go template type error
+("incompatible types for comparison") rather than a clean refusal. The
+message says so by name, because writing `clientAuth: "off"` quoted is the
+one-character fix and an adopter who hit the raw Go error would not find it
+unaided.
 */}}
 {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+{{- if not (kindIs "string" .Values.tls.clientAuth) }}
+{{- fail (printf (join "" (list
+      "task: `tls.clientAuth` must be a quoted string (\"off\", \"optional\" "
+      "or \"required\") and is %s (%s). YAML reads a bare off as false: write "
+      "`clientAuth: \"off\"`."))
+      (kindOf .Values.tls.clientAuth) (toJson .Values.tls.clientAuth)) }}
+{{- end }}
 {{- if eq .Values.tls.clientAuth "optional" }}
 {{- fail (join "" (list
       "task: `tls.clientAuth: optional` is not enforced yet. This binary does "

@@ -273,19 +273,30 @@ spec:
             - name: LISTEN_TLS_KEY_FILE
               value: /var/run/config/serving-cert/tls.key
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") }}
             # B-U5E EXPAND (ADR-0854), STATED AHEAD OF THE BINARY READING IT.
             # `templates/render-checks.yaml` refuses every value but `off`
             # until B-U5 lifts that, so this is reached only with `off`.
+            #
+            # NESTED UNDER `tls.enabled`, never a sibling of it (coordinator
+            # convention, project-db#54): client auth is meaningless without
+            # the encrypted transport it runs inside, so a deployment that
+            # has not cut over `tls.enabled` on sees no difference from
+            # stating `clientAuth` at all.
             - name: LISTEN_TLS_CLIENT_AUTH
               value: {{ .Values.tls.clientAuth | quote }}
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientCaSecret") }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
             # THE AUTHORITY this listener would check a CLIENT certificate
             # against, once B-U5 adopts it. A PATH, never a PEM (D80), mounted
             # from its own Secret rather than `tls.certSecret`'s: the CA that
             # signs the callers' certificates is not necessarily the one that
             # signs this pod's own.
+            #
+            # GATED ON `clientCaSecret` TRUTHINESS, NOT `hasKey` — an adopter
+            # who writes `clientCaSecret: ""` to revert must not render
+            # `secretName: ""` further down, which is a wrong value rather
+            # than an absent one.
             - name: LISTEN_TLS_CLIENT_CA_FILE
               value: /var/run/config/client-ca/ca.crt
             {{- end }}
@@ -482,7 +493,7 @@ spec:
               mountPath: /var/run/config/serving-cert
               readOnly: true
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientCaSecret") }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
             # A DIRECTORY MOUNT, never subPath, for the same reason as
             # `serving-cert` above: kubelet never refreshes a subPath mount,
             # and a rotated authority would never reach this pod.
@@ -567,16 +578,24 @@ spec:
               - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
                 path: tls.key
         {{- end }}
-        {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientCaSecret") }}
+        {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
         # B-U5E EXPAND (ADR-0854): the authority a CLIENT certificate would be
         # checked against, once B-U5 adopts LISTEN_TLS_CLIENT_CA_FILE. A PATH,
-        # never a PEM (D80), the same `optional: true` reasoning as
-        # `serving-cert` above — the binary is what names a missing file,
-        # never a stuck `ContainerCreating`.
+        # never a PEM (D80).
+        #
+        # NOT `optional: true`, unlike `serving-cert` and `task-db-ca` above —
+        # and deliberately so (coordinator convention). Those two are
+        # rendered whenever their PARENT toggle is on, so an adopter who
+        # turned TLS on before issuing the certificate meets an expected,
+        # transient gap; this Secret is named only because `clientCaSecret`
+        # is already SET to a real name (the gate above is on its
+        # truthiness, not `hasKey`), so a missing Secret here is a mistake
+        # in that name, and `ContainerCreating` naming the volume is the
+        # more useful refusal than a silently empty mount the binary would
+        # then have to notice on its own.
         - name: client-ca
           secret:
             secretName: {{ .Values.tls.clientCaSecret | quote }}
-            optional: true
             items:
               - key: {{ required "tls.clientCaSecretKey names the key inside tls.clientCaSecret that holds the CA bundle and must be set whenever tls.clientCaSecret is; see the chart's values.yaml" .Values.tls.clientCaSecretKey | quote }}
                 path: ca.crt

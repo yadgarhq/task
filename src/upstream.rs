@@ -159,6 +159,21 @@ struct ClientIdentity {
     key: PathBuf,
 }
 
+/// What `*_TLS_ENABLED` looked like, for the refusal naming it — and the
+/// reason this takes the RAW, untrimmed lookup result rather than `get`'s
+/// output: an absent variable and one set to `""` or whitespace are the same
+/// decision today (off would be `"0"`, and neither of these is it), but an
+/// operator reading a crash loop needs to tell "I forgot this" from "I set
+/// this to nothing" apart, the same distinction `env_required` makes in
+/// `main.rs`.
+fn describe_enabled(value: Option<&str>) -> String {
+    match value.map(str::trim) {
+        None => "NOT SET".to_string(),
+        Some("") => "\"\" (empty)".to_string(),
+        Some(other) => format!("{other:?}"),
+    }
+}
+
 impl UpstreamTls {
     /// Read one upstream's transport configuration from the environment.
     ///
@@ -190,7 +205,13 @@ impl UpstreamTls {
         // The knob used to have a compiled-in default: anything but "1" was
         // cleartext, so an unset variable and a typo both silently meant OFF.
         // ADR-0845 deletes that default.
-        match get("TLS_ENABLED").as_deref() {
+        //
+        // THE RAW LOOKUP, NOT `get`: `get` collapses absent and set-but-empty
+        // into the same `None`, which is right for a PATH and wrong here —
+        // `describe_enabled` names the two differently, the same
+        // discrimination `env_required` makes in `main.rs`.
+        let enabled_raw = lookup(&format!("{prefix}_TLS_ENABLED"));
+        match enabled_raw.as_deref().map(str::trim) {
             Some("0") => {
                 // THE CLIENT CERTIFICATE IS NAMED HERE TOO, and leaving it out
                 // was the silent case: an operator who mounts a client leaf
@@ -215,16 +236,10 @@ impl UpstreamTls {
                 return Ok(None);
             }
             Some("1") => {}
-            Some(other) => {
+            other => {
                 return Err(TlsConfigError::EnabledNotBoolean(
                     prefix,
-                    format!("{other:?}"),
-                ))
-            }
-            None => {
-                return Err(TlsConfigError::EnabledNotBoolean(
-                    prefix,
-                    "NOT SET".to_string(),
+                    describe_enabled(other),
                 ))
             }
         }

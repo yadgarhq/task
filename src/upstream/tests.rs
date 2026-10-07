@@ -35,10 +35,35 @@ fn lookup<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Opt
 /// value outside "1"/"0", naming the knob.
 #[test]
 fn absent_tls_enabled_is_refused() {
+    let error = UpstreamTls::from_lookup(TASK_DB, lookup(&[])).unwrap_err();
     assert!(matches!(
-        UpstreamTls::from_lookup(TASK_DB, lookup(&[])),
-        Err(TlsConfigError::EnabledNotBoolean(TASK_DB, _))
+        error,
+        TlsConfigError::EnabledNotBoolean(TASK_DB, _)
     ));
+    let message = error.to_string();
+    assert!(
+        message.contains("TASK_DB_TLS_ENABLED"),
+        "the refusal must name the variable: {message}"
+    );
+    assert!(
+        message.contains("taskDb.tls.enabled"),
+        "the refusal must name the chart key: {message}"
+    );
+}
+
+/// AN EMPTY VALUE IS NAMED DIFFERENTLY FROM AN ABSENT ONE, the same
+/// discrimination `env_required` makes in `main.rs`: a nulled chart value
+/// renders `""`, which is what an operator is most likely to hit.
+#[test]
+fn an_empty_tls_enabled_is_refused_and_named_differently_from_absent() {
+    let empty = UpstreamTls::from_lookup(TASK_DB, lookup(&[("TASK_DB_TLS_ENABLED", "")]))
+        .unwrap_err()
+        .to_string();
+    let absent = UpstreamTls::from_lookup(TASK_DB, lookup(&[]))
+        .unwrap_err()
+        .to_string();
+    assert!(empty.contains("(empty)"), "got: {empty}");
+    assert_ne!(empty, absent, "empty and absent must not share one message");
 }
 
 /// THE REVERTED STATE is now `"0"` WRITTEN EXPLICITLY, not absence. A bundle

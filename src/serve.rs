@@ -151,6 +151,21 @@ pub struct ServeTls {
     key_file: PathBuf,
 }
 
+/// What `*_TLS_ENABLED` looked like, for the refusal naming it — and the
+/// reason this takes the RAW, untrimmed lookup result rather than `get`'s
+/// output: an absent variable and one set to `""` or whitespace are the same
+/// decision today (off would be `"0"`, and neither of these is it), but an
+/// operator reading a crash loop needs to tell "I forgot this" from "I set
+/// this to nothing" apart, the same distinction `env_required` makes in
+/// `main.rs`.
+fn describe_enabled(value: Option<&str>) -> String {
+    match value.map(str::trim) {
+        None => "NOT SET".to_string(),
+        Some("") => "\"\" (empty)".to_string(),
+        Some(other) => format!("{other:?}"),
+    }
+}
+
 impl ServeTls {
     /// Read the listener's transport configuration from the environment.
     ///
@@ -186,7 +201,14 @@ impl ServeTls {
         // a setting meant to be off ends up looking chosen when nobody chose
         // it; the chart renders this variable unconditionally now, so the
         // only way it is genuinely absent is a chart that forgot to.
-        match get("TLS_ENABLED").as_deref() {
+        //
+        // THE RAW LOOKUP, NOT `get`: `get` collapses absent and set-but-empty
+        // into the same `None`, which is right for a PATH (nothing to tell
+        // apart) and wrong here — `describe_enabled` names the two
+        // differently, the same discrimination `env_required` makes in
+        // `main.rs` for the knob a nulled chart value actually produces.
+        let enabled_raw = lookup(&format!("{prefix}_TLS_ENABLED"));
+        match enabled_raw.as_deref().map(str::trim) {
             Some("0") => {
                 if get("TLS_CERT_FILE").is_some() || get("TLS_KEY_FILE").is_some() {
                     // NOT an error. Leaving the certificate in place while the
@@ -204,16 +226,10 @@ impl ServeTls {
                 return Ok(None);
             }
             Some("1") => {}
-            Some(other) => {
+            other => {
                 return Err(ServeTlsError::EnabledNotBoolean(
                     prefix,
-                    format!("{other:?}"),
-                ))
-            }
-            None => {
-                return Err(ServeTlsError::EnabledNotBoolean(
-                    prefix,
-                    "NOT SET".to_string(),
+                    describe_enabled(other),
                 ))
             }
         }
@@ -321,10 +337,35 @@ mod tests {
     /// any other value outside "1"/"0", naming the knob.
     #[test]
     fn absent_tls_enabled_is_refused() {
+        let error = ServeTls::from_lookup(LISTEN, lookup(&[])).unwrap_err();
         assert!(matches!(
-            ServeTls::from_lookup(LISTEN, lookup(&[])),
-            Err(ServeTlsError::EnabledNotBoolean("LISTEN", _))
+            error,
+            ServeTlsError::EnabledNotBoolean("LISTEN", _)
         ));
+        let message = error.to_string();
+        assert!(
+            message.contains("LISTEN_TLS_ENABLED"),
+            "the refusal must name the variable: {message}"
+        );
+        assert!(
+            message.contains("tls.enabled"),
+            "the refusal must name the chart key: {message}"
+        );
+    }
+
+    /// AN EMPTY VALUE IS NAMED DIFFERENTLY FROM AN ABSENT ONE, the same
+    /// discrimination `env_required` makes in `main.rs`: a nulled chart
+    /// value renders `""`, which is what an operator is most likely to hit.
+    #[test]
+    fn an_empty_tls_enabled_is_refused_and_named_differently_from_absent() {
+        let empty = ServeTls::from_lookup(LISTEN, lookup(&[("LISTEN_TLS_ENABLED", "")]))
+            .unwrap_err()
+            .to_string();
+        let absent = ServeTls::from_lookup(LISTEN, lookup(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("(empty)"), "got: {empty}");
+        assert_ne!(empty, absent, "empty and absent must not share one message");
     }
 
     /// THE REVERTED STATE is now `"0"` WRITTEN EXPLICITLY, not absence. A
