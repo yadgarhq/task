@@ -259,7 +259,17 @@ def red_api_versions(declared: Iterable[str], under_test: str) -> tuple[str, ...
 
 
 def render(chart: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return helm("template", CHART_NAME, str(chart), *arguments)
+    # `-f <chart>/ci/values.yaml` FIRST, ALWAYS, WHEN THE FILE EXISTS (ADR-0845,
+    # C-SVb): `tls.enabled` and `taskDb.tls.enabled` carry no default any
+    # more, so every bare render in this file needs the baseline this
+    # chart's own `ci/values.yaml` states — read relative to WHICHEVER
+    # `chart` directory is passed in, because several callers here render a
+    # mutated COPY of the chart under a temp path, not the module-level
+    # `CHART` constant. First, not last, so a case-specific `--values`/`--set`
+    # in `*arguments` still wins on any key the two happen to share.
+    ci_values = chart / "ci" / "values.yaml"
+    override = ("-f", str(ci_values)) if ci_values.is_file() else ()
+    return helm("template", CHART_NAME, str(chart), *override, *arguments)
 
 
 def objects(stdout: str) -> list[dict]:

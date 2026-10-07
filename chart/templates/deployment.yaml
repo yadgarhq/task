@@ -201,21 +201,30 @@ spec:
               value: "0.0.0.0:50052"
             - name: METRICS_LISTEN
               value: "0.0.0.0:9090"
-            {{- if .Values.taskDb.tls.enabled }}
-            # RENDERED ONLY WHEN TLS IS ASKED FOR, so a deployment that has not
-            # cut over sends the binary nothing at all and takes the cleartext
-            # path it always took. The same shape as the gateway's
-            # trustUnauthenticatedHeaders: absence is the default, and the flag
-            # is the whole of the lever.
+            # THE HOP TO task-db, which LISTEN_TLS_ENABLED below says nothing
+            # about: that one describes this pod's own listener.
+            #
+            # RENDERED UNCONDITIONALLY, NEVER BEHIND `taskDb.tls.enabled`
+            # (ADR-0845, C-SVb). The binary refuses to boot when
+            # TASK_DB_TLS_ENABLED is absent or empty rather than defaulting to
+            # cleartext, so a chart that withheld this variable under an `if`
+            # would leave every deployment that has not cut over refusing to
+            # boot instead of dialling cleartext as before.
+            # `templates/render-checks.yaml` (K-1) is this value's named
+            # refusal; the `kindIs "map"` guard here only keeps a malformed
+            # `taskDb.tls` from raising a bare Go template error before that
+            # refusal is reached.
             - name: TASK_DB_TLS_ENABLED
-              value: "1"
+              value: {{ ternary "1" "0" (and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.enabled) | quote }}
+            {{- if and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.enabled }}
             # A PATH, never an issuer-specific resource (D80). cert-manager
             # writes this file in the reference deployment and a hand-assembled
             # Secret writes it anywhere else; neither the chart nor the binary
             # can tell the difference, which is the point.
             - name: TASK_DB_TLS_CA_FILE
               value: /var/run/config/task-db-ca/ca.pem
-            {{- if .Values.taskDb.tls.clientCertSecret }}
+            {{- end }}
+            {{- if and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.enabled .Values.taskDb.tls.clientCertSecret }}
             # WHO THIS SERVICE SAYS IT IS ON THAT HOP — mutual TLS (ADR-0516),
             # and a THIRD direction beside the two others in this file.
             # LISTEN_TLS_* is what task serves; TASK_DB_TLS_CA_FILE is how task
@@ -236,7 +245,7 @@ spec:
             - name: TASK_DB_TLS_CLIENT_KEY_FILE
               value: /var/run/secrets/client-cert/client.key
             {{- end }}
-            {{- if .Values.taskDb.tls.domain }}
+            {{- if and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.domain }}
             # Only when the certificate names something other than the Service.
             # Unset means "verify against taskDb.host", which is what makes a
             # certificate issued for the Service name work while the balancer
@@ -244,14 +253,17 @@ spec:
             - name: TASK_DB_TLS_DOMAIN
               value: {{ .Values.taskDb.tls.domain | quote }}
             {{- end }}
-            {{- end }}
-            {{- if .Values.tls.enabled }}
             # THE OTHER DIRECTION: what a caller reaching THIS service gets.
-            # Rendered only when asked for, so a deployment that has not cut over
-            # sends the binary nothing and opens the cleartext listener it has
-            # always opened.
+            #
+            # RENDERED UNCONDITIONALLY, NEVER BEHIND `tls.enabled` (ADR-0845,
+            # C-SVb), for the same reason as TASK_DB_TLS_ENABLED above: the
+            # binary refuses absence rather than defaulting to cleartext, so
+            # withholding this under an `if` would leave every deployment that
+            # has not cut over refusing to boot. `templates/render-checks.yaml`
+            # (K-1) is this value's named refusal.
             - name: LISTEN_TLS_ENABLED
-              value: "1"
+              value: {{ ternary "1" "0" (and (kindIs "map" .Values.tls) .Values.tls.enabled) | quote }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled }}
             # PATHS, never an issuer-specific resource (D80). Two of them,
             # because a certificate and its key are two files — and naming them
             # separately is what lets the binary say WHICH of the two was missing
@@ -260,6 +272,22 @@ spec:
               value: /var/run/config/serving-cert/tls.crt
             - name: LISTEN_TLS_KEY_FILE
               value: /var/run/config/serving-cert/tls.key
+            {{- end }}
+            {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+            # B-U5E EXPAND (ADR-0854), STATED AHEAD OF THE BINARY READING IT.
+            # `templates/render-checks.yaml` refuses every value but `off`
+            # until B-U5 lifts that, so this is reached only with `off`.
+            - name: LISTEN_TLS_CLIENT_AUTH
+              value: {{ .Values.tls.clientAuth | quote }}
+            {{- end }}
+            {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientCaSecret") }}
+            # THE AUTHORITY this listener would check a CLIENT certificate
+            # against, once B-U5 adopts it. A PATH, never a PEM (D80), mounted
+            # from its own Secret rather than `tls.certSecret`'s: the CA that
+            # signs the callers' certificates is not necessarily the one that
+            # signs this pod's own.
+            - name: LISTEN_TLS_CLIENT_CA_FILE
+              value: /var/run/config/client-ca/ca.crt
             {{- end }}
           # This service does NOT wait for task-db before listening, so the port
           # opening means "process up", not "dependency healthy" — deliberately.
@@ -426,7 +454,7 @@ spec:
             - name: config-shared
               mountPath: /etc/yadgar/config/shared
               readOnly: true
-            {{- if .Values.taskDb.tls.enabled }}
+            {{- if and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.enabled }}
             # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
             # copy that kubelet never refreshes, so the bundle would freeze at
             # whatever it was when the pod started and a rotated authority would
@@ -435,7 +463,7 @@ spec:
               mountPath: /var/run/config/task-db-ca
               readOnly: true
             {{- end }}
-            {{- if and .Values.taskDb.tls.enabled .Values.taskDb.tls.clientCertSecret }}
+            {{- if and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.enabled .Values.taskDb.tls.clientCertSecret }}
             # A DIRECTORY MOUNT, never subPath — and here the rule is at its most
             # expensive to break. A subPath mount is a one-time copy kubelet
             # never refreshes, so a renewed CLIENT certificate would never reach
@@ -446,12 +474,20 @@ spec:
               mountPath: /var/run/secrets/client-cert
               readOnly: true
             {{- end }}
-            {{- if .Values.tls.enabled }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled }}
             # A DIRECTORY MOUNT for the same reason, and here it matters more: a
             # frozen serving certificate EXPIRES, and every caller starts
             # refusing this pod on a date nobody is watching.
             - name: serving-cert
               mountPath: /var/run/config/serving-cert
+              readOnly: true
+            {{- end }}
+            {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientCaSecret") }}
+            # A DIRECTORY MOUNT, never subPath, for the same reason as
+            # `serving-cert` above: kubelet never refreshes a subPath mount,
+            # and a rotated authority would never reach this pod.
+            - name: client-ca
+              mountPath: /var/run/config/client-ca
               readOnly: true
             {{- end }}
       volumes:
@@ -460,7 +496,7 @@ spec:
         - name: config-shared
           configMap:
             name: shared
-        {{- if .Values.taskDb.tls.enabled }}
+        {{- if and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.enabled }}
         - name: task-db-ca
           secret:
             secretName: {{ required "taskDb.tls.caSecret holds the CA bundle task-db is verified against and must be set whenever taskDb.tls.enabled is; see the chart's values.yaml" .Values.taskDb.tls.caSecret }}
@@ -483,7 +519,7 @@ spec:
               - key: {{ required "taskDb.tls.caSecretKey names the key inside taskDb.tls.caSecret that holds the CA bundle and must be set whenever taskDb.tls.enabled is; see the chart's values.yaml" .Values.taskDb.tls.caSecretKey | quote }}
                 path: ca.pem
         {{- end }}
-        {{- if and .Values.taskDb.tls.enabled .Values.taskDb.tls.clientCertSecret }}
+        {{- if and (kindIs "map" .Values.taskDb.tls) .Values.taskDb.tls.enabled .Values.taskDb.tls.clientCertSecret }}
         - name: client-cert
           secret:
             secretName: {{ .Values.taskDb.tls.clientCertSecret }}
@@ -508,7 +544,7 @@ spec:
               - key: {{ required "taskDb.tls.clientKeySecretKey names the key inside taskDb.tls.clientCertSecret that holds the client private key and must be set whenever taskDb.tls.clientCertSecret is; see the chart's values.yaml" .Values.taskDb.tls.clientKeySecretKey | quote }}
                 path: client.key
         {{- end }}
-        {{- if .Values.tls.enabled }}
+        {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled }}
         - name: serving-cert
           secret:
             secretName: {{ required "tls.certSecret holds the certificate and private key this service presents and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecret }}
@@ -530,4 +566,18 @@ spec:
                 path: tls.crt
               - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
                 path: tls.key
+        {{- end }}
+        {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientCaSecret") }}
+        # B-U5E EXPAND (ADR-0854): the authority a CLIENT certificate would be
+        # checked against, once B-U5 adopts LISTEN_TLS_CLIENT_CA_FILE. A PATH,
+        # never a PEM (D80), the same `optional: true` reasoning as
+        # `serving-cert` above — the binary is what names a missing file,
+        # never a stuck `ContainerCreating`.
+        - name: client-ca
+          secret:
+            secretName: {{ .Values.tls.clientCaSecret | quote }}
+            optional: true
+            items:
+              - key: {{ required "tls.clientCaSecretKey names the key inside tls.clientCaSecret that holds the CA bundle and must be set whenever tls.clientCaSecret is; see the chart's values.yaml" .Values.tls.clientCaSecretKey | quote }}
+                path: ca.crt
         {{- end }}

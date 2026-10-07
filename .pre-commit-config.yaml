@@ -27,16 +27,17 @@ repos:
   # real `#[test]` is test code. Without it `src/upstream/tests.rs` is measured as
   # production and the adoption this change exists for cannot land. Nothing else
   # is in the range, so no other hook's behaviour moves with the bump.
+  #
+  # THE REV MOVES FROM v1.22.0 TO v1.31.0 HERE (C-A2, ADR-0845): `no-compiled-
+  # in-defaults` widened in that range to catch a presence test against a
+  # compiled-in "off" literal (`get("TLS_ENABLED").as_deref() != Some("1")`)
+  # and a bare `EnvFilter::new(...)` log-level fallback with no marker — both
+  # measured against this repository and cleared in this PR. `helm-lint`
+  # also gained `chart_values_override.py`, which is what lets `chart/ci/
+  # values.yaml` (new in this PR) reach every shared gate that renders or
+  # lints offline, without this repository's own hooks naming the file.
   - repo: https://github.com/yadgarhq/actions
-    # THE REV MOVES FROM v1.20.1 TO v1.22.0 FOR THE TWO IDS BELOW, and the whole
-    # block comes with it because pre-commit resolves one rev per repository
-    # entry. `git diff --stat v1.20.1 v1.22.0 -- hooks/ .pre-commit-hooks.yaml`
-    # is 1901 insertions and 0 deletions, touching only the new
-    # `hooks/chart_baseline.py` and the two manifest entries that publish it — so
-    # no hook already in this block changes behaviour. A second `repo:` entry
-    # pinning the same repository at a second rev was the alternative, and it is
-    # the drift the shared manifest exists to prevent.
-    rev: v1.22.0
+    rev: v1.31.0
     hooks:
       - id: gitleaks
       - id: prettier

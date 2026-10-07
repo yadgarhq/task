@@ -24,7 +24,7 @@ use yadgar_task::rotate::{self, Inputs, Schedule};
 use yadgar_task::serve::ServeTls;
 use yadgar_task::service::Task;
 
-use crate::env_required;
+use crate::{env_required, refusal};
 
 /// The JSON subscriber, installed before anything else can want to log.
 pub fn install_logging() {
@@ -40,7 +40,7 @@ pub fn install_logging() {
         // A service nobody can observe is one D67 cannot measure either.
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")), // ADR-0569-EXCEPTION(LIB): the log level is observability, not behaviour (965 census row B8).
         )
         .init();
 }
@@ -125,7 +125,20 @@ pub async fn serve_until_drained(
         }
     };
     match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
-        Drain::Finished(result) => result?,
+        // NAMED, not a bare `?` (ledger 1333). `serve_with_shutdown`'s error
+        // is `tonic::transport::Error`, whose entire `Display` is the two
+        // words "transport error" — the bind collision or listener failure
+        // underneath it sits one `source()` hop down, reachable only by the
+        // same chain walk `main`'s own refusal already takes. Without this,
+        // an operator staring at a CrashLoopBackOff for a `LISTEN` already
+        // held by another process reads "Error: transport error" and learns
+        // neither which address nor why.
+        Drain::Finished(result) => result.map_err(|e| {
+            format!(
+                "the gRPC server on LISTEN={addr} stopped with an error: {}",
+                refusal(&e)
+            )
+        })?,
         Drain::Overran => tracing::error!(
             budget_secs = DRAIN_BUDGET.as_secs(),
             "the drain did not finish within its budget; ending anyway with calls still in \

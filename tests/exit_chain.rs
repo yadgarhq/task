@@ -1,5 +1,8 @@
 //! THE EXIT CHAIN, held at the binary (ledger 748): the two ways a running
-//! `task` is asked to stop both end in a drain and exit code 0.
+//! `task` is asked to stop both end the process with exit code 0. What this
+//! file does NOT see is in-flight calls finishing: replacing `drain_within`
+//! with `serving.abort()` keeps both cases below green (measured). The drain
+//! itself is held by `yadgar-lifecycle`'s `tests/shutdown.rs`.
 //!
 //! The library tests prove the parts — `yadgar-lifecycle` that a signal resolves
 //! `shutdown()` and that a changed file resolves `rotate::watch`,
