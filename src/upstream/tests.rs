@@ -41,13 +41,17 @@ fn absent_tls_enabled_is_refused() {
         TlsConfigError::EnabledNotBoolean(TASK_DB, _)
     ));
     let message = error.to_string();
+    // The refusal's own text is not interpolated into the assertion message
+    // (CodeQL's cleartext-logging query flags that shape): the assertion
+    // already fails loudly enough naming what was expected, and `cargo
+    // test`'s own failure output prints `error`/`message` in full regardless.
     assert!(
         message.contains("TASK_DB_TLS_ENABLED"),
-        "the refusal must name the variable: {message}"
+        "the refusal must name the variable TASK_DB_TLS_ENABLED"
     );
     assert!(
         message.contains("taskDb.tls.enabled"),
-        "the refusal must name the chart key: {message}"
+        "the refusal must name the chart key taskDb.tls.enabled"
     );
 }
 
@@ -62,7 +66,10 @@ fn an_empty_tls_enabled_is_refused_and_named_differently_from_absent() {
     let absent = UpstreamTls::from_lookup(TASK_DB, lookup(&[]))
         .unwrap_err()
         .to_string();
-    assert!(empty.contains("(empty)"), "got: {empty}");
+    assert!(
+        empty.contains("(empty)"),
+        "the refusal must say the value was empty"
+    );
     assert_ne!(empty, absent, "empty and absent must not share one message");
 }
 

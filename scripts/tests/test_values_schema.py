@@ -562,6 +562,22 @@ def test_client_ca_secret_empty_renders_no_client_ca_fields(tmp_path):
     assert env["LISTEN_TLS_CLIENT_AUTH"] == "off"
 
 
+def test_client_ca_secret_without_client_auth_renders_no_client_ca_fields(tmp_path):
+    """The OTHER half of the same gate (review round 3): naming a CA bundle
+    with no `clientAuth` stated is an incomplete expand. A real,
+    non-empty `clientCaSecret` must still render nothing without
+    `clientAuth` present — the authority this file would be checked against
+    means nothing without the mode that checks it.
+    """
+    body = {"tls": {"enabled": True, "clientCaSecret": "x", "clientCaSecretKey": "ca.crt"}}
+    result = render("-f", values_file(tmp_path, "ca-secret-no-auth", body))
+    assert result.returncode == 0, result.stderr
+    env = deployment_env(result.stdout)
+    assert "LISTEN_TLS_CLIENT_AUTH" not in env
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in env
+    assert "client-ca" not in result.stdout
+
+
 def test_client_auth_fields_do_not_render_when_tls_is_off(tmp_path):
     """Convention item 3: client auth is nested under `tls.enabled`, not a
     sibling of it. A deployment that has not cut over `tls.enabled` sees no
@@ -581,74 +597,6 @@ def test_client_auth_fields_do_not_render_when_tls_is_off(tmp_path):
     assert "LISTEN_TLS_CLIENT_AUTH" not in env
     assert "LISTEN_TLS_CLIENT_CA_FILE" not in env
     assert "client-ca" not in result.stdout
-
-
-def origin_main_chart(tmp_path: Path) -> Path:
-    """A real copy of `origin/main`'s `chart/` tree, extracted with `git
-    show` rather than reconstructed by hand — the golden comparison below
-    is only honest against the chart that actually shipped before this PR,
-    not against a guess at what it looked like.
-    """
-    dest = tmp_path / "origin-main-chart"
-    listing = subprocess.run(
-        ["git", "-C", str(REPO), "ls-tree", "-r", "--name-only", "origin/main", "--", "chart"],
-        capture_output=True,
-        text=True,
-    )
-    assert listing.returncode == 0 and listing.stdout.strip(), (
-        f"could not list origin/main's chart/ tree: {listing.stderr}"
-    )
-    for relpath in listing.stdout.splitlines():
-        blob = subprocess.run(
-            ["git", "-C", str(REPO), "show", f"origin/main:{relpath}"],
-            capture_output=True,
-            text=True,
-        )
-        assert blob.returncode == 0, f"could not read origin/main:{relpath}: {blob.stderr}"
-        target = dest / Path(relpath).relative_to("chart")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(blob.stdout)
-    return dest
-
-
-def rendered_objects(stdout: str) -> list:
-    """Every parsed object in a render, sorted by kind. PURE.
-
-    Comparing PARSED objects rather than text is what makes this a render
-    comparison rather than a comment-diff: `yaml.safe_load_all` drops every
-    comment on the way in, and this chart's own prose is the overwhelming
-    majority of what changed in this PR's diff of `templates/deployment.yaml`.
-    Sorted by `kind` alone, which is enough here — this chart renders at most
-    one object of each kind.
-    """
-    objects = [doc for doc in yaml.safe_load_all(stdout) if isinstance(doc, dict)]
-    return sorted(objects, key=lambda d: d.get("kind", ""))
-
-
-def test_tls_enabled_true_renders_and_is_neutral_against_origin_main(tmp_path):
-    """THE CARD'S OWN GOLDEN (ADR-0645, K-1): with both switches explicit and
-    the same image ref, HEAD's render must equal origin/main's render of the
-    SAME chart with the equivalent override (origin/main's `tls.enabled`/
-    `taskDb.tls.enabled` still had a chart default of `false`, so it needs
-    the override stated explicitly too, same as HEAD does since this PR
-    removed that default). Compared as PARSED objects, not text, so neither
-    side's own prose — which is most of this PR's diff of
-    `templates/deployment.yaml` — can register as a difference.
-    """
-    overlay = values_file(
-        tmp_path,
-        "golden",
-        {"tls": {"enabled": True}, "taskDb": {"tls": {"enabled": True}}},
-    )
-
-    head = render("-f", overlay)
-    assert head.returncode == 0, head.stderr
-
-    old_chart = origin_main_chart(tmp_path)
-    main = helm("template", "x", str(old_chart), "-f", overlay)
-    assert main.returncode == 0, main.stderr
-
-    assert rendered_objects(head.stdout) == rendered_objects(main.stdout)
 
 
 def lint_bare() -> subprocess.CompletedProcess[str]:

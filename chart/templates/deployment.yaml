@@ -286,7 +286,7 @@ spec:
             - name: LISTEN_TLS_CLIENT_AUTH
               value: {{ .Values.tls.clientAuth | quote }}
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
             # THE AUTHORITY this listener would check a CLIENT certificate
             # against, once B-U5 adopts it. A PATH, never a PEM (D80), mounted
             # from its own Secret rather than `tls.certSecret`'s: the CA that
@@ -296,7 +296,12 @@ spec:
             # GATED ON `clientCaSecret` TRUTHINESS, NOT `hasKey` — an adopter
             # who writes `clientCaSecret: ""` to revert must not render
             # `secretName: ""` further down, which is a wrong value rather
-            # than an absent one.
+            # than an absent one. ALSO GATED ON `clientAuth` BEING PRESENT:
+            # naming a CA bundle with no `clientAuth` stated is an incomplete
+            # expand, not a legal one — the authority this file would be
+            # checked against means nothing without the mode that checks it,
+            # even though `clientAuth` alone (the env var above) does not
+            # need this bundle in return.
             - name: LISTEN_TLS_CLIENT_CA_FILE
               value: /var/run/config/client-ca/ca.crt
             {{- end }}
@@ -493,7 +498,7 @@ spec:
               mountPath: /var/run/config/serving-cert
               readOnly: true
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
             # A DIRECTORY MOUNT, never subPath, for the same reason as
             # `serving-cert` above: kubelet never refreshes a subPath mount,
             # and a rotated authority would never reach this pod.
@@ -578,7 +583,7 @@ spec:
               - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
                 path: tls.key
         {{- end }}
-        {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
+        {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
         # B-U5E EXPAND (ADR-0854): the authority a CLIENT certificate would be
         # checked against, once B-U5 adopts LISTEN_TLS_CLIENT_CA_FILE. A PATH,
         # never a PEM (D80).
