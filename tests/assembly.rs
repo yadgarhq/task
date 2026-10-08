@@ -36,7 +36,7 @@ use rcgen::{
 use yadgar_task::rotate::{
     self, Configuration, Presented, CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
-use yadgar_task::serve::{self, ServeTls};
+use yadgar_task::serve::{self, ServerTls};
 use yadgar_task::upstream::{self, UpstreamTls};
 
 /// The leaf's expiry, and the issuing authority's — DELIBERATELY DIFFERENT and
@@ -228,15 +228,21 @@ fn configuration(body: &str) -> Configuration {
     Configuration::under(root)
 }
 
-/// The listener's transport as a DEPLOYMENT states it — through the same three
-/// variables the chart renders.
+/// The listener's transport as a DEPLOYMENT states it — through the same
+/// variables the chart renders, with client auth `off`.
 ///
 /// **Built from the configuration rather than from paths spelled out here.** A
 /// helper naming five paths would prove only that the watcher watches what it is
 /// handed; going through `from_lookup` proves that a deployment's CONFIGURATION
 /// puts them there, which is the half that can silently be wrong.
-fn listener_tls(mount: &Mount) -> ServeTls {
-    let vars = [
+fn listener_tls(mount: &Mount) -> ServerTls {
+    listener_with(mount, "off", None)
+}
+
+/// The same with client auth `mode` and, when given, the client CA bundle at
+/// `client_ca` inside the mount.
+fn listener_with(mount: &Mount, mode: &str, client_ca: Option<&str>) -> ServerTls {
+    let mut vars = vec![
         ("LISTEN_TLS_ENABLED".to_string(), "1".to_string()),
         (
             "LISTEN_TLS_CERT_FILE".to_string(),
@@ -246,12 +252,53 @@ fn listener_tls(mount: &Mount) -> ServeTls {
             "LISTEN_TLS_KEY_FILE".to_string(),
             mount.path("tls-key.pem").display().to_string(),
         ),
+        ("LISTEN_TLS_CLIENT_AUTH".to_string(), mode.to_string()),
     ];
-    ServeTls::from_lookup(serve::LISTEN, move |k| {
-        vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
-    })
-    .expect("a complete configuration")
-    .expect("the flag is set")
+    if let Some(name) = client_ca {
+        vars.push((
+            "LISTEN_TLS_CLIENT_CA_FILE".to_string(),
+            mount.path(name).display().to_string(),
+        ));
+    }
+    serve::from_lookup(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+        .expect("a complete configuration")
+        .expect("the flag is set")
+}
+
+/// THE CLIENT CA JOINS THE WATCH SET WHEN A VERIFYING MODE READS IT (B-U5,
+/// ADR-0523): a rotated authority must restart this pod exactly as a rotated
+/// leaf does, or callers holding leaves from the new authority are refused
+/// until something else restarts it. Under `off` the CA is neither read nor
+/// watched — a Secret staged ahead of the flip changes nothing.
+#[test]
+fn a_verifying_listener_watches_its_client_ca_and_off_does_not() {
+    let mount = Mount::new(&generation("task"));
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+
+    for mode in ["optional", "required"] {
+        let listener = listener_with(&mount, mode, Some("ca.pem"));
+        assert_eq!(
+            rotate::watch_set(Some(&listener), None, &config).watched(),
+            vec![
+                mount.path("tls.pem").as_path(),
+                mount.path("tls-key.pem").as_path(),
+                mount.path("ca.pem").as_path(),
+                config.path(),
+            ],
+            "a verifying listener reads its leaf, its key and the client CA bundle"
+        );
+    }
+
+    let off = listener_with(&mount, "off", Some("ca.pem"));
+    assert_eq!(
+        rotate::watch_set(Some(&off), None, &config).watched(),
+        vec![
+            mount.path("tls.pem").as_path(),
+            mount.path("tls-key.pem").as_path(),
+            config.path(),
+        ],
+        "an `off` listener does not read the client CA, so it does not watch it"
+    );
 }
 
 /// How `task-db` is verified, and who this service says it is on that hop.

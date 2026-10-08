@@ -59,7 +59,7 @@
 //! change exists to remove, so there is no path here that does it.
 
 use yadgar_task::rotate;
-use yadgar_task::serve::{self, ServeTls, LISTEN};
+use yadgar_task::serve;
 use yadgar_task::upstream::{self, UpstreamTls, TASK_DB};
 
 /// Boot steps that would not fit here: see the module's own note on why a
@@ -98,13 +98,18 @@ fn env_required(key: &str) -> Result<String, String> {
     }
 }
 
-/// The `task-db` boot refusal, flattened through the estate's one error-chain
-/// walker (ledger 733, ledger 740, ADR-0591) instead of a second copy.
+/// The `task-db` boot refusal — and the listener's — flattened through the
+/// estate's one error-chain walker (ledger 733, ledger 740, ADR-0591) instead
+/// of a second copy.
 ///
-/// **THE ONLY `to_string()` SITE IN THIS FILE THAT TAKES IT.** Every other
-/// refusal here — `ServeTls`, `UpstreamTls`, `rotate::Configuration` — already
-/// returns a complete sentence with nothing further under it worth a walk.
-/// `upstream::connect` is different: it returns `yadgar_dial::BalanceError`,
+/// **THE LISTENER'S TWO SITES TAKE IT TOO (B-U5, ADR-0591).** The lifted
+/// `ServeTlsError::Unusable` keeps tonic's error as its `#[source]` rather than
+/// flattening it into its own sentence, so a bare `to_string()` on
+/// `serve::builder` would print only "the serving identity … is unusable" and
+/// drop the reason; `serve::from_env` goes through the same walk so every
+/// listener refusal renders one way. `UpstreamTls` and `rotate::Configuration`
+/// already return a complete sentence.
+/// `upstream::connect` is the first: it returns `yadgar_dial::BalanceError`,
 /// and `BalanceError::Tls` wraps a `tonic::transport::Error` whose entire
 /// `Display` is the two words `transport error` — measured, this is the one
 /// place in this file where the head of the chain is a dead end and the reason
@@ -169,8 +174,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // structural rather than tidy: the downgrade this car removes is a listener
     // that opens in cleartext because TLS configuration failed, and with one
     // construction site there is nowhere else to write it.
-    let tls = ServeTls::from_env(LISTEN).map_err(|e| e.to_string())?;
-    let server = serve::builder(tls.as_ref()).map_err(|e| e.to_string())?;
+    //
+    // The client CA is read and parsed here too when `LISTEN_TLS_CLIENT_AUTH`
+    // verifies (B-U5), so an empty or non-PEM bundle refuses now, naming it.
+    let tls = serve::from_env().map_err(|e| refusal(&e))?;
+    let server = serve::builder(tls.as_ref()).map_err(|e| refusal(&e))?;
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.

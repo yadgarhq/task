@@ -78,6 +78,9 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("LISTEN", "127.0.0.1:0"),
         ("METRICS_LISTEN", "127.0.0.1:0"),
         ("LISTEN_TLS_ENABLED", "0"),
+        // REQUIRED with no default (ADR-0854, B-U5), at `off` exactly as
+        // `chart/ci/values.yaml` states it.
+        ("LISTEN_TLS_CLIENT_AUTH", "off"),
         ("TASK_DB_TLS_ENABLED", "0"),
     ]
 }

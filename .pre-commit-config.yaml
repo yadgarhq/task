@@ -36,8 +36,16 @@ repos:
   # also gained `chart_values_override.py`, which is what lets `chart/ci/
   # values.yaml` (new in this PR) reach every shared gate that renders or
   # lints offline, without this repository's own hooks naming the file.
+  #
+  # v1.31.0 -> v1.34.0 (B-U5, K-8 step 3): `boot-reads-watched` (actions#113)
+  # accepts a declared library material. Adopting yadgar-lifecycle's
+  # `serve_tls::ServerTls` moved this binary's last boot read out of `src/`,
+  # so the gate's zero-read floor refused the tree; `src/rotate.rs` now names
+  # the lifted type with `ADR-0523-LIBRARY-WATCHED`. The range also carries
+  # v1.32.0 (C-A3 pre-pin parent gate, a ci-pr.yaml change) and v1.33.x (trivy
+  # renders what it scans; D80 skips CRD schemas).
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.31.0
+    rev: v1.34.0
     hooks:
       - id: gitleaks
       - id: prettier

@@ -21,8 +21,16 @@
 # TLS on costs nothing else to coalesce, and it is the shape every offline
 # render in the estate is measured against (the card's own golden render,
 # against origin/main).
+#
+# tls.clientAuth (B-U5, ADR-0854, K-8 step 3): required with no default, like
+# the two switches, because the binary refuses an absent
+# `LISTEN_TLS_CLIENT_AUTH`. `"off"` — QUOTED, because YAML reads a bare off as
+# false — is the neutral choice: it asks callers for no certificate, needs no
+# client CA Secret, and is the value the parent chart states for this server
+# (B-P1).
 tls:
   enabled: true
+  clientAuth: "off"
 taskDb:
   tls:
     enabled: true

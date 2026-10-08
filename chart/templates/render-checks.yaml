@@ -128,7 +128,7 @@ for a deleted key and for an absent one alike and cannot tell them apart.
 
 `tls` AND `taskDb.tls` ARE GUARDED FIRST, the same `hasKey` then `kindIs "map"`
 idiom as `autoscaling`: `certSecret`, `certSecretKey`, `keySecretKey` and the
-B-U5E expand's `clientAuth`, `clientCaSecret`, `clientCaSecretKey` all live
+`clientAuth`, `clientCaSecret` and `clientCaSecretKey` (B-U5) all live
 under `tls`; `caSecret`, `caSecretKey`, `domain`, `clientCertSecret`,
 `clientCertSecretKey` and `clientKeySecretKey` all live under `taskDb.tls`.
 
@@ -225,35 +225,44 @@ shape is proved sound.
 {{- end }}
 
 {{/*
-B-U5E EXPAND: `tls.clientAuth`, `tls.clientCaSecret` and `tls.clientCaSecretKey`
-(ADR-0854, folded into this card per the plan's B-U5E card and the
-coordinator's cross-repo convention, scratchpad/sweep/B-U5E-convention.md).
+`tls.clientAuth` — REQUIRED WITH NO DEFAULT (B-U5, ADR-0854), and the client CA
+it needs.
 
-NONE OF THIS CHANGES THE BINARY. `src/serve.rs` does not read
-LISTEN_TLS_CLIENT_AUTH at all yet — B-U5 is the unit that adopts it. This
-block only lets an adopter STATE the mode ahead of that cut-over, and refuses
-the two modes the binary cannot yet enforce, so nothing shipped here can
-promise a protection this pod does not give.
+THE CONTRACT HALF OF K-8. The B-U5E expand (C-SVb) declared the key, accepted
+it when present and refused `optional`/`required` as "not enforced yet". The
+binary now reads LISTEN_TLS_CLIENT_AUTH through `yadgar-lifecycle`'s
+`ServerTls` and refuses its absence, so `templates/deployment.yaml` renders it
+UNCONDITIONALLY and this block refuses an absent key, with TLS on or off. The
+"not enforced yet" refusal is lifted: `optional` and `required` verify a
+caller's certificate against `tls.clientCaSecret`'s bundle.
 
-`tls.clientAuth` IS OPTIONAL. An absent key renders `templates/deployment.yaml`
-exactly as it did before this change, which is the whole of what "expand" means
-— no LISTEN_TLS_CLIENT_AUTH, no LISTEN_TLS_CLIENT_CA_FILE, no `ca.crt` item.
-When the key IS present, ADR-0854 allows exactly three values, and `optional`
-and `required` are refused HERE rather than rendered: shipping either today
-would have an adopter believe client certificates are checked when nothing
-checks them. Only `off` — ADR-0854's "emergency value" — is accepted before
-B-U5 lifts this gate (K-8 step 1).
+`chart/values.schema.json` lists `clientAuth` under `tls`'s `required`, so an
+ABSENT key is the schema's refusal first (K-3 accepts that pre-emption); the
+`hasKey` arm below is what holds where the schema does not run. A NULL survives
+`required` — `values.yaml` declares no `clientAuth`, so nothing deletes it on
+coalescing — and is refused by the `kindIs "string"` arm, by name.
 
 `kindIs "string"` GUARDS EVERY `eq`/`ne` BELOW, and it has to run FIRST. YAML
-1.1 reads a BARE `off` (no quotes) as the boolean `false` — `clientAuth: off`
-parses to `false`, not the string `"off"` — so `eq .Values.tls.clientAuth
-"optional"` against a bool argument is a Go template type error
-("incompatible types for comparison") rather than a clean refusal. The
-message says so by name, because writing `clientAuth: "off"` quoted is the
-one-character fix and an adopter who hit the raw Go error would not find it
-unaided.
+1.1 reads a BARE `off` (no quotes) as the boolean `false`, so `eq` against it
+is a Go template type error ("incompatible types for comparison") rather than
+a clean refusal. The message says so by name: writing `clientAuth: "off"`
+quoted is the one-character fix.
+
+TWO MORE REFUSALS, each a boot refusal the binary would otherwise raise in a
+crash loop: a verifying mode on a cleartext listener (`tls.enabled: false`),
+and a verifying mode with no client CA Secret named. `clientCaSecret: ""`
+counts as unnamed — the mount's gate is its truthiness.
 */}}
-{{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+{{- if and (kindIs "map" .Values.tls) (not (hasKey .Values.tls "clientAuth")) }}
+{{- fail (join "" (list
+      "task: `tls.clientAuth` is absent. ADR-0854 gives this knob no compiled-in "
+      "default: the binary refuses to boot without LISTEN_TLS_CLIENT_AUTH, with "
+      "TLS on or off. Write the keys you mean: `tls.clientAuth` has no default "
+      "and must be \"off\" (callers present nothing), \"optional\" or "
+      "\"required\" (callers' certificates are verified against "
+      "`tls.clientCaSecret`).")) }}
+{{- end }}
+{{- if kindIs "map" .Values.tls }}
 {{- if not (kindIs "string" .Values.tls.clientAuth) }}
 {{- fail (printf (join "" (list
       "task: `tls.clientAuth` must be a quoted string (\"off\", \"optional\" "
@@ -261,27 +270,27 @@ unaided.
       "`clientAuth: \"off\"`."))
       (kindOf .Values.tls.clientAuth) (toJson .Values.tls.clientAuth)) }}
 {{- end }}
-{{- if eq .Values.tls.clientAuth "optional" }}
-{{- fail (join "" (list
-      "task: `tls.clientAuth: optional` is not enforced yet. This binary does "
-      "not read LISTEN_TLS_CLIENT_AUTH until B-U5 adopts it, so shipping "
-      "`optional` here would have an adopter believe client certificates are "
-      "checked when nothing checks them. Write `off`, or omit `tls.clientAuth` "
-      "entirely, until B-U5 ships.")) }}
-{{- end }}
-{{- if eq .Values.tls.clientAuth "required" }}
-{{- fail (join "" (list
-      "task: `tls.clientAuth: required` is not enforced yet. This binary does "
-      "not read LISTEN_TLS_CLIENT_AUTH until B-U5 adopts it, so shipping "
-      "`required` here would have an adopter believe client certificates are "
-      "checked when nothing checks them. Write `off`, or omit `tls.clientAuth` "
-      "entirely, until B-U5 ships.")) }}
-{{- end }}
-{{- if ne .Values.tls.clientAuth "off" }}
+{{- if not (has .Values.tls.clientAuth (list "off" "optional" "required")) }}
 {{- fail (printf (join "" (list
       "task: `tls.clientAuth` must be `off`, `optional` or `required` "
-      "(ADR-0854) and is %s. `optional` and `required` are refused for a "
-      "separate reason, above. Write `off`, or omit `tls.clientAuth` entirely."))
+      "(ADR-0854) and is %s. The binary refuses any other value at boot."))
       (toJson .Values.tls.clientAuth)) }}
+{{- end }}
+{{- if and (ne .Values.tls.clientAuth "off") (not .Values.tls.enabled) }}
+{{- fail (printf (join "" (list
+      "task: `tls.clientAuth: %s` needs `tls.enabled: true`. A cleartext "
+      "listener cannot verify a client certificate, and the binary refuses "
+      "the pair at boot rather than ignore a security setting. Set "
+      "`tls.enabled: true`, or `tls.clientAuth: \"off\"`."))
+      .Values.tls.clientAuth) }}
+{{- end }}
+{{- if and (ne .Values.tls.clientAuth "off") (not .Values.tls.clientCaSecret) }}
+{{- fail (printf (join "" (list
+      "task: `tls.clientAuth: %s` verifies a caller's certificate, so it needs "
+      "the authority to verify it against: name the Secret holding that CA "
+      "bundle in `tls.clientCaSecret` (and its key in `tls.clientCaSecretKey`). "
+      "Without it the chart renders no LISTEN_TLS_CLIENT_CA_FILE and the "
+      "binary refuses to boot."))
+      .Values.tls.clientAuth) }}
 {{- end }}
 {{- end }}

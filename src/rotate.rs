@@ -14,7 +14,8 @@
 //!
 //! # The ruling: exit on change
 //!
-//! Serving certificates are read ONCE, when the listener is built.
+//! Serving certificates — and the client CA a verifying listener checks
+//! callers against — are read ONCE, when the listener is built.
 //! [`crate::serve::builder`] hands tonic an acceptor holding an
 //! `Arc<ServerConfig>` built there and then, and nothing afterwards can swap it.
 //! So a pod started today serves its day-0 leaf until it restarts, whatever
@@ -51,8 +52,8 @@ pub use yadgar_lifecycle::rotate::{
     CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
-use crate::serve::ServeTls;
 use crate::upstream::UpstreamTls;
+use yadgar_lifecycle::serve_tls::ServerTls;
 
 /// The `service` label on [`CERTIFICATE_NOT_AFTER`], and the name in the
 /// watcher's log lines.
@@ -62,20 +63,11 @@ use crate::upstream::UpstreamTls;
 /// selects on this string.
 const SERVICE: &str = "task";
 
-/// The listener's certificate and the private key belonging to it.
-///
-/// **Both halves, or the pair rotates half-watched.** kubelet swaps a mount
-/// atomically, so a set holding only the certificate still fires on an ordinary
-/// rotation — but a deployment that rewrites the key alone would pass
-/// unnoticed, and so would an implementation that named the certificate twice.
-impl Material for ServeTls {
-    fn files(&self) -> Vec<File<'_>> {
-        vec![
-            File::certificate(Presented::Serving, self.cert_file()),
-            File::read(self.key_file()),
-        ]
-    }
-}
+// THE LISTENER'S MATERIAL IS `yadgar-lifecycle`'s OWN IMPL now (B-U5): the
+// lifted `ServerTls` implements `Material` beside the type — its certificate,
+// the private key belonging to it, and the client CA bundle exactly when a
+// verifying mode reads it. `tests/assembly.rs` asserts all three through
+// `watch_set` below.
 
 /// The CA bundle `task-db`'s certificate is verified against, AND the client
 /// certificate this service presents to it.
@@ -126,8 +118,9 @@ impl Material for UpstreamTls {
 /// process actually loaded. Collecting paths and reading them when the watcher
 /// first polls would put the rest of boot inside a window where a kubelet swap
 /// quietly becomes the baseline, and the real rotation would never be noticed.
+// ADR-0523-LIBRARY-WATCHED: yadgar_lifecycle::serve_tls::ServerTls
 pub fn watch_set(
-    listener: Option<&ServeTls>,
+    listener: Option<&ServerTls>,
     upstream: Option<&UpstreamTls>,
     config: &Configuration,
 ) -> Inputs {
