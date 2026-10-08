@@ -8,9 +8,12 @@
 //!
 //! # TLS
 //!
-//! **OPT-IN, and OFF unless a deployment asks for it.** With nothing configured
-//! this serves exactly what it has always served, in cleartext. The code ships
-//! first and the cut-over is a separate change that can be reverted on its own.
+//! **NO COMPILED-IN DEFAULT (ADR-0845).** `LISTEN_TLS_ENABLED` must be exactly
+//! "1" or "0"; absent, empty or any other value refuses the boot rather than
+//! guessing cleartext. This used to be opt-in — anything but "1" served in
+//! cleartext — until ADR-0845 found that an unset variable and a typo both
+//! silently meant the same thing. The CUT-OVER ITSELF is still a separate,
+//! revertible choice: writing "0" is what reverts it.
 //!
 //! **Configuration is file paths and a flag, never an issuer-specific resource**
 //! (D80). A certificate and a private key on disk are written by cert-manager in
@@ -83,6 +86,15 @@ pub const LISTEN: &str = "LISTEN";
 #[derive(Debug, thiserror::Error)]
 pub enum ServeTlsError {
     #[error(
+        "{0}_TLS_ENABLED must be \"1\" or \"0\" and is {1}. ADR-0845 gives this knob no \
+         compiled-in default, so this service cannot guess whether to serve TLS: leaving it \
+         unset or empty is refused exactly like any other value outside the two it accepts. \
+         Write \"1\" to serve this listener over TLS or \"0\" to serve in cleartext. The chart \
+         renders this from `tls.enabled`."
+    )]
+    EnabledNotBoolean(&'static str, String),
+
+    #[error(
         "{0}_TLS_ENABLED is set but {0}_TLS_CERT_FILE names no certificate. TLS was \
          asked for, so this is a deployment mistake rather than a reason to open a \
          plaintext listener — and it is NOT the same as leaving TLS off, which is the \
@@ -139,11 +151,27 @@ pub struct ServeTls {
     key_file: PathBuf,
 }
 
+/// What `*_TLS_ENABLED` looked like, for the refusal naming it — and the
+/// reason this takes the RAW, untrimmed lookup result rather than `get`'s
+/// output: an absent variable and one set to `""` or whitespace are the same
+/// decision today (off would be `"0"`, and neither of these is it), but an
+/// operator reading a crash loop needs to tell "I forgot this" from "I set
+/// this to nothing" apart, the same distinction `env_required` makes in
+/// `main.rs`.
+fn describe_enabled(value: Option<&str>) -> String {
+    match value.map(str::trim) {
+        None => "NOT SET".to_string(),
+        Some("") => "\"\" (empty)".to_string(),
+        Some(other) => format!("{other:?}"),
+    }
+}
+
 impl ServeTls {
     /// Read the listener's transport configuration from the environment.
     ///
-    /// `Ok(None)` is the ordinary answer today: TLS is opt-in, so an
-    /// unconfigured deployment serves in cleartext exactly as before.
+    /// `Ok(None)` is the explicit-cleartext answer: `{prefix}_TLS_ENABLED` is
+    /// "0". There is no unconfigured answer any more (ADR-0845) — absent or
+    /// anything else refuses.
     pub fn from_env(prefix: &'static str) -> Result<Option<Self>, ServeTlsError> {
         Self::from_lookup(prefix, |key| std::env::var(key).ok())
     }
@@ -165,24 +193,45 @@ impl ServeTls {
                 .filter(|v| !v.is_empty())
         };
 
-        // Exactly "1". A permissive parse here — "0", "false" and "no" all
-        // enabling it — is how a setting meant to be off ends up on, and the
-        // reverse mistake is worse: this flag is the revert lever for the
-        // cut-over, and a lever that does not move is not one.
-        if get("TLS_ENABLED").as_deref() != Some("1") {
-            if get("TLS_CERT_FILE").is_some() || get("TLS_KEY_FILE").is_some() {
-                // NOT an error. Leaving the certificate in place while the flag
-                // is off is exactly how the cut-over gets reverted, so refusing
-                // it would make the lever unusable. It is still worth a line: a
-                // deployment that believes it is encrypted and is not should be
-                // able to see that from the boot log.
-                tracing::warn!(
-                    prefix,
-                    "a serving certificate is configured but {prefix}_TLS_ENABLED is not \
-                     \"1\", so this service listens in CLEARTEXT"
-                );
+        // EXACTLY "1" OR "0", AND NOTHING ELSE — INCLUDING ABSENT (ADR-0845).
+        // The knob used to have a compiled-in default: anything but "1" was
+        // cleartext, so an unset variable and a typo both silently meant OFF.
+        // ADR-0845 deletes that default. A permissive parse here — "false"
+        // and "no" both meaning off, or an absent value meaning off — is how
+        // a setting meant to be off ends up looking chosen when nobody chose
+        // it; the chart renders this variable unconditionally now, so the
+        // only way it is genuinely absent is a chart that forgot to.
+        //
+        // THE RAW LOOKUP, NOT `get`: `get` collapses absent and set-but-empty
+        // into the same `None`, which is right for a PATH (nothing to tell
+        // apart) and wrong here — `describe_enabled` names the two
+        // differently, the same discrimination `env_required` makes in
+        // `main.rs` for the knob a nulled chart value actually produces.
+        let enabled_raw = lookup(&format!("{prefix}_TLS_ENABLED"));
+        match enabled_raw.as_deref().map(str::trim) {
+            Some("0") => {
+                if get("TLS_CERT_FILE").is_some() || get("TLS_KEY_FILE").is_some() {
+                    // NOT an error. Leaving the certificate in place while the
+                    // flag is off is exactly how the cut-over gets reverted,
+                    // so refusing it would make the lever unusable. It is
+                    // still worth a line: a deployment that believes it is
+                    // encrypted and is not should be able to see that from
+                    // the boot log.
+                    tracing::warn!(
+                        prefix,
+                        "a serving certificate is configured but {prefix}_TLS_ENABLED is \
+                         \"0\", so this service listens in CLEARTEXT"
+                    );
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            Some("1") => {}
+            other => {
+                return Err(ServeTlsError::EnabledNotBoolean(
+                    prefix,
+                    describe_enabled(other),
+                ))
+            }
         }
 
         Ok(Some(Self {
@@ -264,146 +313,4 @@ pub fn builder(tls: Option<&ServeTls>) -> Result<Server, ServeTlsError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// SENTINELS: nothing in `serve.rs` could produce either of them, so a test
-    /// that sees one saw it travel from the lookup.
-    const SENTINEL_CERT: &str = "/etc/yadgar/pangolin-7c21/serving.crt";
-    const SENTINEL_KEY: &str = "/etc/yadgar/pangolin-7c21/serving.key";
-
-    fn lookup<'a>(
-        pairs: &'a [(&'static str, &'static str)],
-    ) -> impl Fn(&str) -> Option<String> + 'a {
-        move |key| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_string())
-        }
-    }
-
-    /// THE DEFAULT, and the property the whole change is built around: nothing
-    /// configured means the cleartext listener, unchanged.
-    #[test]
-    fn nothing_configured_means_no_tls() {
-        assert_eq!(ServeTls::from_lookup(LISTEN, lookup(&[])).unwrap(), None);
-    }
-
-    /// A certificate without the flag is the REVERTED state, not an error. The
-    /// flag is the lever; leaving the paths in place is how it gets pulled back.
-    #[test]
-    fn a_certificate_alone_does_not_enable_tls() {
-        let vars = [
-            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
-        ];
-        assert_eq!(ServeTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
-    }
-
-    /// Anything but "1" is off. A permissive parse is how a setting meant to be
-    /// off ends up on — and here also how one meant to be revertible stops
-    /// being.
-    #[test]
-    fn only_exactly_one_enables_tls() {
-        for value in ["0", "false", "no", "true", "yes", "", " "] {
-            let vars = [
-                ("LISTEN_TLS_ENABLED", value),
-                ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
-            ];
-            assert_eq!(
-                ServeTls::from_lookup(LISTEN, lookup(&vars)).unwrap(),
-                None,
-                "{value:?} must not enable TLS"
-            );
-        }
-    }
-
-    /// THE FAILURE THAT MUST NOT DEGRADE. Asking for TLS and naming no
-    /// certificate is a deployment mistake, and the answer to it is an error
-    /// rather than a plaintext listener.
-    #[test]
-    fn asking_for_tls_without_a_certificate_is_an_error() {
-        for vars in [
-            vec![
-                ("LISTEN_TLS_ENABLED", "1"),
-                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
-            ],
-            vec![
-                ("LISTEN_TLS_ENABLED", "1"),
-                ("LISTEN_TLS_CERT_FILE", ""),
-                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
-            ],
-            vec![
-                ("LISTEN_TLS_ENABLED", "1"),
-                ("LISTEN_TLS_CERT_FILE", "   "),
-                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
-            ],
-        ] {
-            assert!(
-                matches!(
-                    ServeTls::from_lookup(LISTEN, lookup(&vars)),
-                    Err(ServeTlsError::NoCertFile("LISTEN"))
-                ),
-                "{vars:?} must be refused, not silently downgraded"
-            );
-        }
-    }
-
-    /// The same for the key. Half a pair is not an identity, and the message
-    /// has to name the half that is missing.
-    #[test]
-    fn asking_for_tls_without_a_private_key_is_an_error() {
-        for vars in [
-            vec![
-                ("LISTEN_TLS_ENABLED", "1"),
-                ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-            ],
-            vec![
-                ("LISTEN_TLS_ENABLED", "1"),
-                ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-                ("LISTEN_TLS_KEY_FILE", "   "),
-            ],
-        ] {
-            assert!(
-                matches!(
-                    ServeTls::from_lookup(LISTEN, lookup(&vars)),
-                    Err(ServeTlsError::NoKeyFile("LISTEN"))
-                ),
-                "{vars:?} must be refused, not silently downgraded"
-            );
-        }
-    }
-
-    /// Both paths reach the settings, proved with names the module could not
-    /// have chosen for itself.
-    #[test]
-    fn the_certificate_and_the_key_both_arrive() {
-        let vars = [
-            ("LISTEN_TLS_ENABLED", "1"),
-            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
-        ];
-        let tls = ServeTls::from_lookup(LISTEN, lookup(&vars))
-            .unwrap()
-            .expect("a flag, a certificate and a key enable TLS");
-        assert_eq!(tls.cert_file(), Path::new(SENTINEL_CERT));
-        assert_eq!(tls.key_file(), Path::new(SENTINEL_KEY));
-    }
-
-    /// The prefix is what selects the variables, so the upstream's transport
-    /// cannot configure the listener. `TASK_DB_TLS_*` is a real setting in this
-    /// process — [`crate::upstream`] reads it — which is what makes this worth
-    /// pinning rather than obvious.
-    #[test]
-    fn the_upstreams_variables_do_not_configure_the_listener() {
-        let vars = [
-            ("TASK_DB_TLS_ENABLED", "1"),
-            ("TASK_DB_TLS_CA_FILE", SENTINEL_CERT),
-            ("TLS_ENABLED", "1"),
-            ("TLS_CERT_FILE", SENTINEL_CERT),
-        ];
-        assert_eq!(ServeTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
-    }
-}
+mod tests;
