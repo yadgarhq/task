@@ -21,7 +21,7 @@ use tonic::transport::{Channel, Server};
 use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
 use yadgar_task::rotate::{self, Inputs, Schedule};
-use yadgar_task::serve::ServeTls;
+use yadgar_task::serve::ServerTls;
 use yadgar_task::service::Task;
 
 use crate::{env_required, refusal};
@@ -60,7 +60,7 @@ pub fn install_logging() {
 /// refused before.
 pub async fn serve_until_drained(
     mut server: Server,
-    tls: Option<ServeTls>,
+    tls: Option<ServerTls>,
     channel: Channel,
     watch_inputs: Inputs,
     schedule: Schedule,

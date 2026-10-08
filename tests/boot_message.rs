@@ -49,19 +49,42 @@ fn refusal_without_mounts(vars: &[(&str, &str)]) -> String {
     refusal_line(out.status, &String::from_utf8_lossy(&out.stderr))
 }
 
-/// A TYPED error: `ServeTlsError::NoCertFile`, the first refusal `run` can
-/// reach. Debug of the error would print `NoCertFile("LISTEN")`; Debug of its
-/// sentence printed the sentence in quotes. Display prints the sentence.
+/// A TYPED error: `ServeTlsError::NoServingFile`, the first refusal `run` can
+/// reach with a complete mode. Debug of the error would print the variant
+/// name; Debug of its sentence printed the sentence in quotes. Display prints
+/// the sentence.
 #[test]
 fn a_typed_refusal_is_printed_as_its_sentence() {
-    let line = refusal_without_mounts(&[("LISTEN_TLS_ENABLED", "1")]);
+    let line = refusal_without_mounts(&[
+        ("LISTEN_TLS_ENABLED", "1"),
+        ("LISTEN_TLS_CLIENT_AUTH", "off"),
+    ]);
     assert!(
-        line.contains("LISTEN_TLS_ENABLED is set but LISTEN_TLS_CERT_FILE names no certificate"),
+        line.contains("LISTEN_TLS_ENABLED is \"1\" but LISTEN_TLS_CERT_FILE is not set"),
         "the refusal must name both variables: {line}"
     );
     assert!(
-        !line.contains("NoCertFile"),
+        !line.contains("NoServingFile"),
         "the operator got the Debug variant name, not the sentence: {line}"
+    );
+}
+
+/// THE BINARY REFUSES AN ABSENT CLIENT-AUTH MODE (ADR-0854, B-U5), naming the
+/// variable it reads and the chart value that renders it — through `main`,
+/// not only through the library, so a `main` that read the listener with some
+/// other chart key, or not through `serve::from_env` at all, turns this red.
+#[test]
+fn an_absent_client_auth_is_refused_naming_the_variable_and_the_chart_key() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "LISTEN_TLS_CLIENT_AUTH");
+    let line = refusal_without_mounts(&vars);
+    assert!(
+        line.contains("LISTEN_TLS_CLIENT_AUTH is not set"),
+        "the refusal must name the variable LISTEN_TLS_CLIENT_AUTH"
+    );
+    assert!(
+        line.contains("`tls.clientAuth`"),
+        "the refusal must name the chart key tls.clientAuth"
     );
 }
 
