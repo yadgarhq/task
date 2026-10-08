@@ -32,10 +32,256 @@ THE TOGGLE IS OPT-IN, which is what makes this check legal at all: `Has` is fals
 every CRD-backed group with no cluster, so a check reachable at the defaults would
 refuse every offline render.
 */}}
+{{/*
+THE SHAPE OF `autoscaling` AND `autoscaling.enabled`, REFUSED BEFORE THIS CHECK READS
+THEM (ledger 1135).
+
+`{{- if .Values.autoscaling.enabled }}` BELOW, AND `templates/scaledobject.yaml`'s
+own gate, are BARE TRUTHINESS TESTS, which are FAIL-OPEN on a string. Measured on
+helm 3.20.2 and 4.3.0, identically:
+
+  false, 0, null, {}, []   render no ScaledObject
+  true                     renders one
+  "false", "no", "true", 1 render one
+
+So `autoscaling.enabled: "false"` — which reads as OFF to any human, and is what a
+`--set-string`, a templated overlay or a quoted values file produces — CREATES A
+SCALEDOBJECT. ADR-0797 is the governing rule for this arm: a values key a helm
+condition reads, and that this chart DECLARES, is validated with `kindIs "bool"` ON
+THE RAW VALUE, `hasKey` first because `kindOf` cannot tell a deleted key from an
+absent one.
+
+ONE LEVEL UP, `autoscaling` ITSELF IS READ AS A BLOCK, NOT A TOGGLE, by both this
+check and `templates/scaledobject.yaml`. Measured: a values file setting
+`autoscaling: "x"` crashes `templates/scaledobject.yaml` with a raw Go template
+error naming no key at all, because `.enabled` cannot be read off a non-map.
+ADR-0794 is the governing rule for THIS arm: shape is tested with `kindIs "map"`
+ON THE RAW VALUE, `hasKey` first, for the same reason.
+
+ADR-0850 is why BOTH templates need their own copy of this: a `fail` here aborts the
+whole render, but which template's unguarded read panics first is not under this
+chart's control (measured: `scaledobject.yaml` panics before this file's `fail` is
+ever reached), so `templates/scaledobject.yaml` carries its own `kindIs "map"` guard
+rather than relying on this one running first.
+
+THE REFUSAL TEXT MAY NOT QUOTE THE RAISE TEXT IT REPLACES (ADR-0794) — a refusal and
+a raise both exit 1, so the message is the only thing that tells them apart.
+`scripts/tests/test_render_checks.py` holds the banned markers in one place and
+reads this whole file for them; the nine-shape table beside it is the gate on this
+block.
+*/}}
+{{- if not (hasKey .Values "autoscaling") }}
+{{- fail (join "" (list
+      "task: `autoscaling` is absent from the values, so `autoscaling.enabled` cannot be read. "
+      "Helm deletes a null-valued key that a chart in the tree declares, and restores no "
+      "default, so a values file writing `autoscaling:` with no value leaves this chart with "
+      "nothing under it. Write the keys you mean, or omit `autoscaling` entirely and this "
+      "chart's own defaults apply.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.autoscaling) }}
+{{- fail (printf (join "" (list
+      "task: `autoscaling` must be a map and is %s (%s). `autoscaling.enabled` is read from "
+      "inside it, and a non-map here crashes the template with a raw Go error naming no key "
+      "at all. Write `autoscaling:` as a block, with `enabled: true` or `enabled: false` "
+      "inside it."))
+      (kindOf .Values.autoscaling) (toJson .Values.autoscaling)) }}
+{{- end }}
+{{- if not (hasKey .Values.autoscaling "enabled") }}
+{{- fail (join "" (list
+      "task: `autoscaling.enabled` is absent. This chart's `values.yaml` declares it false, so "
+      "it is missing only when a values file wrote `enabled:` with NO VALUE — helm deletes a "
+      "null-valued key a chart declares and restores no default. Write `autoscaling.enabled: "
+      "false` to leave autoscaling off, or `true` to turn it on.")) }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.autoscaling.enabled) }}
+{{- fail (printf (join "" (list
+      "task: `autoscaling.enabled` must be true or false and is %s (%s). A string, number, map "
+      "or list here is not a toggle: the template gates on bare truthiness, so \"false\", "
+      "\"no\", \"true\" and 1 all CREATE a ScaledObject while {}, 0 and [] do not, and nothing "
+      "tells you which one you wrote. Write the bare word `true` or `false`."))
+      (kindOf .Values.autoscaling.enabled) (toJson .Values.autoscaling.enabled)) }}
+{{- end }}
 {{- if .Values.autoscaling.enabled }}
 {{- include "task.require-api" (dict
       "context" $
       "apiVersion" "keda.sh/v1alpha1"
       "operator" "KEDA"
       "toggle" "autoscaling.enabled") }}
+{{- end }}
+
+{{/*
+THE SHAPE OF `tls.enabled` AND `taskDb.tls.enabled`, REFUSED BEFORE
+`templates/deployment.yaml` CAN RENDER THEM (ADR-0845, C-SVb).
+
+`templates/deployment.yaml` now renders `LISTEN_TLS_ENABLED` and
+`TASK_DB_TLS_ENABLED` UNCONDITIONALLY — ADR-0845 deleted the binary's
+compiled-in default for both, so the chart can no longer skip either
+variable when TLS is "off"; it must always say which one it means, as
+`ternary "1" "0" .Values.tls.enabled` (and the same for `taskDb.tls.enabled`).
+A BARE `.Values.tls.enabled` read is FAIL-OPEN on a string exactly as
+`autoscaling.enabled` above: `tls.enabled: "false"` reads as off to any
+human, and under Go template truthiness a non-empty string is truthy, so
+`ternary` would hand the pod LISTEN_TLS_ENABLED="1" for a value every reader
+believes turned TLS off. This is the same two-part guard every other toggle
+here carries: `hasKey` before `kindIs`, because `kindOf` answers `invalid`
+for a deleted key and for an absent one alike and cannot tell them apart.
+
+`tls` AND `taskDb.tls` ARE GUARDED FIRST, the same `hasKey` then `kindIs "map"`
+idiom as `autoscaling`: `certSecret`, `certSecretKey`, `keySecretKey` and the
+B-U5E expand's `clientAuth`, `clientCaSecret`, `clientCaSecretKey` all live
+under `tls`; `caSecret`, `caSecretKey`, `domain`, `clientCertSecret`,
+`clientCertSecretKey` and `clientKeySecretKey` all live under `taskDb.tls`.
+
+`templates/deployment.yaml` CARRIES ITS OWN `kindIs "map"` GUARD on the same
+reads, the same defence `templates/scaledobject.yaml` carries for
+`autoscaling.enabled` — the refusal below is reached only once that guard has
+already kept the read safe, whichever of the two templates helm reaches first.
+
+UNLIKE `autoscaling.enabled`, THIS GUARD HAS NO TRAILING
+`include "task.require-api"`: TLS needs no CRD-backed operator at render
+time, only a Secret, so there is no API-availability check to chain after the
+shape is proved sound.
+*/}}
+{{- if not (hasKey .Values "tls") }}
+{{- fail (join "" (list
+      "task: `tls` is absent from the values, so `tls.enabled` cannot be read. "
+      "Helm deletes a null-valued key that a chart in the tree declares, and "
+      "restores no default, so a values file writing `tls:` with no value leaves "
+      "this chart with nothing under it. Write the keys you mean: `tls.enabled` "
+      "has no default (ADR-0845) and must be `true` or `false`.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.tls) }}
+{{- fail (printf (join "" (list
+      "task: `tls` must be a map and is %s (%s). `enabled`, `certSecret`, "
+      "`certSecretKey` and `keySecretKey` all live under it, so a string, number "
+      "or list here cannot be read. Write the block this chart's `values.yaml` "
+      "declares."))
+      (kindOf .Values.tls) (toJson .Values.tls)) }}
+{{- end }}
+{{- if not (hasKey .Values.tls "enabled") }}
+{{- fail (join "" (list
+      "task: `tls.enabled` is absent. ADR-0845 gives this knob no compiled-in "
+      "default: an absent or nulled value is a choice this chart cannot make for "
+      "an adopter. Write `tls.enabled: true` to serve this listener over TLS, or "
+      "`false` to leave it in cleartext.")) }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.tls.enabled) }}
+{{- fail (printf (join "" (list
+      "task: `tls.enabled` must be true or false and is %s (%s). A string, "
+      "number, map or list here is not a toggle: the chart renders "
+      "LISTEN_TLS_ENABLED from it unconditionally, so a quoted or typed value "
+      "would be misread rather than refused until the pod either fails to boot "
+      "or serves the wrong transport. Write the bare word `true` or `false`."))
+      (kindOf .Values.tls.enabled) (toJson .Values.tls.enabled)) }}
+{{- end }}
+{{- if not (hasKey .Values "taskDb") }}
+{{- fail (join "" (list
+      "task: `taskDb` is absent from the values, so `taskDb.tls.enabled` cannot "
+      "be read. Helm deletes a null-valued key that a chart in the tree "
+      "declares, and restores no default, so a values file writing `taskDb:` "
+      "with no value leaves this chart with nothing under it. Write the keys "
+      "you mean: `taskDb.tls.enabled` has no default (ADR-0845) and must be "
+      "`true` or `false`.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.taskDb) }}
+{{- fail (printf (join "" (list
+      "task: `taskDb` must be a map and is %s (%s). `host`, `port` and `tls` "
+      "all live under it, so a string, number or list here cannot be read. "
+      "Write the block this chart's `values.yaml` declares."))
+      (kindOf .Values.taskDb) (toJson .Values.taskDb)) }}
+{{- end }}
+{{- if not (hasKey .Values.taskDb "tls") }}
+{{- fail (join "" (list
+      "task: `taskDb.tls` is absent from the values, so `taskDb.tls.enabled` "
+      "cannot be read. Helm deletes a null-valued key that a chart in the tree "
+      "declares, and restores no default, so a values file writing `taskDb: "
+      "{tls:}` with no value leaves this chart with nothing under it. Write "
+      "the keys you mean: `taskDb.tls.enabled` has no default (ADR-0845) and "
+      "must be `true` or `false`.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.taskDb.tls) }}
+{{- fail (printf (join "" (list
+      "task: `taskDb.tls` must be a map and is %s (%s). `enabled`, `caSecret`, "
+      "`caSecretKey` and `domain` all live under it, so a string, number or "
+      "list here cannot be read. Write the block this chart's `values.yaml` "
+      "declares."))
+      (kindOf .Values.taskDb.tls) (toJson .Values.taskDb.tls)) }}
+{{- end }}
+{{- if not (hasKey .Values.taskDb.tls "enabled") }}
+{{- fail (join "" (list
+      "task: `taskDb.tls.enabled` is absent. ADR-0845 gives this knob no "
+      "compiled-in default: an absent or nulled value is a choice this chart "
+      "cannot make for an adopter. Write `taskDb.tls.enabled: true` to dial "
+      "task-db over TLS, or `false` to leave it in cleartext.")) }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.taskDb.tls.enabled) }}
+{{- fail (printf (join "" (list
+      "task: `taskDb.tls.enabled` must be true or false and is %s (%s). A "
+      "string, number, map or list here is not a toggle: the chart renders "
+      "TASK_DB_TLS_ENABLED from it unconditionally, so a quoted or typed value "
+      "would be misread rather than refused until the pod either fails to boot "
+      "or dials the wrong transport. Write the bare word `true` or `false`."))
+      (kindOf .Values.taskDb.tls.enabled) (toJson .Values.taskDb.tls.enabled)) }}
+{{- end }}
+
+{{/*
+B-U5E EXPAND: `tls.clientAuth`, `tls.clientCaSecret` and `tls.clientCaSecretKey`
+(ADR-0854, folded into this card per the plan's B-U5E card and the
+coordinator's cross-repo convention, scratchpad/sweep/B-U5E-convention.md).
+
+NONE OF THIS CHANGES THE BINARY. `src/serve.rs` does not read
+LISTEN_TLS_CLIENT_AUTH at all yet — B-U5 is the unit that adopts it. This
+block only lets an adopter STATE the mode ahead of that cut-over, and refuses
+the two modes the binary cannot yet enforce, so nothing shipped here can
+promise a protection this pod does not give.
+
+`tls.clientAuth` IS OPTIONAL. An absent key renders `templates/deployment.yaml`
+exactly as it did before this change, which is the whole of what "expand" means
+— no LISTEN_TLS_CLIENT_AUTH, no LISTEN_TLS_CLIENT_CA_FILE, no `ca.crt` item.
+When the key IS present, ADR-0854 allows exactly three values, and `optional`
+and `required` are refused HERE rather than rendered: shipping either today
+would have an adopter believe client certificates are checked when nothing
+checks them. Only `off` — ADR-0854's "emergency value" — is accepted before
+B-U5 lifts this gate (K-8 step 1).
+
+`kindIs "string"` GUARDS EVERY `eq`/`ne` BELOW, and it has to run FIRST. YAML
+1.1 reads a BARE `off` (no quotes) as the boolean `false` — `clientAuth: off`
+parses to `false`, not the string `"off"` — so `eq .Values.tls.clientAuth
+"optional"` against a bool argument is a Go template type error
+("incompatible types for comparison") rather than a clean refusal. The
+message says so by name, because writing `clientAuth: "off"` quoted is the
+one-character fix and an adopter who hit the raw Go error would not find it
+unaided.
+*/}}
+{{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+{{- if not (kindIs "string" .Values.tls.clientAuth) }}
+{{- fail (printf (join "" (list
+      "task: `tls.clientAuth` must be a quoted string (\"off\", \"optional\" "
+      "or \"required\") and is %s (%s). YAML reads a bare off as false: write "
+      "`clientAuth: \"off\"`."))
+      (kindOf .Values.tls.clientAuth) (toJson .Values.tls.clientAuth)) }}
+{{- end }}
+{{- if eq .Values.tls.clientAuth "optional" }}
+{{- fail (join "" (list
+      "task: `tls.clientAuth: optional` is not enforced yet. This binary does "
+      "not read LISTEN_TLS_CLIENT_AUTH until B-U5 adopts it, so shipping "
+      "`optional` here would have an adopter believe client certificates are "
+      "checked when nothing checks them. Write `off`, or omit `tls.clientAuth` "
+      "entirely, until B-U5 ships.")) }}
+{{- end }}
+{{- if eq .Values.tls.clientAuth "required" }}
+{{- fail (join "" (list
+      "task: `tls.clientAuth: required` is not enforced yet. This binary does "
+      "not read LISTEN_TLS_CLIENT_AUTH until B-U5 adopts it, so shipping "
+      "`required` here would have an adopter believe client certificates are "
+      "checked when nothing checks them. Write `off`, or omit `tls.clientAuth` "
+      "entirely, until B-U5 ships.")) }}
+{{- end }}
+{{- if ne .Values.tls.clientAuth "off" }}
+{{- fail (printf (join "" (list
+      "task: `tls.clientAuth` must be `off`, `optional` or `required` "
+      "(ADR-0854) and is %s. `optional` and `required` are refused for a "
+      "separate reason, above. Write `off`, or omit `tls.clientAuth` entirely."))
+      (toJson .Values.tls.clientAuth)) }}
+{{- end }}
 {{- end }}
