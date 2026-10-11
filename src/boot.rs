@@ -21,7 +21,7 @@ use tonic::transport::{Channel, Server};
 use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 use yadgar_task::pb::yadgar::taskapi::v1::task_service_server::TaskServiceServer;
 use yadgar_task::rotate::{self, Inputs, Schedule};
-use yadgar_task::serve::ServerTls;
+use yadgar_task::serve::{ClientAuth, ServerTls};
 use yadgar_task::service::Task;
 
 use crate::{env_required, refusal};
@@ -98,6 +98,7 @@ pub async fn serve_until_drained(
     tracing::info!(
         %addr,
         tls = tls.is_some(),
+        client_auth = %tls.as_ref().map_or(ClientAuth::Off, |t| t.client_auth()),
         watching = watch_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
