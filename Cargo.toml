@@ -98,6 +98,13 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # repository, and it expires on a date nobody is watching. Same crate and same
 # features yadgar-dial uses for the client half of this seam.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# `tests/boot_log_client_auth.rs` reads the real "task listening" line as
+# structured data rather than substring-matching it: a bare `contains("off")`
+# would pass against a line that happened to mention "off" anywhere else, and
+# would not catch a `client_auth` field holding the WRONG one of the three
+# values. `install_logging` writes this shape (`tracing_subscriber::fmt().json()`),
+# so parsing it is parsing the real line, not a format this test invents.
+serde_json = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
