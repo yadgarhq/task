@@ -21,6 +21,10 @@ const SENTINEL_CLIENT_CERT: &str = "/etc/yadgar/aardvark-9f3c/task-caller.pem";
 const SENTINEL_CLIENT_KEY: &str = "/etc/yadgar/aardvark-9f3c/task-caller-key.pem";
 const SENTINEL_DOMAIN: &str = "task-db.verified-as-this.invalid";
 
+/// Any value inside dial's accepted range; these tests are about WHICH dial runs, not
+/// how long it would wait.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn lookup<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + 'a {
     move |key| {
         pairs
@@ -192,7 +196,7 @@ async fn a_tls_dial_goes_through_connect_tls_and_not_through_connect() {
 
     assert!(
         matches!(
-            connect(UNRESOLVABLE, 50051, Some(&tls)).await,
+            connect(UNRESOLVABLE, 50051, Some(&tls), TEST_TIMEOUT).await,
             Err(BalanceError::CaUnreadable { .. })
         ),
         "a TLS dial must read the bundle, which only connect_tls does"
@@ -231,8 +235,8 @@ async fn a_cleartext_dial_reads_no_bundle() {
         .unwrap()
         .unwrap();
 
-    let cleartext = connect(UNRESOLVABLE, 50051, None).await;
-    let encrypted = connect(UNRESOLVABLE, 50051, Some(&tls)).await;
+    let cleartext = connect(UNRESOLVABLE, 50051, None, TEST_TIMEOUT).await;
+    let encrypted = connect(UNRESOLVABLE, 50051, Some(&tls), TEST_TIMEOUT).await;
 
     assert!(
         cleartext.is_ok(),
@@ -489,7 +493,7 @@ fn dial_under_a_recorder(host: &str) -> (Vec<Emitted>, tonic::transport::Channel
         .build()
         .expect("a runtime");
     let channel = metrics::with_local_recorder(&recorder, || {
-        rt.block_on(async { connect(host, 50051, None).await })
+        rt.block_on(async { connect(host, 50051, None, TEST_TIMEOUT).await })
     })
     .expect("a cleartext dial is lazy and hands back a channel");
 
@@ -518,4 +522,88 @@ fn gauge_for(emitted: &[Emitted], upstream: &str, want: f64) -> bool {
                 .any(|l| l.key() == "upstream" && l.value() == upstream)
             && matches!(value, metrics_util::debugging::DebugValue::Gauge(g) if g.0 == want)
     })
+}
+
+// ---------------------------------------------------------------------------
+// REQUEST TIMEOUT (ADR-0925 Q-C1, ledger 1490)
+// ---------------------------------------------------------------------------
+
+/// Every refusal names BOTH the variable and the chart key, so an operator who
+/// sees only the boot log can find the value to change.
+fn assert_names_var_and_chart_key(error: &RequestTimeoutError) {
+    let message = error.to_string();
+    assert!(
+        message.contains("TASK_DB_REQUEST_TIMEOUT_SECONDS"),
+        "the refusal must name the variable; got: {message}"
+    );
+    assert!(
+        message.contains("taskDb.requestTimeoutSeconds"),
+        "the refusal must name the chart key; got: {message}"
+    );
+}
+
+#[test]
+fn an_unset_request_timeout_refuses_and_names_the_variable() {
+    let error = request_timeout_from_lookup(lookup(&[])).unwrap_err();
+    assert!(
+        matches!(error, RequestTimeoutError::Unset { .. }),
+        "{error:?}"
+    );
+    assert_names_var_and_chart_key(&error);
+}
+
+#[test]
+fn a_zero_request_timeout_refuses_and_names_the_variable() {
+    let error = request_timeout_from_lookup(lookup(&[("TASK_DB_REQUEST_TIMEOUT_SECONDS", "0")]))
+        .unwrap_err();
+    assert!(
+        matches!(error, RequestTimeoutError::OutOfRange { .. }),
+        "{error:?}"
+    );
+    assert_names_var_and_chart_key(&error);
+}
+
+#[test]
+fn a_request_timeout_one_second_under_the_floor_refuses() {
+    let error = request_timeout_from_lookup(lookup(&[("TASK_DB_REQUEST_TIMEOUT_SECONDS", "13")]))
+        .unwrap_err();
+    assert!(
+        matches!(error, RequestTimeoutError::OutOfRange { .. }),
+        "{error:?}"
+    );
+    assert_names_var_and_chart_key(&error);
+}
+
+#[test]
+fn a_request_timeout_one_second_over_the_ceiling_refuses() {
+    let error = request_timeout_from_lookup(lookup(&[("TASK_DB_REQUEST_TIMEOUT_SECONDS", "60")]))
+        .unwrap_err();
+    assert!(
+        matches!(error, RequestTimeoutError::OutOfRange { .. }),
+        "{error:?}"
+    );
+    assert_names_var_and_chart_key(&error);
+}
+
+#[test]
+fn a_request_timeout_that_is_not_whole_seconds_refuses() {
+    let error = request_timeout_from_lookup(lookup(&[("TASK_DB_REQUEST_TIMEOUT_SECONDS", "30s")]))
+        .unwrap_err();
+    assert!(
+        matches!(error, RequestTimeoutError::NotSeconds { .. }),
+        "{error:?}"
+    );
+    assert_names_var_and_chart_key(&error);
+}
+
+/// The edges are pinned by LITERAL (ADR-0599): 14 and 59 are accepted, and the
+/// value read is the value returned, not a default.
+#[test]
+fn the_inclusive_bounds_and_the_chart_default_are_accepted_as_stated() {
+    for seconds in ["14", "30", "59"] {
+        let got =
+            request_timeout_from_lookup(lookup(&[("TASK_DB_REQUEST_TIMEOUT_SECONDS", seconds)]))
+                .unwrap_or_else(|e| panic!("{seconds} must be accepted: {e}"));
+        assert_eq!(got, Duration::from_secs(seconds.parse().unwrap()));
+    }
 }

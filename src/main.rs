@@ -205,6 +205,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // always produced.
     let db_tls = UpstreamTls::from_env(TASK_DB).map_err(|e| e.to_string())?;
 
+    // NO COMPILED-IN DEFAULT (ADR-0569, ADR-0925 Q-C1). Read with the rest of the
+    // configuration, before the dial, so an unset, zero or out-of-range value
+    // refuses the boot naming the variable and `taskDb.requestTimeoutSeconds`.
+    let request_timeout = upstream::request_timeout_from_env().map_err(|e| e.to_string())?;
+
     // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
     // `yadgarhq/config` renders into the `shared` ConfigMap, mounted at
     // `/etc/yadgar/config/shared/shared.yaml`. There is no compiled-in default
@@ -242,7 +247,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // deployment too, which is where it would otherwise sit unnoticed until the
     // cut-over.
     let schedule = config.schedule().map_err(|e| e.to_string())?;
-    let channel = upstream::connect(&db_host, db_port, db_tls.as_ref())
+    let channel = upstream::connect(&db_host, db_port, db_tls.as_ref(), request_timeout)
         .await
         // `refusal` rather than `to_string()` (ledger 733, ledger 740): see its
         // own doc comment for why this is the one site in this file that takes
@@ -254,6 +259,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
         tls = db_tls.is_some(),
+        request_timeout_secs = request_timeout.as_secs(),
         "connected to task-db"
     );
 
@@ -339,9 +345,14 @@ mod tests {
         let ca = MintedCa::new();
         let tls = upstream_tls(ca.path(), "not a server name");
 
-        let error = yadgar_task::upstream::connect("task-db", 50051, Some(&tls))
-            .await
-            .expect_err("a domain rustls cannot parse must refuse before any dial");
+        let error = yadgar_task::upstream::connect(
+            "task-db",
+            50051,
+            Some(&tls),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a domain rustls cannot parse must refuse before any dial");
 
         assert!(
             refusal(&error).contains("invalid dns name"),

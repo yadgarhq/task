@@ -192,6 +192,11 @@ spec:
               value: {{ .Values.taskDb.host | quote }}
             - name: TASK_DB_PORT
               value: {{ .Values.taskDb.port | quote }}
+            # NO COMPILED-IN DEFAULT (ADR-0569, ADR-0925 Q-C1): the binary refuses
+            # an unset value, so this renders from `taskDb.requestTimeoutSeconds`
+            # unconditionally. Bounded 14..=59 in `values.schema.json`.
+            - name: TASK_DB_REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.taskDb.requestTimeoutSeconds | quote }}
             # STATED HERE BECAUSE THE BINARY NO LONGER CARRIES A DEFAULT
             # (ADR-0569). Both used to fall back to a compiled-in value when
             # unset; that fallback is gone, so a value it renders nowhere is a
