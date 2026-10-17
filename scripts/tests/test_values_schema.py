@@ -112,6 +112,15 @@ OPEN_VALUES_PATHS = ("resources", "rollingUpdate")
 REQUIRED_NO_DEFAULT = ("tls.enabled", "taskDb.tls.enabled", "tls.clientAuth")
 BOOLEAN_SWITCHES = ("tls.enabled", "taskDb.tls.enabled")
 
+# THE ONE TYPED, BOUNDED, REQUIRED LEAF THAT DOES SHIP A DEFAULT (ADR-0925 Q-C1,
+# ledger 1490): `taskDb.requestTimeoutSeconds` is `type: integer` with a
+# `minimum` and `maximum`, and its parent lists it under `required`. Unlike
+# REQUIRED_NO_DEFAULT it IS in `chart/values.yaml` (an explicit 30, never
+# compiled in). The bounds are `yadgar_dial`'s `min_request_timeout()` and
+# `max_request_timeout()`; `tests/chart_request_timeout.rs` holds them to the
+# pinned crate.
+REQUIRED_BOUNDED_INTEGER = {"taskDb.requestTimeoutSeconds": (14, 59)}
+
 
 def helm(*arguments: str) -> subprocess.CompletedProcess[str]:
     binary = shutil.which("helm")
@@ -221,11 +230,11 @@ def leaf_type_violations(node: dict, prefix: str = "") -> list[str]:
     """
     violations = []
     for key in ("type", "enum", "default"):
-        if key in node and prefix not in BOOLEAN_SWITCHES:
+        if key in node and prefix not in BOOLEAN_SWITCHES and prefix not in REQUIRED_BOUNDED_INTEGER:
             violations.append(key)
     if "required" in node:
         required_paths = {f"{prefix}.{name}" if prefix else name for name in node["required"]}
-        if not required_paths <= set(REQUIRED_NO_DEFAULT):
+        if not required_paths <= set(REQUIRED_NO_DEFAULT) | set(REQUIRED_BOUNDED_INTEGER):
             violations.append("required")
     for key, subschema in (node.get("properties") or {}).items():
         subprefix = f"{prefix}.{key}" if prefix else key
@@ -288,12 +297,27 @@ def test_the_retained_leaves_are_untyped_task_ships_none():
     """
     schema = load_schema()
     for path in schema_leaves(schema["properties"]):
-        if path in RESERVED or path in BOOLEAN_SWITCHES:
+        if path in RESERVED or path in BOOLEAN_SWITCHES or path in REQUIRED_BOUNDED_INTEGER:
             continue
         leaf = schema
         for step in path.split("."):
             leaf = leaf["properties"][step]
         assert leaf == {}, path
+
+
+def test_the_request_timeout_is_a_bounded_required_integer():
+    schema = load_schema()
+    for path, (minimum, maximum) in REQUIRED_BOUNDED_INTEGER.items():
+        *parents, leaf_key = path.split(".")
+        cursor = schema
+        for step in parents:
+            cursor = cursor["properties"][step]
+        assert cursor["properties"][leaf_key] == {
+            "type": "integer",
+            "minimum": minimum,
+            "maximum": maximum,
+        }, path
+        assert leaf_key in cursor.get("required", []), path
 
 
 def test_the_boolean_switches_are_typed_boolean():

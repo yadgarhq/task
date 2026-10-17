@@ -73,10 +73,11 @@
 //! cleartext, and nothing falls back to the platform trust store.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tonic::transport::Channel;
 
-use yadgar_dial::{BalanceError, TlsOptions};
+use yadgar_dial::{BalanceError, RequestTimeoutError, TlsOptions};
 
 /// The environment variables one upstream's transport is configured from.
 ///
@@ -327,11 +328,40 @@ pub async fn connect(
     host: &str,
     port: u16,
     tls: Option<&UpstreamTls>,
+    timeout: Duration,
 ) -> Result<Channel, BalanceError> {
     match tls {
-        None => yadgar_dial::connect(host, port).await,
-        Some(tls) => yadgar_dial::connect_tls(host, port, &tls.options()).await,
+        None => yadgar_dial::connect_with_request_timeout(host, port, timeout).await,
+        Some(tls) => {
+            yadgar_dial::connect_tls_with_request_timeout(host, port, &tls.options(), timeout).await
+        }
     }
+}
+
+/// The environment variable that bounds how long one request to `task-db` may wait
+/// for a peer that is connected and never replies (ADR-0925 Q-C1).
+pub const REQUEST_TIMEOUT: &str = "TASK_DB_REQUEST_TIMEOUT_SECONDS";
+
+/// The chart key that renders [`REQUEST_TIMEOUT`]. Named, not derived, for the
+/// reason [`CHART_KEY`] is.
+pub const REQUEST_TIMEOUT_CHART_KEY: &str = "taskDb.requestTimeoutSeconds";
+
+/// The request timeout for the `task-db` hop, read through `lookup`.
+///
+/// **NO COMPILED-IN DEFAULT (ADR-0569, ADR-0925 Q-C1).** `yadgar_dial` refuses
+/// an unset or empty value, a non-integer, and anything outside
+/// [`yadgar_dial::min_request_timeout`]..=[`yadgar_dial::max_request_timeout`],
+/// each refusal naming [`REQUEST_TIMEOUT`] and [`REQUEST_TIMEOUT_CHART_KEY`].
+/// The chart's default of 30 lives in `chart/values.yaml`, not here.
+pub fn request_timeout_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Duration, RequestTimeoutError> {
+    yadgar_dial::request_timeout_from_lookup(lookup, REQUEST_TIMEOUT, REQUEST_TIMEOUT_CHART_KEY)
+}
+
+/// [`request_timeout_from_lookup`] over the process environment.
+pub fn request_timeout_from_env() -> Result<Duration, RequestTimeoutError> {
+    request_timeout_from_lookup(|key| std::env::var(key).ok())
 }
 
 #[cfg(test)]

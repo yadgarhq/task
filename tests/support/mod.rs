@@ -82,6 +82,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         // `chart/ci/values.yaml` states it.
         ("LISTEN_TLS_CLIENT_AUTH", "off"),
         ("TASK_DB_TLS_ENABLED", "0"),
+        ("TASK_DB_REQUEST_TIMEOUT_SECONDS", "30"),
     ]
 }
 

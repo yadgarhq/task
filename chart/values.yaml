@@ -23,6 +23,21 @@ taskDb:
   host: task-db
   port: 50051
 
+  # HOW LONG ONE REQUEST TO task-db MAY WAIT for a peer that is connected and
+  # never replies, in whole seconds (ADR-0705, ADR-0925 Q-C1). The binary has NO
+  # compiled-in default (ADR-0569); this explicit default is the only place 30
+  # lives, and `chart/values.schema.json` makes the key `required`.
+  #
+  # BOUNDED 14..=59 by `yadgar_dial`: below 14 the bound fires before HTTP/2
+  # keepalive can notice a vanished peer, and from 60 up the answer arrives
+  # after the ingress has given up. `tests/chart_request_timeout.rs` holds the
+  # schema's `minimum` and `maximum` to the pinned dial's own.
+  #
+  # KEEP IT ABOVE task-db's pool acquire timeout (25s, ADR-0925): a request
+  # waiting on a pool slot must be allowed to wait as long as the pool does. The
+  # cross-chart check is ledger 1524, not this chart.
+  requestTimeoutSeconds: 30
+
   # The TRANSPORT to that twin. Everything in the cluster is cleartext today,
   # so a bearer token and every task body cross the pod network in the open;
   # this is the seam that closes it, one hop at a time.
