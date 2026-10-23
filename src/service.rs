@@ -87,6 +87,7 @@ impl Task {
         &self,
         req: &api::TransitionTaskRequest,
     ) -> Result<(db::Task, db::TaskStatus, db::TaskStatus), Status> {
+        let key = crate::writes::target_key(&req.id, req.number)?;
         let to = db::TaskStatus::try_from(req.to)
             .map_err(|_| Status::invalid_argument("unknown target status"))?;
 
@@ -95,7 +96,7 @@ impl Task {
             .clone()
             .get_task(db::GetTaskRequest {
                 scope: req.scope.clone(),
-                key: Some(db::get_task_request::Key::Id(req.id.clone())),
+                key: Some(key),
             })
             .await
             .map_err(|e| passthrough(e, "transition-read"))?

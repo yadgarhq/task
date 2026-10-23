@@ -695,6 +695,8 @@ fn an_edit() -> api::EditTaskRequest {
         title: "an edited title".into(),
         body: "an edited body".into(),
         update_mask: None,
+        number: 0,
+        expect_body_sha256: Vec::new(),
     }
 }
 
@@ -901,6 +903,7 @@ fn a_transition(to: i32) -> api::TransitionTaskRequest {
         id: CALLER_ID.into(),
         expect_version: 3,
         to,
+        number: 0,
     }
 }
 
@@ -1342,4 +1345,277 @@ async fn a_scope_that_states_no_setting_reaches_the_store_still_stating_none() {
     // The rest of the scope still arrives, so the assertion above is about the
     // one field rather than about a scope that went missing entirely.
     assert_eq!(sent.user_id, "yadgar:user:the-owner");
+}
+
+// ---------------------------------------------------------------------------
+// Addressing an edit or a transition by `number` (yaadgaar #397).
+// ---------------------------------------------------------------------------
+
+/// A number no request above carries, so a read keyed on it can only have
+/// come from the request under test.
+const CALLER_NUMBER: u32 = 397;
+
+/// A store that holds the task and accepts the write.
+fn a_store_holding_it() -> MockDb {
+    MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        update: Some(Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+            previous_status: db::TaskStatus::Open as i32,
+        })),
+        ..Default::default()
+    }
+}
+
+/// **THE READ IS KEYED BY NUMBER, AND THE WRITE NAMES THE ID THAT READ
+/// RETURNED.** The caller sent no id, so the only id the write can carry is
+/// the one the store resolved — `read_meta`'s, which no request here sends.
+/// The scope travels unchanged: the store's number arm pins the caller's exact
+/// project (`task-db` `read.rs`, `project_id = ?`), which is the whole of the
+/// "never across projects" rule, so this service must not widen or drop it.
+#[tokio::test]
+async fn an_edit_by_number_reads_by_number_and_writes_the_id_the_read_resolved() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let scope = common::Scope {
+        project_id: "acme/a".into(),
+        user_id: "u1".into(),
+        ..Default::default()
+    };
+
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        scope: Some(scope.clone()),
+        id: String::new(),
+        number: CALLER_NUMBER,
+        ..an_edit()
+    }))
+    .await
+    .expect("an edit by number applies");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.get.len(), 1, "one read, as an edit by id costs");
+    assert_eq!(
+        seen.get[0].key,
+        Some(db::get_task_request::Key::Number(CALLER_NUMBER)),
+        "the read must be keyed on the number the caller sent"
+    );
+    assert_eq!(seen.get[0].scope, Some(scope.clone()));
+    assert_eq!(seen.update.len(), 1);
+    assert_eq!(
+        seen.update[0].id,
+        read_meta().id,
+        "the write must name the task the read resolved, not an empty id"
+    );
+    assert_eq!(seen.update[0].scope, Some(scope));
+    assert_eq!(seen.update[0].expect_version, 3);
+}
+
+/// The same for a transition: one read by number, the resolved id written.
+#[tokio::test]
+async fn a_transition_by_number_reads_by_number_and_writes_the_id_the_read_resolved() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    svc.transition_task(Request::new(api::TransitionTaskRequest {
+        id: String::new(),
+        number: CALLER_NUMBER,
+        ..a_transition(db::TaskStatus::Done as i32)
+    }))
+    .await
+    .expect("a transition by number applies");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.get[0].key,
+        Some(db::get_task_request::Key::Number(CALLER_NUMBER))
+    );
+    assert_eq!(seen.update[0].id, read_meta().id);
+}
+
+/// A number the caller's project does not hold is NOT_FOUND, and nothing is
+/// written. The store answers NOT_FOUND for a number that exists only in
+/// ANOTHER project, because its number arm matches the project by equality.
+#[tokio::test]
+async fn an_edit_by_a_number_the_project_does_not_hold_is_not_found_and_writes_nothing() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Err((Code::NotFound, "no such task in this scope"))),
+        ..Default::default()
+    })
+    .await;
+
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            id: String::new(),
+            number: CALLER_NUMBER,
+            ..an_edit()
+        }))
+        .await
+        .expect_err("there is no such task in this project");
+
+    assert_eq!(status.code(), Code::NotFound);
+    assert_eq!(
+        seen.lock().unwrap().get[0].key,
+        Some(db::get_task_request::Key::Number(CALLER_NUMBER)),
+        "the NOT_FOUND must come from a read by number, not from a read by an empty id"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// Both keys, or neither, is refused before the store is touched — for an
+/// edit and for a transition alike.
+#[tokio::test]
+async fn an_edit_or_transition_naming_both_keys_or_neither_is_refused_before_anything_is_read() {
+    let (svc, seen) = wire(MockDb::default()).await;
+
+    let both = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            number: CALLER_NUMBER,
+            ..an_edit()
+        }))
+        .await
+        .expect_err("an id AND a number is ambiguous");
+    assert_eq!(both.code(), Code::InvalidArgument);
+    assert_eq!(both.message(), "give id or number, not both");
+
+    let neither = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            id: String::new(),
+            ..an_edit()
+        }))
+        .await
+        .expect_err("no key names no task");
+    assert_eq!(neither.code(), Code::InvalidArgument);
+    assert_eq!(neither.message(), "one of id or number is required");
+
+    let both = svc
+        .transition_task(Request::new(api::TransitionTaskRequest {
+            number: CALLER_NUMBER,
+            ..a_transition(db::TaskStatus::Done as i32)
+        }))
+        .await
+        .expect_err("an id AND a number is ambiguous");
+    assert_eq!(both.code(), Code::InvalidArgument);
+
+    let neither = svc
+        .transition_task(Request::new(api::TransitionTaskRequest {
+            id: String::new(),
+            ..a_transition(db::TaskStatus::Done as i32)
+        }))
+        .await
+        .expect_err("no key names no task");
+    assert_eq!(neither.code(), Code::InvalidArgument);
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.get.is_empty(), "a refused key must not cost a read");
+    assert!(seen.update.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `expect_body_sha256`: a body cut off in transit is refused (yaadgaar #394).
+// ---------------------------------------------------------------------------
+
+/// The body the caller MEANT to send, and its digest spelled as a literal
+/// (ADR-0573): `printf 'the whole body\n' | sha256sum`. The trailing newline is
+/// part of the body, and so part of what is hashed.
+const WHOLE_BODY: &str = "the whole body\n";
+const WHOLE_BODY_SHA256: &str = "3dd6ee3056c3a5d527d642ff3d19900286ad919bfbdccc6acb083ffde283f726";
+
+fn digest(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("a hex literal"))
+        .collect()
+}
+
+fn a_body_edit(body: &str, sha: Vec<u8>) -> api::EditTaskRequest {
+    api::EditTaskRequest {
+        body: body.into(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["body".to_string()],
+        }),
+        expect_body_sha256: sha,
+        ..an_edit()
+    }
+}
+
+/// The guard admits the body it was computed over, and that body is what is
+/// written.
+#[tokio::test]
+async fn a_body_matching_its_digest_is_written() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    svc.edit_task(Request::new(a_body_edit(
+        WHOLE_BODY,
+        digest(WHOLE_BODY_SHA256),
+    )))
+    .await
+    .expect("the body is the one the digest was computed over");
+
+    let sent = seen.lock().unwrap().update[0].clone();
+    assert_eq!(sent.task.expect("an edit carries a task").body, WHOLE_BODY);
+}
+
+/// **THE CASE THE FIELD EXISTS FOR.** A body cut off mid-word, and a body that
+/// lost only its trailing newline, are both refused, and neither is read or
+/// written: the decision is about the request alone.
+#[tokio::test]
+async fn a_body_that_does_not_match_its_digest_is_refused_and_nothing_is_written() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    for cut in ["the whole bo", "the whole body"] {
+        let status = svc
+            .edit_task(Request::new(a_body_edit(cut, digest(WHOLE_BODY_SHA256))))
+            .await
+            .expect_err("a truncated body must not be stored");
+        assert_eq!(status.code(), Code::InvalidArgument, "{cut:?}");
+        assert!(
+            status.message().contains("expect_body_sha256"),
+            "the refusal must name the guard that fired: {}",
+            status.message()
+        );
+    }
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.get.is_empty());
+    assert!(seen.update.is_empty(), "a cut-off body was written anyway");
+}
+
+/// A digest that is not 32 bytes is not a SHA-256 digest, and a digest on an
+/// edit that writes no body guards nothing the caller believes it guards.
+#[tokio::test]
+async fn a_malformed_or_misplaced_digest_is_refused_before_anything_is_read() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    let short = svc
+        .edit_task(Request::new(a_body_edit(WHOLE_BODY, vec![0u8; 31])))
+        .await
+        .expect_err("31 bytes is not a SHA-256 digest");
+    assert_eq!(short.code(), Code::InvalidArgument);
+    // The mismatch check would refuse 31 bytes too, so only the message tells
+    // the length check apart from it.
+    assert_eq!(
+        short.message(),
+        "expect_body_sha256 must be a 32-byte SHA-256 digest, not 31 bytes"
+    );
+
+    // The whole body with its CORRECT digest: the only thing wrong is that the
+    // mask writes no body, so only the misplaced-digest check can refuse it.
+    let misplaced = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["title".to_string()],
+            }),
+            ..a_body_edit(WHOLE_BODY, digest(WHOLE_BODY_SHA256))
+        }))
+        .await
+        .expect_err("a title-only edit has no body to check");
+    assert_eq!(misplaced.code(), Code::InvalidArgument);
+    assert_eq!(
+        misplaced.message(),
+        "expect_body_sha256 was sent, but this edit does not write `body`"
+    );
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.get.is_empty());
+    assert!(seen.update.is_empty());
 }
