@@ -1619,3 +1619,153 @@ async fn a_malformed_or_misplaced_digest_is_refused_before_anything_is_read() {
     assert!(seen.get.is_empty());
     assert!(seen.update.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The title bound: 128 Unicode scalar values (yaadgaar #396).
+// ---------------------------------------------------------------------------
+
+/// `n` copies of a TWO-BYTE character. A byte cap of 128 would refuse a title
+/// of 65 of these; the bound counts code points, so 128 of them (256 bytes)
+/// must pass. The number is spelled as a literal at every call site (ADR-0573).
+fn persian(n: usize) -> String {
+    "ی".repeat(n)
+}
+
+fn a_create(title: String) -> api::CreateTaskRequest {
+    api::CreateTaskRequest {
+        title,
+        ..Default::default()
+    }
+}
+
+fn a_store_that_creates() -> MockDb {
+    MockDb {
+        create: Some(Ok(db::CreateTaskResponse {
+            meta: Some(store_meta()),
+            number: 4711,
+        })),
+        ..Default::default()
+    }
+}
+
+/// 129 code points is refused, and the store never sees it.
+#[tokio::test]
+async fn a_title_over_128_code_points_is_refused_on_create_before_the_store_is_touched() {
+    let (svc, seen) = wire(MockDb::default()).await;
+
+    for title in ["x".repeat(129), persian(129)] {
+        let status = svc
+            .create_task(Request::new(a_create(title)))
+            .await
+            .expect_err("129 code points is over the bound");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "a task title is at most 128 characters (Unicode code points); this one has 129. \
+             Put the detail in the body"
+        );
+    }
+    assert!(seen.lock().unwrap().create.is_empty());
+}
+
+/// Exactly 128 code points is accepted, in one-byte and in two-byte text —
+/// the second is what proves the unit is not the byte.
+#[tokio::test]
+async fn a_title_of_exactly_128_code_points_is_created_whatever_its_byte_length() {
+    let (svc, seen) = wire(a_store_that_creates()).await;
+
+    for title in ["x".repeat(128), persian(128)] {
+        svc.create_task(Request::new(a_create(title.clone())))
+            .await
+            .unwrap_or_else(|e| panic!("128 code points is within the bound: {e}"));
+        let sent = seen.lock().unwrap().create.last().cloned().expect("sent");
+        assert_eq!(sent.task.expect("a create carries a task").title, title);
+    }
+}
+
+/// An edit that WRITES a title is held to the bound, before anything is read.
+#[tokio::test]
+async fn an_edit_writing_a_title_over_128_code_points_is_refused_before_anything_is_read() {
+    let (svc, seen) = wire(MockDb::default()).await;
+
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            title: "x".repeat(129),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["title".to_string()],
+            }),
+            ..an_edit()
+        }))
+        .await
+        .expect_err("129 code points is over the bound");
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(seen.lock().unwrap().get.is_empty());
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// **A ROW WRITTEN BEFORE THE BOUND STAYS USABLE.** Its stored title is over
+/// 128, and an edit that writes only the body must still apply: the bound
+/// judges the title a caller SENDS, never one it left alone. The stored title
+/// is carried back unchanged, for the rollout reason `edit_request` documents.
+#[tokio::test]
+async fn a_body_only_edit_of_a_task_whose_stored_title_is_over_the_bound_still_applies() {
+    let long = "y".repeat(207);
+    let (svc, seen) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(db::Task {
+                title: long.clone(),
+                ..a_stored_task(db::TaskStatus::Open as i32)
+            }),
+        })),
+        update: Some(Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+            previous_status: db::TaskStatus::Open as i32,
+        })),
+        ..Default::default()
+    })
+    .await;
+
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        title: String::new(),
+        body: "a new body".into(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["body".to_string()],
+        }),
+        ..an_edit()
+    }))
+    .await
+    .expect("a body-only edit never judges the stored title");
+
+    let sent = seen.lock().unwrap().update[0].clone();
+    assert_eq!(sent.task.expect("an edit carries a task").title, long);
+}
+
+/// A read returns an over-long stored title as it is: the bound is never
+/// applied to what the store already holds.
+#[tokio::test]
+async fn a_read_returns_a_stored_title_over_the_bound_unchanged() {
+    let long = "y".repeat(207);
+    let (svc, _) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(db::Task {
+                title: long.clone(),
+                ..a_stored_task(db::TaskStatus::Open as i32)
+            }),
+        })),
+        ..Default::default()
+    })
+    .await;
+
+    let task = svc
+        .read_task(Request::new(api::ReadTaskRequest {
+            scope: None,
+            key: Some(api::read_task_request::Key::Id(CALLER_ID.into())),
+        }))
+        .await
+        .expect("a read is never refused for a title's length")
+        .into_inner()
+        .task
+        .expect("the task");
+    assert_eq!(task.title, long);
+}

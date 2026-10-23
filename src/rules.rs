@@ -86,3 +86,28 @@ pub enum TransitionError {
     #[error("a transition must name a target status; TASK_STATUS_UNSPECIFIED is not one")]
     Unspecified,
 }
+
+/// The longest title a write may store, in Unicode scalar values (code points).
+///
+/// THE UNIT IS THE CODE POINT, as `yadgar.task.v1.Task.title` states: it is
+/// what `str::chars().count()`, MariaDB `CHAR_LENGTH` over utf8mb4 and JSON
+/// Schema `maxLength` all count, so the bound means one thing at every layer.
+/// 128 = 2^7 (yaadgaar #396).
+pub const TITLE_MAX: usize = 128;
+
+/// A title a write is about to store, held to [`TITLE_MAX`].
+///
+/// Applied to a title the caller SENDS — on create, and on an edit whose mask
+/// writes `title` — and never to one already stored. Rows written before the
+/// bound existed can be longer, and a body-only edit or a read of one must
+/// still work.
+pub fn title_fits(title: &str) -> Result<(), String> {
+    let count = title.chars().count();
+    if count > TITLE_MAX {
+        return Err(format!(
+            "a task title is at most {TITLE_MAX} characters (Unicode code points); this one \
+             has {count}. Put the detail in the body"
+        ));
+    }
+    Ok(())
+}

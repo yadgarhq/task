@@ -15,7 +15,7 @@ use super::{passthrough, tel_scope, Task};
 use crate::pb::yadgar::task::v1 as db;
 use crate::pb::yadgar::taskapi::v1 as api;
 use crate::pb::yadgar::taskapi::v1::task_service_server::TaskService;
-use crate::writes;
+use crate::{rules, writes};
 
 #[tonic::async_trait]
 impl TaskService for Task {
@@ -40,6 +40,7 @@ impl TaskService for Task {
                     // the humans who have to triage it. The column would happily take it.
                     return Err(Status::invalid_argument("a task needs a title"));
                 }
+                rules::title_fits(&req.title).map_err(Status::invalid_argument)?;
 
                 let created = self
                     .db
@@ -215,6 +216,10 @@ impl TaskService for Task {
                 // actually at stake.
                 if paths.contains(&"title") && req.title.trim().is_empty() {
                     return Err(Status::invalid_argument("a task needs a title"));
+                }
+                // The bound, on the same condition: only a title being written.
+                if paths.contains(&"title") {
+                    rules::title_fits(&req.title).map_err(Status::invalid_argument)?;
                 }
 
                 // The read is kept for what it actually provides: NOT_FOUND for a
