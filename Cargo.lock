@@ -2058,6 +2058,7 @@ dependencies = [
  "prost-types",
  "rcgen",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-stream",

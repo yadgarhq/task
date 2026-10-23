@@ -28,6 +28,8 @@ fn an_edit(mask: Option<Vec<&str>>) -> api::EditTaskRequest {
         update_mask: mask.map(|paths| FieldMask {
             paths: paths.into_iter().map(String::from).collect(),
         }),
+        number: 0,
+        expect_body_sha256: Vec::new(),
     }
 }
 
@@ -186,6 +188,7 @@ fn a_transition_names_the_status_alone() {
             id: "yadgar:task:x".into(),
             expect_version: 1,
             to: db::TaskStatus::Done as i32,
+            number: 0,
         },
         &current,
         db::TaskStatus::Done,

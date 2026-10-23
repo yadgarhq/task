@@ -200,6 +200,10 @@ impl TaskService for Task {
                 // no edit may write is refused here rather than after a `get_task`
                 // round trip whose answer was always going to be discarded.
                 let paths = writes::requested_paths(req.update_mask.as_ref())?;
+                // The key and the body digest are decisions about the request
+                // alone too, so they are settled before the read as well.
+                let key = writes::target_key(&req.id, req.number)?;
+                writes::check_body_digest(&req, &paths)?;
 
                 // THE TITLE RULE, and it applies only to an edit that WRITES a
                 // title. It used to run before the mask was resolved, which made a
@@ -225,7 +229,7 @@ impl TaskService for Task {
                     .clone()
                     .get_task(db::GetTaskRequest {
                         scope: req.scope.clone(),
-                        key: Some(db::get_task_request::Key::Id(req.id.clone())),
+                        key: Some(key),
                     })
                     .await
                     .map_err(|e| passthrough(e, "edit-read"))?
