@@ -201,9 +201,13 @@ impl TaskService for Task {
                 // no edit may write is refused here rather than after a `get_task`
                 // round trip whose answer was always going to be discarded.
                 let paths = writes::requested_paths(req.update_mask.as_ref())?;
-                // The key and the body digest are decisions about the request
-                // alone too, so they are settled before the read as well.
+                // The key, the patch's shape and the body digest are decisions
+                // about the request alone too, so they are settled before the
+                // read as well. In patch mode the digest is over the PRE-edit
+                // body, so only its length is settled here; `writes::patched`
+                // compares it after the read (ADR-1008).
                 let key = writes::target_key(&req.id, req.number)?;
+                writes::check_patch(&req, &paths)?;
                 writes::check_body_digest(&req, &paths)?;
 
                 // THE TITLE RULE, and it applies only to an edit that WRITES a
@@ -241,6 +245,10 @@ impl TaskService for Task {
                     .into_inner()
                     .task
                     .ok_or_else(|| Status::not_found("no such task in this scope"))?;
+
+                // A patch becomes a whole-body edit here, against the body
+                // just read (ADR-1008); any other edit passes through as sent.
+                let (req, paths) = writes::patched(req, &current, &paths)?;
 
                 let updated = self
                     .db
