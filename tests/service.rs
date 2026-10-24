@@ -697,6 +697,7 @@ fn an_edit() -> api::EditTaskRequest {
         update_mask: None,
         number: 0,
         expect_body_sha256: Vec::new(),
+        patch: None,
     }
 }
 
@@ -1768,4 +1769,422 @@ async fn a_read_returns_a_stored_title_over_the_bound_unchanged() {
         .task
         .expect("the task");
     assert_eq!(task.title, long);
+}
+
+// ---------------------------------------------------------------------------
+// Patch mode: a literal search-and-replace over the stored body (ADR-1008,
+// yaadgaar #399).
+// ---------------------------------------------------------------------------
+
+/// The SHA-256 of `a_stored_task`'s body, spelled as a literal (ADR-0573):
+/// `printf 'the stored body' | sha256sum`.
+const STORED_BODY_SHA256: &str = "d203ab53d71fe2e43a80aca03bd1ca66b209e8deb7706ce570e42bbd7bc306df";
+
+/// A store whose task holds `body`, and that accepts the write.
+fn a_store_whose_body_is(body: &str) -> MockDb {
+    let mut task = a_stored_task(db::TaskStatus::Open as i32);
+    task.body = body.into();
+    MockDb {
+        get: Some(Ok(db::GetTaskResponse { task: Some(task) })),
+        ..a_store_holding_it()
+    }
+}
+
+fn a_patch(old: &str, new: &str, expect_count: u32) -> api::EditTaskRequest {
+    api::EditTaskRequest {
+        title: String::new(),
+        body: String::new(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["patch".to_string()],
+        }),
+        patch: Some(api::BodyPatch {
+            old: old.into(),
+            new: new.into(),
+            expect_count,
+        }),
+        ..an_edit()
+    }
+}
+
+/// What the edit wrote: the body, and the mask it named.
+fn written(seen: &Arc<Mutex<Recorded>>) -> (String, Vec<String>) {
+    let sent = seen.lock().unwrap().update[0].clone();
+    (
+        sent.task.expect("an edit carries a task").body,
+        sent.update_mask.expect("an edit is masked").paths,
+    )
+}
+
+/// THE CASE THE MODE EXISTS FOR: one sentence changed, the rest of the body
+/// kept, and the store is asked to write `body` — never `patch`, which is no
+/// column — as a whole body this service computed.
+#[tokio::test]
+async fn a_patch_replaces_every_occurrence_and_writes_the_result_as_a_body() {
+    let (svc, seen) = wire(a_store_whose_body_is("a cat and a cat, not a dog")).await;
+
+    svc.edit_task(Request::new(a_patch("cat", "fox", 2)))
+        .await
+        .expect("`cat` occurs twice, as the caller said");
+
+    let (body, mask) = written(&seen);
+    assert_eq!(body, "a fox and a fox, not a dog");
+    assert_eq!(mask, ["body"]);
+}
+
+/// A patch and a title in one edit: the title is the caller's, the body is the
+/// patched one, and both are named.
+#[tokio::test]
+async fn a_patch_may_travel_with_a_title() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        title: "a new title".into(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["title".to_string(), "patch".to_string()],
+        }),
+        ..a_patch("stored", "patched", 1)
+    }))
+    .await
+    .expect("a title and a patch are not exclusive");
+
+    let sent = seen.lock().unwrap().update[0].clone();
+    let task = sent.task.unwrap();
+    assert_eq!(task.title, "a new title");
+    assert_eq!(task.body, "the patched body");
+    assert_eq!(sent.update_mask.unwrap().paths, ["title", "body"]);
+}
+
+/// RED CASE: `old` absent from the body. FAILED_PRECONDITION, because the
+/// answer depends on what is stored; the message starts with the reason token
+/// and says what was found; nothing is written.
+#[tokio::test]
+async fn a_patch_whose_old_does_not_occur_is_a_failed_precondition_and_writes_nothing() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    let status = svc
+        .edit_task(Request::new(a_patch("absent", "x", 1)))
+        .await
+        .expect_err("`absent` does not occur in the stored body");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "PATCH_COUNT_MISMATCH: `old` occurs 0 times in the stored body, not the 1 \
+         expect_count names; nothing was written. Re-read the task"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// RED CASE: more occurrences than the caller expects, and fewer.
+#[tokio::test]
+async fn a_patch_whose_count_differs_from_expect_count_is_refused_both_ways() {
+    let (svc, seen) = wire(a_store_whose_body_is("x x x")).await;
+
+    for (expect, found) in [(2u32, 3u32), (4, 3)] {
+        let status = svc
+            .edit_task(Request::new(a_patch("x", "y", expect)))
+            .await
+            .expect_err("the count is 3");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(
+            status
+                .message()
+                .starts_with(&format!("PATCH_COUNT_MISMATCH: `old` occurs {found} times")),
+            "{}",
+            status.message()
+        );
+    }
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// OVERLAP IS DEFINED, NOT LEFT TO CHANCE: occurrences are counted
+/// non-overlapping, left to right. In "aaaa", "aa" occurs TWICE (0..2, 2..4),
+/// not three times; in "aaa" once, at the start, and the tail is kept.
+#[tokio::test]
+async fn overlapping_occurrences_count_non_overlapping_left_to_right() {
+    let (svc, seen) = wire(a_store_whose_body_is("aaaa")).await;
+    let three = svc
+        .edit_task(Request::new(a_patch("aa", "b", 3)))
+        .await
+        .expect_err("three overlapping matches are not three occurrences");
+    assert!(three
+        .message()
+        .starts_with("PATCH_COUNT_MISMATCH: `old` occurs 2 times"));
+    svc.edit_task(Request::new(a_patch("aa", "b", 2)))
+        .await
+        .expect("two non-overlapping occurrences");
+    assert_eq!(written(&seen).0, "bb");
+
+    let (svc, seen) = wire(a_store_whose_body_is("aaa")).await;
+    svc.edit_task(Request::new(a_patch("aa", "b", 1)))
+        .await
+        .expect("one occurrence, at the start");
+    assert_eq!(written(&seen).0, "ba");
+}
+
+/// MULTI-BYTE TEXT: the match is literal over UTF-8 bytes, so a Persian word
+/// is replaced whole and its neighbours keep every byte; and there is NO
+/// normalisation, so a precomposed `é` (U+00E9) does not match `e` followed by
+/// a combining acute (U+0065 U+0301), although both render alike.
+#[tokio::test]
+async fn a_patch_matches_multi_byte_text_literally_and_without_normalisation() {
+    let (svc, seen) = wire(a_store_whose_body_is("یادگار — café — 🦀")).await;
+    svc.edit_task(Request::new(a_patch("یادگار", "yadgar", 1)))
+        .await
+        .expect("the Persian word occurs once");
+    assert_eq!(written(&seen).0, "yadgar — café — 🦀");
+
+    let (svc, seen) = wire(a_store_whose_body_is("caf\u{e9}")).await;
+    let status = svc
+        .edit_task(Request::new(a_patch("e\u{301}", "e", 1)))
+        .await
+        .expect_err("a decomposed é is not the precomposed one");
+    assert!(status
+        .message()
+        .starts_with("PATCH_COUNT_MISMATCH: `old` occurs 0 times"));
+
+    // A four-byte character replaced by another, around a two-byte one.
+    let (svc, seen2) = wire(a_store_whose_body_is("🦀é🦀")).await;
+    svc.edit_task(Request::new(a_patch("🦀", "🐍", 2)))
+        .await
+        .expect("two crabs");
+    assert_eq!(written(&seen2).0, "🐍é🐍");
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// RED CASES decided about the request alone, so none of them costs a read:
+/// an empty `old`, an `expect_count` of 0, and `old` or `new` over 65536
+/// bytes. The bound counts BYTES: 32768 two-byte characters fit, 32769 do not.
+#[tokio::test]
+async fn a_malformed_patch_is_refused_before_anything_is_read() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    let refused = |req: api::EditTaskRequest| {
+        let svc = &svc;
+        async move {
+            svc.edit_task(Request::new(req))
+                .await
+                .expect_err("a malformed patch")
+        }
+    };
+
+    let empty = refused(a_patch("", "x", 1)).await;
+    assert_eq!(empty.code(), Code::InvalidArgument);
+    assert_eq!(empty.message(), "a patch's `old` must not be empty");
+
+    let zero = refused(a_patch("stored", "x", 0)).await;
+    assert_eq!(zero.code(), Code::InvalidArgument);
+    assert_eq!(
+        zero.message(),
+        "a patch's `expect_count` must be at least 1"
+    );
+
+    let big_old = refused(a_patch(&persian(32769), "x", 1)).await;
+    assert_eq!(big_old.code(), Code::InvalidArgument);
+    assert_eq!(
+        big_old.message(),
+        "a patch's `old` is at most 65536 bytes; this one has 65538"
+    );
+    let big_new = refused(a_patch("stored", &"n".repeat(65537), 1)).await;
+    assert_eq!(big_new.code(), Code::InvalidArgument);
+    assert_eq!(
+        big_new.message(),
+        "a patch's `new` is at most 65536 bytes; this one has 65537"
+    );
+
+    assert!(
+        seen.lock().unwrap().get.is_empty(),
+        "a malformed patch cost a read"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// Exactly 65536 bytes on each side is inside the bound.
+#[tokio::test]
+async fn a_patch_of_exactly_65536_bytes_a_side_is_applied() {
+    let old = persian(32768);
+    let (svc, seen) = wire(a_store_whose_body_is(&old)).await;
+    svc.edit_task(Request::new(a_patch(&old, &"n".repeat(65536), 1)))
+        .await
+        .expect("65536 bytes is the bound, not over it");
+    assert_eq!(written(&seen).0.len(), 65536);
+}
+
+/// RED CASE: a result over 1048576 bytes, the largest request the gateway
+/// accepts, is refused after the read: its size depends on the stored body.
+#[tokio::test]
+async fn a_patch_whose_result_is_over_one_mebibyte_is_refused() {
+    // 17 occurrences of a one-byte `old`, each grown to 65536 bytes: 1114112.
+    let (svc, seen) = wire(a_store_whose_body_is(&"x".repeat(17))).await;
+    let status = svc
+        .edit_task(Request::new(a_patch("x", &"n".repeat(65536), 17)))
+        .await
+        .expect_err("the result would be 1114112 bytes");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "PATCH_RESULT_TOO_LARGE: the patched body would be 1114112 bytes; a body is \
+         at most 1048576. Nothing was written"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+
+    // 16 of them is exactly 1048576 and fits.
+    let (svc, seen) = wire(a_store_whose_body_is(&"x".repeat(16))).await;
+    svc.edit_task(Request::new(a_patch("x", &"n".repeat(65536), 16)))
+        .await
+        .expect("1048576 bytes is the bound");
+    assert_eq!(written(&seen).0.len(), 1_048_576);
+}
+
+/// IN PATCH MODE THE DIGEST IS OVER THE PRE-EDIT BODY (ADR-1008): the stored
+/// body's digest admits the patch, and any other is a FAILED_PRECONDITION that
+/// writes nothing — including the digest of the RESULT, which a caller who
+/// misread the rule would send.
+#[tokio::test]
+async fn a_patch_checks_expect_body_sha256_against_the_pre_edit_body() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        expect_body_sha256: digest(STORED_BODY_SHA256),
+        ..a_patch("stored", "patched", 1)
+    }))
+    .await
+    .expect("the digest is the stored body's");
+    assert_eq!(written(&seen).0, "the patched body");
+
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    // `printf 'the patched body' | sha256sum`: the result, not the pre-edit body.
+    let result_sha = "a676e8c17b2ae2e14381e0f657dcf7b7800291c15e8e2d3904bd17557b1ae4c3";
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            expect_body_sha256: digest(result_sha),
+            ..a_patch("stored", "patched", 1)
+        }))
+        .await
+        .expect_err("a digest that is not the stored body's");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "BODY_SHA256_MISMATCH: the stored body does not match expect_body_sha256, so \
+         it is not the body you read; nothing was written. Re-read the task"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+
+    // A digest of the wrong length is still refused before the read.
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let short = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            expect_body_sha256: vec![0u8; 31],
+            ..a_patch("stored", "patched", 1)
+        }))
+        .await
+        .expect_err("31 bytes is not a digest");
+    assert_eq!(short.code(), Code::InvalidArgument);
+    assert!(seen.lock().unwrap().get.is_empty());
+}
+
+/// `patch` and `body` are mutually exclusive, and the mask and the message
+/// must agree. Each disagreement is refused before the read.
+#[tokio::test]
+async fn a_patch_and_its_mask_must_agree_and_exclude_body() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let mask = |paths: &[&str]| {
+        Some(prost_types::FieldMask {
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+        })
+    };
+    let cases = [
+        (
+            api::EditTaskRequest {
+                update_mask: mask(&["body", "patch"]),
+                ..a_patch("stored", "x", 1)
+            },
+            "`patch` and `body` are mutually exclusive; send one",
+        ),
+        (
+            // An empty mask means "every editable field", body included.
+            api::EditTaskRequest {
+                update_mask: None,
+                ..a_patch("stored", "x", 1)
+            },
+            "a patch was sent, but the mask does not name `patch`",
+        ),
+        (
+            api::EditTaskRequest {
+                update_mask: mask(&["body"]),
+                ..a_patch("stored", "x", 1)
+            },
+            "a patch was sent, but the mask does not name `patch`",
+        ),
+        (
+            api::EditTaskRequest {
+                patch: None,
+                ..a_patch("stored", "x", 1)
+            },
+            "the mask names `patch`, but no patch was sent",
+        ),
+    ];
+    for (req, message) in cases {
+        let status = svc.edit_task(Request::new(req)).await.expect_err(message);
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), message);
+    }
+    assert!(seen.lock().unwrap().get.is_empty());
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// MEMORY BOUND: the result's size is decided BEFORE it is built. A 1 MiB
+/// body of one-byte occurrences, each to grow to 64 KiB, would build a 64 GiB
+/// string if the replacement ran first. The refusal must come from arithmetic
+/// alone, so this returns at once rather than exhausting memory.
+#[tokio::test]
+async fn a_patch_whose_result_would_be_huge_is_refused_without_building_it() {
+    let (svc, seen) = wire(a_store_whose_body_is(&"x".repeat(1_048_576))).await;
+    let status = svc
+        .edit_task(Request::new(a_patch("x", &"n".repeat(65536), 1_048_576)))
+        .await
+        .expect_err("the result would be 68719476736 bytes");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "PATCH_RESULT_TOO_LARGE: the patched body would be 68719476736 bytes; a body is \
+         at most 1048576. Nothing was written"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// LOST UPDATE: a patch is computed on the body READ, so the read must be the
+/// version the caller expects. Otherwise a caller sending `expect_version`
+/// read+1 has its patch computed on the older body, and the store's
+/// compare-and-set passes if another writer lands that version in between.
+///
+/// The message carries NO reason token: ADR-1008 lists the tokens a patch
+/// refusal may start with on `EditTaskRequest.patch`, and a stale version is
+/// not one of them, as it is not in whole-body mode either.
+#[tokio::test]
+async fn a_patch_whose_expect_version_is_not_the_version_read_is_refused() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            expect_version: 4,
+            ..a_patch("stored", "patched", 1)
+        }))
+        .await
+        .expect_err("the read is at version 3");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "the task is at version 3, not the expect_version 4 this patch names; nothing \
+         was written. Re-read the task"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// The compare half of the store's compare-and-set is the CALLER'S version,
+/// carried unchanged through the patch.
+#[tokio::test]
+async fn a_patch_sends_the_callers_expect_version_to_the_store() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    svc.edit_task(Request::new(a_patch("stored", "patched", 1)))
+        .await
+        .expect("a matching patch");
+    assert_eq!(seen.lock().unwrap().update[0].expect_version, 3);
 }
