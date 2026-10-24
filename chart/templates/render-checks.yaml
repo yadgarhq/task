@@ -294,3 +294,70 @@ counts as unnamed — the mount's gate is its truthiness.
       .Values.tls.clientAuth) }}
 {{- end }}
 {{- end }}
+
+
+
+{{/*
+THE SHAPE OF `server.limits`, AND THE ONE RULE THE SCHEMA CANNOT STATE (ADR-1006;
+yaadgaar #218).
+
+`values.schema.json` bounds each of the four limits to the range `yadgar-lifecycle`
+enforces, types it `integer` and makes it `required`. Two things it cannot see:
+
+  - `server` or `server.limits` itself, deleted. This chart's `values.yaml` declares
+    the block, so an override of `server: null` DELETES it (helm deletes a null-valued
+    key a chart in the tree declares and restores no default), and a schema whose every
+    constraint sits under `server.limits` has nothing left to check. The ADR-0794 idiom
+    (`hasKey`, then `kindIs "map"`) refuses it here with a sentence naming the key,
+    before the template reads a leaf of it.
+  - A RULE BETWEEN TWO KEYS. `keepaliveTimeoutSeconds` must be strictly below
+    `keepaliveIntervalSeconds`, or the next keepalive PING goes out before the last one
+    could be judged lost. The binary refuses the same pair at boot
+    (`ServerLimitsError::KeepaliveTimeoutNotBelowInterval`); refusing it here means the
+    mistake is found at render, before a pod crash-loops on it.
+
+BOTH SIDES OF THE COMPARE ARE CAST WITH `int64`. A values-file number reaches the
+template as a float64 and a `--set` one as an int64, and Go templates refuse to
+compare the two kinds rather than converting. Connection age (ADR-1006, 30 min) is
+omitted until tonic#2780 ships; yaadgaar #417.
+
+The shape and sentences follow iam-db's copy of this block (iam-db#102).
+
+Not counted by `scripts/tests/test_render_checks.py`'s `EXPECTED_RENDER_CHECKS`: that
+count is the number of API-group capability checks, and these are value checks like
+the `tls.clientAuth` ones above.
+*/}}
+{{- if not (hasKey .Values "server") }}
+{{- fail (join "" (list
+      "task: `server` is absent from the values. It holds `server.limits`, the four "
+      "listener limits the binary refuses to boot without (ADR-1006). Helm deletes a "
+      "null-valued key that a chart in the tree declares, and restores no default. Write "
+      "the keys you mean, or omit `server` entirely and this chart's own defaults apply.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.server) }}
+{{- fail (printf (join "" (list
+      "task: `server` must be a map holding `limits` and is %s (%s). Omit it to take this "
+      "chart's defaults."))
+      (kindOf .Values.server) (toJson .Values.server)) }}
+{{- end }}
+{{- if not (hasKey .Values.server "limits") }}
+{{- fail (join "" (list
+      "task: `server.limits` is absent. The binary refuses to boot without its four "
+      "values (ADR-1006). Write the keys you mean, or omit `server` entirely and this "
+      "chart's own defaults apply.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.server.limits) }}
+{{- fail (printf (join "" (list
+      "task: `server.limits` must be a map and is %s (%s). Omit it to take this chart's "
+      "defaults."))
+      (kindOf .Values.server.limits) (toJson .Values.server.limits)) }}
+{{- end }}
+{{- if ge (int64 .Values.server.limits.keepaliveTimeoutSeconds) (int64 .Values.server.limits.keepaliveIntervalSeconds) }}
+{{- fail (printf (join "" (list
+      "task: `server.limits.keepaliveTimeoutSeconds` (%v) is not below "
+      "`server.limits.keepaliveIntervalSeconds` (%v). The next keepalive PING would be sent "
+      "before the last one could be judged lost, and task refuses to boot this way "
+      "(ADR-1006). Lower the timeout or raise the interval."))
+      (int64 .Values.server.limits.keepaliveTimeoutSeconds)
+      (int64 .Values.server.limits.keepaliveIntervalSeconds)) }}
+{{- end }}

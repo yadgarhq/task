@@ -94,10 +94,15 @@ fn values_default() -> u64 {
         .unwrap_or_else(|why| panic!("`{}` is not an integer: {why}", found[0]))
 }
 
+/// ADR-1006: the timeout chain shrinks inward, so this hop's default is 14 —
+/// below the gateway's 16 for its hop to task, above task-db's 12 s pool
+/// acquire, and exactly dial's floor. Neither neighbour's value is visible from
+/// this repository; the parent chart (`yadgarhq/yadgar`) is where a cross-chart
+/// check can compare them (ledger 1524).
 #[test]
-fn the_chart_default_is_30_and_inside_the_bounds() {
+fn the_chart_default_is_14_and_inside_the_bounds() {
     let default = values_default();
-    assert_eq!(default, 30, "the ruled default (ADR-0925 Q-C4) moved");
+    assert_eq!(default, 14, "the ruled default (ADR-1006) moved");
     assert!(
         (yadgar_dial::min_request_timeout().as_secs()
             ..=yadgar_dial::max_request_timeout().as_secs())
@@ -105,9 +110,14 @@ fn the_chart_default_is_30_and_inside_the_bounds() {
         "the chart default is outside the range the binary accepts"
     );
     assert!(
-        default > 25,
-        "the request timeout must stay above the -db's pool acquire timeout (25s), or a request \
-         waiting on a pool slot is cut before the pool gives up"
+        default > 12,
+        "the request timeout must stay above the -db's pool acquire timeout (12s, ADR-1006), or \
+         a request waiting on a pool slot is cut before the pool gives up"
+    );
+    assert!(
+        default < 16,
+        "the request timeout must stay below the gateway's 16s for its hop to task (ADR-1006): \
+         each hop times out strictly before its caller"
     );
 }
 

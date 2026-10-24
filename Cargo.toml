@@ -42,7 +42,7 @@ tonic-prost = "0.14"
 # `ServerTls` now — the one implementation of server TLS and client-certificate
 # verification six servers adopt — so this repository's own copy is deleted.
 # Same tonic major and the same `tls-ring` provider this manifest names above.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.20", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.0", features = [
   "serve-tls",
 ] }
 # The shared instrumentation seam (D67). Pinned by release tag, like every other

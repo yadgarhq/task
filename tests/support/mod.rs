@@ -82,7 +82,14 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         // `chart/ci/values.yaml` states it.
         ("LISTEN_TLS_CLIENT_AUTH", "off"),
         ("TASK_DB_TLS_ENABLED", "0"),
-        ("TASK_DB_REQUEST_TIMEOUT_SECONDS", "30"),
+        ("TASK_DB_REQUEST_TIMEOUT_SECONDS", "14"),
+        // THE LISTENER'S PROTOCOL LIMITS (ADR-1006): required, no compiled-in
+        // default, at the `server.limits` defaults `chart/values.yaml` ships.
+        // Without them every case here would be a refused boot.
+        ("LISTEN_MAX_CONCURRENT_STREAMS", "256"),
+        ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
+        ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
+        ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
     ]
 }
 

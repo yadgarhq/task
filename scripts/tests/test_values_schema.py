@@ -112,14 +112,26 @@ OPEN_VALUES_PATHS = ("resources", "rollingUpdate")
 REQUIRED_NO_DEFAULT = ("tls.enabled", "taskDb.tls.enabled", "tls.clientAuth")
 BOOLEAN_SWITCHES = ("tls.enabled", "taskDb.tls.enabled")
 
-# THE ONE TYPED, BOUNDED, REQUIRED LEAF THAT DOES SHIP A DEFAULT (ADR-0925 Q-C1,
-# ledger 1490): `taskDb.requestTimeoutSeconds` is `type: integer` with a
-# `minimum` and `maximum`, and its parent lists it under `required`. Unlike
-# REQUIRED_NO_DEFAULT it IS in `chart/values.yaml` (an explicit 30, never
-# compiled in). The bounds are `yadgar_dial`'s `min_request_timeout()` and
+# THE TYPED, BOUNDED, REQUIRED LEAVES THAT DO SHIP A DEFAULT. Each is
+# `type: integer` with a `minimum` and `maximum`, and its parent lists it under
+# `required`. Unlike REQUIRED_NO_DEFAULT each IS in `chart/values.yaml` (an
+# explicit value, never compiled in).
+#
+# `taskDb.requestTimeoutSeconds` (ADR-0925 Q-C1, ledger 1490; default 14 under
+# ADR-1006): the bounds are `yadgar_dial`'s `min_request_timeout()` and
 # `max_request_timeout()`; `tests/chart_request_timeout.rs` holds them to the
 # pinned crate.
-REQUIRED_BOUNDED_INTEGER = {"taskDb.requestTimeoutSeconds": (14, 59)}
+#
+# `server.limits.*` (ADR-1006): the bounds are `yadgar_lifecycle`'s
+# `ServerLimits::*` ranges; `tests/chart_server_limits.rs` holds them to the
+# pinned crate.
+REQUIRED_BOUNDED_INTEGER = {
+    "taskDb.requestTimeoutSeconds": (14, 59),
+    "server.limits.maxConcurrentStreams": (1, 10000),
+    "server.limits.keepaliveIntervalSeconds": (1, 3600),
+    "server.limits.keepaliveTimeoutSeconds": (1, 600),
+    "server.limits.maxHeaderListBytes": (1024, 1048576),
+}
 
 
 def helm(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -882,3 +894,89 @@ def test_the_suite_reads_the_chart_this_repository_ships():
     assert CHART == REPO / "chart", CHART
     assert SCHEMA.exists(), SCHEMA
     assert yaml.safe_load((CHART / "Chart.yaml").read_text())["name"] == "task"
+
+
+# ── server.limits (ADR-1006) ─────────────────────────────────────────────────
+
+
+def env_value(rendered: str, name: str) -> str:
+    """The value the rendered Deployment gives `name`. PURE."""
+    docs = [d for d in yaml.safe_load_all(rendered) if d and d.get("kind") == "Deployment"]
+    assert len(docs) == 1, rendered
+    container = docs[0]["spec"]["template"]["spec"]["containers"][0]
+    values = [e["value"] for e in container["env"] if e["name"] == name]
+    assert len(values) == 1, f"{name} must be rendered exactly once"
+    return values[0]
+
+
+def test_the_limits_render_as_whole_numbers_at_the_top_of_their_range(tmp_path):
+    """helm hands a values-file number over as a float64, and `quote` alone
+    prints 1048576 as `1.048576e+06`, which the binary refuses as not a whole
+    number. The deployment renders each limit `| int64` so it does not."""
+    top = values_file(
+        tmp_path,
+        "top",
+        {"server": {"limits": {"maxHeaderListBytes": 1048576, "maxConcurrentStreams": 10000}}},
+    )
+    result = render("--values", top)
+    assert result.returncode == 0, result.stderr
+    assert env_value(result.stdout, "LISTEN_MAX_HEADER_LIST_BYTES") == "1048576"
+    assert env_value(result.stdout, "LISTEN_MAX_CONCURRENT_STREAMS") == "10000"
+
+
+def test_the_shipped_limits_render_into_their_variables():
+    result = render()
+    assert result.returncode == 0, result.stderr
+    for name, value in (
+        ("LISTEN_MAX_CONCURRENT_STREAMS", "256"),
+        ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
+        ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
+        ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+    ):
+        assert env_value(result.stdout, name) == value, name
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        # Equal, through a values file (float64 on both sides).
+        ("timeout-equal", {"server": {"limits": {"keepaliveTimeoutSeconds": 30}}}),
+        # Above, through --set (int64 against the default's float64).
+        ("set", "server.limits.keepaliveTimeoutSeconds=31"),
+    ],
+)
+def test_a_keepalive_timeout_not_below_the_interval_is_refused_by_name(tmp_path, arguments):
+    name, body = arguments
+    if isinstance(body, str):
+        result = render("--set", body)
+    else:
+        result = render("--values", values_file(tmp_path, name, body))
+    assert result.returncode != 0, result.stdout
+    assert "server.limits.keepaliveTimeoutSeconds" in result.stderr, result.stderr
+    assert "server.limits.keepaliveIntervalSeconds" in result.stderr, result.stderr
+
+
+def test_a_keepalive_timeout_below_the_interval_renders():
+    result = render("--set", "server.limits.keepaliveTimeoutSeconds=29")
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "body, named",
+    [
+        ("server: null\n", "`server` is absent"),
+        ('server: "x"\n', "`server` must be a map"),
+        ("server:\n  limits: null\n", "`server.limits` is absent"),
+        ("server:\n  limits: 5\n", "`server.limits` must be a map"),
+    ],
+)
+def test_a_null_or_scalar_limits_block_is_refused_naming_it_by_the_render_check(
+    tmp_path, body, named
+):
+    """`templates/deployment.yaml` guards its `$limits` read, so none of these
+    reaches a raw Go template error first; the render check names the key."""
+    result = render("--values", values_file(tmp_path, "shape", body))
+    assert result.returncode != 0, result.stdout
+    assert named in result.stderr, result.stderr
+    assert "nil pointer" not in result.stderr, result.stderr
+    assert "can't evaluate field" not in result.stderr, result.stderr

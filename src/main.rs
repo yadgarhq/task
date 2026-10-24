@@ -178,7 +178,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The client CA is read and parsed here too when `LISTEN_TLS_CLIENT_AUTH`
     // verifies (B-U5), so an empty or non-PEM bundle refuses now, naming it.
     let tls = serve::from_env().map_err(|e| refusal(&e))?;
-    let server = serve::builder(tls.as_ref()).map_err(|e| refusal(&e))?;
+    // ADR-1006: the four `LISTEN_*` protocol limits, required with no default.
+    let limits = serve::limits_from_env().map_err(|e| refusal(&e))?;
+    let server = serve::builder(tls.as_ref(), &limits).map_err(|e| refusal(&e))?;
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
