@@ -194,7 +194,8 @@ spec:
               value: {{ .Values.taskDb.port | quote }}
             # NO COMPILED-IN DEFAULT (ADR-0569, ADR-0925 Q-C1): the binary refuses
             # an unset value, so this renders from `taskDb.requestTimeoutSeconds`
-            # unconditionally. Bounded 14..=59 in `values.schema.json`.
+            # unconditionally. Bounded 14..=59 in `values.schema.json`; default 14
+            # (ADR-1006: below the gateway's 16 for this hop).
             - name: TASK_DB_REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.taskDb.requestTimeoutSeconds | quote }}
             # STATED HERE BECAUSE THE BINARY NO LONGER CARRIES A DEFAULT
@@ -206,6 +207,23 @@ spec:
               value: "0.0.0.0:50052"
             - name: METRICS_LISTEN
               value: "0.0.0.0:9090"
+            # THE LISTENER'S PROTOCOL LIMITS (ADR-1006), from `server.limits`.
+            # No compiled-in default (ADR-0569): rendered unconditionally, and
+            # the binary refuses an absent one. `$limits` is guarded so a
+            # nulled block reaches the named refusal in `render-checks.yaml`
+            # rather than a raw nil-pointer error. `| int64` because helm hands
+            # a values-file number over as a float64, and `quote` alone prints
+            # 1048576 as `1.048576e+06`, which the binary refuses. Connection
+            # age (ADR-1006) is omitted until tonic#2780 ships; yaadgaar #417.
+            {{- $limits := (and (kindIs "map" .Values.server) (kindIs "map" .Values.server.limits) .Values.server.limits) | default dict }}
+            - name: LISTEN_MAX_CONCURRENT_STREAMS
+              value: {{ $limits.maxConcurrentStreams | int64 | quote }}
+            - name: LISTEN_KEEPALIVE_INTERVAL_SECS
+              value: {{ $limits.keepaliveIntervalSeconds | int64 | quote }}
+            - name: LISTEN_KEEPALIVE_TIMEOUT_SECS
+              value: {{ $limits.keepaliveTimeoutSeconds | int64 | quote }}
+            - name: LISTEN_MAX_HEADER_LIST_BYTES
+              value: {{ $limits.maxHeaderListBytes | int64 | quote }}
             # THE HOP TO task-db, which LISTEN_TLS_ENABLED below says nothing
             # about: that one describes this pod's own listener.
             #

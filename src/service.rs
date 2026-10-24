@@ -37,7 +37,7 @@ mod handlers;
 ///
 /// An absent scope yields empty strings rather than an error: the call is refused
 /// on its own merits with INVALID_ARGUMENT, and telemetry must never be the thing
-/// that fails a request (D25).
+/// that fails a request (D67).
 fn tel_scope(
     scope: Option<&crate::pb::yadgar::common::v1::Scope>,
 ) -> yadgar_telemetry::observe::Scope {

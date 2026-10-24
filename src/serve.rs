@@ -43,13 +43,41 @@
 
 use tonic::transport::Server;
 
-pub use yadgar_lifecycle::serve_tls::{ClientAuth, ServeTlsError, ServerTls, LISTEN};
+pub use yadgar_lifecycle::serve_tls::{
+    ClientAuth, ServeTlsError, ServerLimits, ServerLimitsError, ServerTls, LISTEN,
+};
 
 /// The chart values block the listener's keys render from: `tls.enabled`,
 /// `tls.clientAuth`, `tls.certSecret` and `tls.clientCaSecret` in
 /// `chart/values.yaml`. Every refusal names `<CHART_KEY>.<leaf>`, which is the
 /// value an operator reading a crash loop edits.
 pub const CHART_KEY: &str = "tls";
+
+/// The chart values block the listener's protocol limits render from (ADR-1006):
+/// `server.limits.maxConcurrentStreams`, `.keepaliveIntervalSeconds`,
+/// `.keepaliveTimeoutSeconds` and `.maxHeaderListBytes` in
+/// `chart/values.yaml`. Connection age (ADR-1006) is omitted until tonic#2780
+/// ships; yaadgaar #417. Every refusal names
+/// `<LIMITS_CHART_KEY>.<leaf>` beside the `LISTEN_*` variable.
+pub const LIMITS_CHART_KEY: &str = "server.limits";
+
+/// Read the listener's protocol limits from the process environment.
+///
+/// **NO COMPILED-IN DEFAULT (ADR-1006, ADR-0569).** Each of the four
+/// `LISTEN_*` limits is required, and an absent, non-numeric or out-of-range
+/// value refuses the boot naming the variable and the chart value. The
+/// defaults live in the chart; the RANGES are `yadgar-lifecycle`'s.
+pub fn limits_from_env() -> Result<ServerLimits, ServerLimitsError> {
+    ServerLimits::from_env(LISTEN, LIMITS_CHART_KEY)
+}
+
+/// The same decision, over an injected lookup, for the reason
+/// [`from_lookup`] gives.
+pub fn limits_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ServerLimits, ServerLimitsError> {
+    ServerLimits::from_lookup(LISTEN, LIMITS_CHART_KEY, lookup)
+}
 
 /// Read the listener's configuration from the process environment.
 ///
@@ -81,8 +109,11 @@ pub fn from_lookup(
 /// acceptor's protocol list; the handshake tests in `tests/serve_tls.rs` fail
 /// if it ever stops being offered, because tonic's own client refuses a
 /// channel whose negotiated protocol is not `h2`.
-pub fn builder(tls: Option<&ServerTls>) -> Result<Server, ServeTlsError> {
-    yadgar_lifecycle::serve_tls::server(tls)
+///
+/// **`limits` APPLY TO BOTH TRANSPORTS.** `yadgar-lifecycle` sets them in one
+/// place for the TLS and the cleartext builder alike, so they cannot diverge.
+pub fn builder(tls: Option<&ServerTls>, limits: &ServerLimits) -> Result<Server, ServeTlsError> {
+    yadgar_lifecycle::serve_tls::server(tls, limits)
 }
 
 #[cfg(test)]

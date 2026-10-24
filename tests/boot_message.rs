@@ -16,9 +16,8 @@ mod support;
 
 use std::net::TcpListener;
 use std::process::Command;
-use std::time::Duration;
 
-use support::{cleartext_env, run_to_exit, Booted, BIN};
+use support::{cleartext_env, run_to_exit, Booted, BIN, MARGIN};
 
 /// The `Error: ` line from a refused boot, held to plain Display.
 fn refusal_line(status: std::process::ExitStatus, stderr: &str) -> String {
@@ -125,19 +124,20 @@ fn an_unparsable_listen_names_the_variable() {
 /// names a real `host:port`, but another socket already holds it.
 /// `boot::serve_until_drained` is the only place that can see this — the
 /// bind happens inside `tokio::spawn`, after every env read has already
-/// succeeded — and before this change it let `result?` carry
+/// succeeded — and before ledger 1333 it let `result?` carry
 /// `tonic::transport::Error` straight out, whose whole `Display` is the two
 /// words "transport error": no LISTEN, no address, no OS reason.
 ///
-/// **THAT FAILURE IS INVISIBLE UNTIL SOMETHING ASKS THE PROCESS TO STOP**
-/// (ledger 1334). `yadgar_lifecycle::drain_within` awaits `stop` FIRST and
-/// only then joins the spawned server — see its own doc comment — so a bind
-/// that fails before any signal arrives leaves the process running, having
-/// bound nothing, rather than exiting. That is exactly what a bad `LISTEN`
-/// looks like in a real cluster: the pod sits Ready-but-deaf until kubelet's
-/// liveness probe eventually sends SIGTERM. This test supplies that SIGTERM
-/// itself, after giving the (synchronous, effectively instant) bind attempt
-/// time to fail.
+/// **THE PROCESS EXITS ON ITS OWN, WITH NO SIGNAL SENT** (yaadgaar #313).
+/// `yadgar_lifecycle::drain_within` returns `Drain::Finished(Err(..))` the
+/// moment the serving task ends, so a bind that fails before any signal
+/// arrives is a non-zero exit at once rather than a process that sits bound to
+/// nothing until kubelet's liveness probe sends SIGTERM. This test sends no
+/// signal: a lifecycle that awaited `stop` first leaves the process running,
+/// and the exit wait below fails on its deadline, the harness's `MARGIN` (10 s).
+/// Measured on the old pin (`v0.2.20`, with a 5 s bound at the time): red,
+/// "waited 5s for the process to exit on its own after the bind failed; it was
+/// still running".
 ///
 /// Held in-process rather than by a second `unshare` child: the listener and
 /// the binary under test must share one network namespace for the collision
@@ -160,15 +160,7 @@ fn a_bind_failure_names_the_listen_address() {
     // Fires regardless of whether the real bind that follows succeeds — see
     // `serve_until_drained`, which logs it before spawning the server task.
     task.wait_until_listening();
-    // The bind itself is a single synchronous syscall; this is slack for the
-    // scheduler to have polled the spawned task at least once, not a wait
-    // for anything slow.
-    std::thread::sleep(Duration::from_millis(200));
-    task.terminate();
-    let status = task.wait_for_exit(
-        "after SIGTERM surfaced the bind failure",
-        Duration::from_secs(10),
-    );
+    let status = task.wait_for_exit("on its own after the bind failed", MARGIN);
     let seen = task.seen().join("\n");
     drop(holder);
 
@@ -204,6 +196,46 @@ fn a_missing_or_out_of_range_request_timeout_names_the_variable_and_the_chart_ke
         assert!(
             line.contains("taskDb.requestTimeoutSeconds"),
             "{bad:?}: the refusal must name the chart key: {line}"
+        );
+    }
+}
+
+/// ADR-1006: the listener's four protocol limits have no compiled-in default
+/// (ADR-0569), so an absent one refuses the boot, naming the variable AND the
+/// `server.limits` chart value that renders it — through `main`, so a `main`
+/// that never read them, or read them under another prefix or chart key, turns
+/// this red. Read beside `serve::from_env`, before `shared.yaml`, so no mount
+/// namespace.
+#[test]
+fn an_absent_server_limit_is_refused_naming_the_variable_and_the_chart_key() {
+    for (var, chart) in [
+        (
+            "LISTEN_MAX_CONCURRENT_STREAMS",
+            "server.limits.maxConcurrentStreams",
+        ),
+        (
+            "LISTEN_KEEPALIVE_INTERVAL_SECS",
+            "server.limits.keepaliveIntervalSeconds",
+        ),
+        (
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS",
+            "server.limits.keepaliveTimeoutSeconds",
+        ),
+        (
+            "LISTEN_MAX_HEADER_LIST_BYTES",
+            "server.limits.maxHeaderListBytes",
+        ),
+    ] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != var);
+        let line = refusal_without_mounts(&vars);
+        assert!(
+            line.contains(&format!("{var} is not set")),
+            "{var}: the refusal must name the variable: {line}"
+        );
+        assert!(
+            line.contains(&format!("`{chart}`")),
+            "{var}: the refusal must name the chart value {chart}: {line}"
         );
     }
 }
