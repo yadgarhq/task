@@ -68,7 +68,7 @@ pub async fn serve_until_drained(
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
+    // serve traffic, which is D67's rule applied to the metrics path too.
     // Named on the way out, for the reason given on TASK_DB_PORT above.
     let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
         .parse()
