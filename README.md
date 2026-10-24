@@ -84,8 +84,9 @@ the autoscaler cannot help. A request that cannot reach the store fails with
 `UNAVAILABLE`, which is recoverable; refusing to start is not.
 
 That last sentence is a CONTRACT rather than a description, and `passthrough` in
-`src/service.rs` is where it is kept: a `-db` answering `UNAVAILABLE` or
-`DEADLINE_EXCEEDED` reaches the caller as `UNAVAILABLE`. It used to be folded
+`src/service.rs` is where it is kept: a `-db` answering `UNAVAILABLE` reaches the
+caller as `UNAVAILABLE`, and one answering `DEADLINE_EXCEEDED` reaches it as
+`DEADLINE_EXCEEDED`: each code passes through as itself. It used to be folded
 into `INTERNAL`, which made the one recoverable storage failure
 indistinguishable from a bug.
 
