@@ -20,7 +20,9 @@
 //! assertion passes for the correct handler and for the one that echoes its own
 //! request back.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use tonic::{Code, Request, Response, Status};
 use yadgar_task::pb::yadgar::common::v1 as common;
@@ -114,6 +116,35 @@ struct Recorded {
     get: Vec<db::GetTaskRequest>,
     list: Vec<db::ListTasksRequest>,
     delete: Vec<db::DeleteTaskRequest>,
+    /// The `grpc-timeout` each call arrived with, in call order (ADR-1019). `None`
+    /// when the header was absent.
+    timeouts: Vec<Option<Duration>>,
+}
+
+/// Sets its flag when dropped. A hanging handler holds one, so the flag proves
+/// the server DROPPED the handler (the caller's cancellation reached it) rather
+/// than leaving it running.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Decode a `grpc-timeout` header value: up to eight digits and a unit.
+fn parse_grpc_timeout(value: &str) -> Duration {
+    let (digits, unit) = value.split_at(value.len() - 1);
+    let n: u64 = digits.parse().expect("grpc-timeout digits");
+    match unit {
+        "H" => Duration::from_secs(n * 3600),
+        "M" => Duration::from_secs(n * 60),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        other => panic!("unknown grpc-timeout unit {other}"),
+    }
 }
 
 /// One scripted outcome per RPC. No queue: no handler in this service calls any
@@ -127,6 +158,30 @@ struct MockDb {
     list: Option<Canned<db::ListTasksResponse>>,
     delete: Option<Canned<db::DeleteTaskResponse>>,
     seen: Arc<Mutex<Recorded>>,
+    /// Never answer: park every call forever (ADR-1019).
+    hang: bool,
+    /// Wait this long before answering, every call.
+    delay: Option<Duration>,
+    /// Set when a parked handler is dropped.
+    dropped: Arc<AtomicBool>,
+}
+
+impl MockDb {
+    /// Record the call's `grpc-timeout`, then park or delay as scripted.
+    async fn arrive<T>(&self, request: &Request<T>) {
+        let timeout = request
+            .metadata()
+            .get("grpc-timeout")
+            .map(|v| parse_grpc_timeout(v.to_str().expect("ascii grpc-timeout")));
+        self.seen.lock().unwrap().timeouts.push(timeout);
+        if self.hang {
+            let _flag = DropFlag(self.dropped.clone());
+            std::future::pending::<()>().await;
+        }
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 fn answer<T: Clone>(canned: &Option<Canned<T>>, rpc: &str) -> Result<Response<T>, Status> {
@@ -147,6 +202,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::CreateTaskRequest>,
     ) -> Result<Response<db::CreateTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().create.push(request.into_inner());
         answer(&self.create, "CreateTask")
     }
@@ -155,6 +211,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::UpdateTaskRequest>,
     ) -> Result<Response<db::UpdateTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().update.push(request.into_inner());
         answer(&self.update, "UpdateTask")
     }
@@ -163,6 +220,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::GetTaskRequest>,
     ) -> Result<Response<db::GetTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().get.push(request.into_inner());
         answer(&self.get, "GetTask")
     }
@@ -171,6 +229,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::ListTasksRequest>,
     ) -> Result<Response<db::ListTasksResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().list.push(request.into_inner());
         answer(&self.list, "ListTasks")
     }
@@ -179,6 +238,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::DeleteTaskRequest>,
     ) -> Result<Response<db::DeleteTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().delete.push(request.into_inner());
         answer(&self.delete, "DeleteTask")
     }
@@ -190,6 +250,10 @@ impl TaskDbService for MockDb {
 /// nothing to reap: the runtime is dropped when the `#[tokio::test]` body
 /// returns.
 async fn wire(mock: MockDb) -> (Task, Arc<Mutex<Recorded>>) {
+    wire_with_ceiling(mock, Duration::from_secs(14)).await
+}
+
+async fn wire_with_ceiling(mock: MockDb, ceiling: Duration) -> (Task, Arc<Mutex<Recorded>>) {
     let seen = mock.seen.clone();
 
     // Bind FIRST, then serve the bound listener. Picking a port and reopening it
@@ -212,7 +276,7 @@ async fn wire(mock: MockDb) -> (Task, Arc<Mutex<Recorded>>) {
         .await
         .expect("the mock store accepted the connection");
 
-    (Task::new(channel), seen)
+    (Task::new(channel, ceiling), seen)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,19 +430,31 @@ async fn a_serialisation_failure_stays_aborted() {
 /// documentation.
 #[tokio::test]
 async fn a_store_that_could_not_be_reached_stays_unavailable() {
-    for code in [Code::Unavailable, Code::DeadlineExceeded] {
-        let status = read_failing_with(code, DB_DETAIL).await;
-        assert_eq!(
-            status.code(),
-            Code::Unavailable,
-            "{code:?} is the store being unreachable, which is what this API promises to report"
-        );
-        assert!(
-            status.message().contains("retry"),
-            "the code invites a retry and the message must say so: {}",
-            status.message()
-        );
-    }
+    let status = read_failing_with(Code::Unavailable, DB_DETAIL).await;
+    assert_eq!(
+        status.code(),
+        Code::Unavailable,
+        "UNAVAILABLE is the store being unreachable, which is what this API promises to report"
+    );
+    assert!(
+        status.message().contains("retry"),
+        "the code invites a retry and the message must say so: {}",
+        status.message()
+    );
+}
+
+/// ADR-1019: a `-db` hop that ran out of time is `DEADLINE_EXCEEDED` to the
+/// caller. It used to fold into `UNAVAILABLE`, which hid the one answer a caller
+/// whose own deadline is spent can act on.
+#[tokio::test]
+async fn a_store_that_ran_out_of_time_stays_deadline_exceeded() {
+    let status = read_failing_with(Code::DeadlineExceeded, DB_DETAIL).await;
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+    assert!(
+        !status.message().contains("mauve"),
+        "the store's own words must not escape: {}",
+        status.message()
+    );
 }
 
 /// **`UNAVAILABLE` AND `DEADLINE_EXCEEDED` ARE DELIBERATELY ABSENT from this
@@ -2187,4 +2263,214 @@ async fn a_patch_sends_the_callers_expect_version_to_the_store() {
         .await
         .expect("a matching patch");
     assert_eq!(seen.lock().unwrap().update[0].expect_version, 3);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-1019: the caller's deadline bounds every call to `-db`.
+// ---------------------------------------------------------------------------
+
+/// A `ReadTask` carrying a caller deadline of `timeout`, if any.
+fn a_read_within(timeout: Option<Duration>) -> Request<api::ReadTaskRequest> {
+    let mut request = Request::new(api::ReadTaskRequest {
+        scope: None,
+        key: Some(api::read_task_request::Key::Id(CALLER_ID.into())),
+    });
+    if let Some(t) = timeout {
+        request.set_timeout(t);
+    }
+    request
+}
+
+/// **THE WEDGED STORE.** The caller gives 300 ms and `-db` never answers. `task`
+/// must tell `-db` it has at most 250 ms (300 ms less the 50 ms margin), answer
+/// `DEADLINE_EXCEEDED` (not `CANCELLED`, not `UNAVAILABLE`) before the caller's
+/// 300 ms is spent, and drop the parked handler in `-db`. `call` receives the
+/// service and the caller's deadline and makes the one RPC under test.
+async fn assert_cut_off_inside_the_callers_deadline<T, Fut>(
+    call: impl FnOnce(Task, Duration) -> Fut,
+) where
+    Fut: std::future::Future<Output = Result<Response<T>, Status>>,
+    T: std::fmt::Debug,
+{
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (svc, seen) = wire(MockDb {
+        hang: true,
+        dropped: dropped.clone(),
+        ..Default::default()
+    })
+    .await;
+
+    let started = tokio::time::Instant::now();
+    // The outer 3 s only keeps a broken implementation from hanging the suite.
+    let status = tokio::time::timeout(
+        Duration::from_secs(3),
+        call(svc, Duration::from_millis(300)),
+    )
+    .await
+    .expect("task answered nothing: it waited on a store that never replies")
+    .expect_err("the store never answers");
+    let took = started.elapsed();
+
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        took < Duration::from_millis(300),
+        "answered after {took:?}, past the caller's 300 ms"
+    );
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told.len(), 1);
+    let told = told[0].expect("-db was told nothing: the caller's deadline was not propagated");
+    assert!(
+        told <= Duration::from_millis(250),
+        "-db was told {told:?}, more than the 250 ms the caller had left"
+    );
+
+    // The cancellation reaches the parked handler: wait briefly for the server
+    // to notice the closed stream.
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the store's handler was never dropped");
+}
+
+fn within<T>(message: T, timeout: Duration) -> Request<T> {
+    let mut request = Request::new(message);
+    request.set_timeout(timeout);
+    request
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.read_task(a_read_within(Some(t))).await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_create() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.create_task(within(
+            api::CreateTaskRequest {
+                title: "a title".into(),
+                ..Default::default()
+            },
+            t,
+        ))
+        .await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_find() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.find_tasks(within(api::FindTasksRequest::default(), t))
+            .await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_transition() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.transition_task(within(a_transition(db::TaskStatus::Done as i32), t))
+            .await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_remove() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.remove_task(within(
+            api::RemoveTaskRequest {
+                id: CALLER_ID.into(),
+                expect_version: 3,
+                ..Default::default()
+            },
+            t,
+        ))
+        .await
+    })
+    .await;
+}
+
+/// No caller deadline: `-db` is told the configured ceiling, not nothing and
+/// not a built-in constant.
+#[tokio::test]
+async fn a_call_without_a_deadline_is_stamped_with_the_ceiling() {
+    let (svc, seen) = wire_with_ceiling(
+        MockDb {
+            get: Some(Ok(db::GetTaskResponse {
+                task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+            })),
+            ..Default::default()
+        },
+        Duration::from_secs(7),
+    )
+    .await;
+
+    svc.read_task(a_read_within(None)).await.expect("answered");
+
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told, vec![Some(Duration::from_secs(7))]);
+}
+
+/// A caller deadline LONGER than the ceiling does not raise the bound.
+#[tokio::test]
+async fn a_long_caller_deadline_never_raises_the_ceiling() {
+    let (svc, seen) = wire_with_ceiling(
+        MockDb {
+            get: Some(Ok(db::GetTaskResponse {
+                task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+            })),
+            ..Default::default()
+        },
+        Duration::from_secs(7),
+    )
+    .await;
+
+    svc.read_task(a_read_within(Some(Duration::from_secs(60))))
+        .await
+        .expect("answered");
+
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told, vec![Some(Duration::from_secs(7))]);
+}
+
+/// Edit makes two calls to `-db` under ONE deadline: the second is told what is
+/// left after the first, not a fresh allowance.
+#[tokio::test]
+async fn an_edits_second_call_is_told_what_the_first_left() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        update: Some(Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+            previous_status: db::TaskStatus::Open as i32,
+        })),
+        delay: Some(Duration::from_millis(200)),
+        ..Default::default()
+    })
+    .await;
+
+    let mut request = Request::new(an_edit());
+    request.set_timeout(Duration::from_secs(2));
+    svc.edit_task(request).await.expect("edited");
+
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told.len(), 2);
+    let (first, second) = (
+        told[0].expect("first stamped"),
+        told[1].expect("second stamped"),
+    );
+    assert!(first <= Duration::from_millis(1950), "first {first:?}");
+    assert!(
+        second <= first - Duration::from_millis(150),
+        "second call was told {second:?} after the first was told {first:?} and took 200 ms"
+    );
 }
