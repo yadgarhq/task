@@ -30,6 +30,7 @@ fn an_edit(mask: Option<Vec<&str>>) -> api::EditTaskRequest {
         }),
         number: 0,
         expect_body_sha256: Vec::new(),
+        patch: None,
     }
 }
 

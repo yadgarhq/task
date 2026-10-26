@@ -20,7 +20,9 @@
 //! assertion passes for the correct handler and for the one that echoes its own
 //! request back.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use tonic::{Code, Request, Response, Status};
 use yadgar_task::pb::yadgar::common::v1 as common;
@@ -114,6 +116,35 @@ struct Recorded {
     get: Vec<db::GetTaskRequest>,
     list: Vec<db::ListTasksRequest>,
     delete: Vec<db::DeleteTaskRequest>,
+    /// The `grpc-timeout` each call arrived with, in call order (ADR-1019). `None`
+    /// when the header was absent.
+    timeouts: Vec<Option<Duration>>,
+}
+
+/// Sets its flag when dropped. A hanging handler holds one, so the flag proves
+/// the server DROPPED the handler (the caller's cancellation reached it) rather
+/// than leaving it running.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Decode a `grpc-timeout` header value: up to eight digits and a unit.
+fn parse_grpc_timeout(value: &str) -> Duration {
+    let (digits, unit) = value.split_at(value.len() - 1);
+    let n: u64 = digits.parse().expect("grpc-timeout digits");
+    match unit {
+        "H" => Duration::from_secs(n * 3600),
+        "M" => Duration::from_secs(n * 60),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        other => panic!("unknown grpc-timeout unit {other}"),
+    }
 }
 
 /// One scripted outcome per RPC. No queue: no handler in this service calls any
@@ -127,6 +158,30 @@ struct MockDb {
     list: Option<Canned<db::ListTasksResponse>>,
     delete: Option<Canned<db::DeleteTaskResponse>>,
     seen: Arc<Mutex<Recorded>>,
+    /// Never answer: park every call forever (ADR-1019).
+    hang: bool,
+    /// Wait this long before answering, every call.
+    delay: Option<Duration>,
+    /// Set when a parked handler is dropped.
+    dropped: Arc<AtomicBool>,
+}
+
+impl MockDb {
+    /// Record the call's `grpc-timeout`, then park or delay as scripted.
+    async fn arrive<T>(&self, request: &Request<T>) {
+        let timeout = request
+            .metadata()
+            .get("grpc-timeout")
+            .map(|v| parse_grpc_timeout(v.to_str().expect("ascii grpc-timeout")));
+        self.seen.lock().unwrap().timeouts.push(timeout);
+        if self.hang {
+            let _flag = DropFlag(self.dropped.clone());
+            std::future::pending::<()>().await;
+        }
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 fn answer<T: Clone>(canned: &Option<Canned<T>>, rpc: &str) -> Result<Response<T>, Status> {
@@ -147,6 +202,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::CreateTaskRequest>,
     ) -> Result<Response<db::CreateTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().create.push(request.into_inner());
         answer(&self.create, "CreateTask")
     }
@@ -155,6 +211,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::UpdateTaskRequest>,
     ) -> Result<Response<db::UpdateTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().update.push(request.into_inner());
         answer(&self.update, "UpdateTask")
     }
@@ -163,6 +220,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::GetTaskRequest>,
     ) -> Result<Response<db::GetTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().get.push(request.into_inner());
         answer(&self.get, "GetTask")
     }
@@ -171,6 +229,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::ListTasksRequest>,
     ) -> Result<Response<db::ListTasksResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().list.push(request.into_inner());
         answer(&self.list, "ListTasks")
     }
@@ -179,6 +238,7 @@ impl TaskDbService for MockDb {
         &self,
         request: Request<db::DeleteTaskRequest>,
     ) -> Result<Response<db::DeleteTaskResponse>, Status> {
+        self.arrive(&request).await;
         self.seen.lock().unwrap().delete.push(request.into_inner());
         answer(&self.delete, "DeleteTask")
     }
@@ -190,6 +250,10 @@ impl TaskDbService for MockDb {
 /// nothing to reap: the runtime is dropped when the `#[tokio::test]` body
 /// returns.
 async fn wire(mock: MockDb) -> (Task, Arc<Mutex<Recorded>>) {
+    wire_with_ceiling(mock, Duration::from_secs(14)).await
+}
+
+async fn wire_with_ceiling(mock: MockDb, ceiling: Duration) -> (Task, Arc<Mutex<Recorded>>) {
     let seen = mock.seen.clone();
 
     // Bind FIRST, then serve the bound listener. Picking a port and reopening it
@@ -212,7 +276,7 @@ async fn wire(mock: MockDb) -> (Task, Arc<Mutex<Recorded>>) {
         .await
         .expect("the mock store accepted the connection");
 
-    (Task::new(channel), seen)
+    (Task::new(channel, ceiling), seen)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,19 +430,31 @@ async fn a_serialisation_failure_stays_aborted() {
 /// documentation.
 #[tokio::test]
 async fn a_store_that_could_not_be_reached_stays_unavailable() {
-    for code in [Code::Unavailable, Code::DeadlineExceeded] {
-        let status = read_failing_with(code, DB_DETAIL).await;
-        assert_eq!(
-            status.code(),
-            Code::Unavailable,
-            "{code:?} is the store being unreachable, which is what this API promises to report"
-        );
-        assert!(
-            status.message().contains("retry"),
-            "the code invites a retry and the message must say so: {}",
-            status.message()
-        );
-    }
+    let status = read_failing_with(Code::Unavailable, DB_DETAIL).await;
+    assert_eq!(
+        status.code(),
+        Code::Unavailable,
+        "UNAVAILABLE is the store being unreachable, which is what this API promises to report"
+    );
+    assert!(
+        status.message().contains("retry"),
+        "the code invites a retry and the message must say so: {}",
+        status.message()
+    );
+}
+
+/// ADR-1019: a `-db` hop that ran out of time is `DEADLINE_EXCEEDED` to the
+/// caller. It used to fold into `UNAVAILABLE`, which hid the one answer a caller
+/// whose own deadline is spent can act on.
+#[tokio::test]
+async fn a_store_that_ran_out_of_time_stays_deadline_exceeded() {
+    let status = read_failing_with(Code::DeadlineExceeded, DB_DETAIL).await;
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+    assert!(
+        !status.message().contains("mauve"),
+        "the store's own words must not escape: {}",
+        status.message()
+    );
 }
 
 /// **`UNAVAILABLE` AND `DEADLINE_EXCEEDED` ARE DELIBERATELY ABSENT from this
@@ -697,6 +773,7 @@ fn an_edit() -> api::EditTaskRequest {
         update_mask: None,
         number: 0,
         expect_body_sha256: Vec::new(),
+        patch: None,
     }
 }
 
@@ -1768,4 +1845,632 @@ async fn a_read_returns_a_stored_title_over_the_bound_unchanged() {
         .task
         .expect("the task");
     assert_eq!(task.title, long);
+}
+
+// ---------------------------------------------------------------------------
+// Patch mode: a literal search-and-replace over the stored body (ADR-1008,
+// yaadgaar #399).
+// ---------------------------------------------------------------------------
+
+/// The SHA-256 of `a_stored_task`'s body, spelled as a literal (ADR-0573):
+/// `printf 'the stored body' | sha256sum`.
+const STORED_BODY_SHA256: &str = "d203ab53d71fe2e43a80aca03bd1ca66b209e8deb7706ce570e42bbd7bc306df";
+
+/// A store whose task holds `body`, and that accepts the write.
+fn a_store_whose_body_is(body: &str) -> MockDb {
+    let mut task = a_stored_task(db::TaskStatus::Open as i32);
+    task.body = body.into();
+    MockDb {
+        get: Some(Ok(db::GetTaskResponse { task: Some(task) })),
+        ..a_store_holding_it()
+    }
+}
+
+fn a_patch(old: &str, new: &str, expect_count: u32) -> api::EditTaskRequest {
+    api::EditTaskRequest {
+        title: String::new(),
+        body: String::new(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["patch".to_string()],
+        }),
+        patch: Some(api::BodyPatch {
+            old: old.into(),
+            new: new.into(),
+            expect_count,
+        }),
+        ..an_edit()
+    }
+}
+
+/// What the edit wrote: the body, and the mask it named.
+fn written(seen: &Arc<Mutex<Recorded>>) -> (String, Vec<String>) {
+    let sent = seen.lock().unwrap().update[0].clone();
+    (
+        sent.task.expect("an edit carries a task").body,
+        sent.update_mask.expect("an edit is masked").paths,
+    )
+}
+
+/// THE CASE THE MODE EXISTS FOR: one sentence changed, the rest of the body
+/// kept, and the store is asked to write `body` — never `patch`, which is no
+/// column — as a whole body this service computed.
+#[tokio::test]
+async fn a_patch_replaces_every_occurrence_and_writes_the_result_as_a_body() {
+    let (svc, seen) = wire(a_store_whose_body_is("a cat and a cat, not a dog")).await;
+
+    svc.edit_task(Request::new(a_patch("cat", "fox", 2)))
+        .await
+        .expect("`cat` occurs twice, as the caller said");
+
+    let (body, mask) = written(&seen);
+    assert_eq!(body, "a fox and a fox, not a dog");
+    assert_eq!(mask, ["body"]);
+}
+
+/// A patch and a title in one edit: the title is the caller's, the body is the
+/// patched one, and both are named.
+#[tokio::test]
+async fn a_patch_may_travel_with_a_title() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        title: "a new title".into(),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["title".to_string(), "patch".to_string()],
+        }),
+        ..a_patch("stored", "patched", 1)
+    }))
+    .await
+    .expect("a title and a patch are not exclusive");
+
+    let sent = seen.lock().unwrap().update[0].clone();
+    let task = sent.task.unwrap();
+    assert_eq!(task.title, "a new title");
+    assert_eq!(task.body, "the patched body");
+    assert_eq!(sent.update_mask.unwrap().paths, ["title", "body"]);
+}
+
+/// RED CASE: `old` absent from the body. FAILED_PRECONDITION, because the
+/// answer depends on what is stored; the message starts with the reason token
+/// and says what was found; nothing is written.
+#[tokio::test]
+async fn a_patch_whose_old_does_not_occur_is_a_failed_precondition_and_writes_nothing() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    let status = svc
+        .edit_task(Request::new(a_patch("absent", "x", 1)))
+        .await
+        .expect_err("`absent` does not occur in the stored body");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "PATCH_COUNT_MISMATCH: `old` occurs 0 times in the stored body, not the 1 \
+         expect_count names; nothing was written. Re-read the task"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// RED CASE: more occurrences than the caller expects, and fewer.
+#[tokio::test]
+async fn a_patch_whose_count_differs_from_expect_count_is_refused_both_ways() {
+    let (svc, seen) = wire(a_store_whose_body_is("x x x")).await;
+
+    for (expect, found) in [(2u32, 3u32), (4, 3)] {
+        let status = svc
+            .edit_task(Request::new(a_patch("x", "y", expect)))
+            .await
+            .expect_err("the count is 3");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(
+            status
+                .message()
+                .starts_with(&format!("PATCH_COUNT_MISMATCH: `old` occurs {found} times")),
+            "{}",
+            status.message()
+        );
+    }
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// OVERLAP IS DEFINED, NOT LEFT TO CHANCE: occurrences are counted
+/// non-overlapping, left to right. In "aaaa", "aa" occurs TWICE (0..2, 2..4),
+/// not three times; in "aaa" once, at the start, and the tail is kept.
+#[tokio::test]
+async fn overlapping_occurrences_count_non_overlapping_left_to_right() {
+    let (svc, seen) = wire(a_store_whose_body_is("aaaa")).await;
+    let three = svc
+        .edit_task(Request::new(a_patch("aa", "b", 3)))
+        .await
+        .expect_err("three overlapping matches are not three occurrences");
+    assert!(three
+        .message()
+        .starts_with("PATCH_COUNT_MISMATCH: `old` occurs 2 times"));
+    svc.edit_task(Request::new(a_patch("aa", "b", 2)))
+        .await
+        .expect("two non-overlapping occurrences");
+    assert_eq!(written(&seen).0, "bb");
+
+    let (svc, seen) = wire(a_store_whose_body_is("aaa")).await;
+    svc.edit_task(Request::new(a_patch("aa", "b", 1)))
+        .await
+        .expect("one occurrence, at the start");
+    assert_eq!(written(&seen).0, "ba");
+}
+
+/// MULTI-BYTE TEXT: the match is literal over UTF-8 bytes, so a Persian word
+/// is replaced whole and its neighbours keep every byte; and there is NO
+/// normalisation, so a precomposed `é` (U+00E9) does not match `e` followed by
+/// a combining acute (U+0065 U+0301), although both render alike.
+#[tokio::test]
+async fn a_patch_matches_multi_byte_text_literally_and_without_normalisation() {
+    let (svc, seen) = wire(a_store_whose_body_is("یادگار — café — 🦀")).await;
+    svc.edit_task(Request::new(a_patch("یادگار", "yadgar", 1)))
+        .await
+        .expect("the Persian word occurs once");
+    assert_eq!(written(&seen).0, "yadgar — café — 🦀");
+
+    let (svc, seen) = wire(a_store_whose_body_is("caf\u{e9}")).await;
+    let status = svc
+        .edit_task(Request::new(a_patch("e\u{301}", "e", 1)))
+        .await
+        .expect_err("a decomposed é is not the precomposed one");
+    assert!(status
+        .message()
+        .starts_with("PATCH_COUNT_MISMATCH: `old` occurs 0 times"));
+
+    // A four-byte character replaced by another, around a two-byte one.
+    let (svc, seen2) = wire(a_store_whose_body_is("🦀é🦀")).await;
+    svc.edit_task(Request::new(a_patch("🦀", "🐍", 2)))
+        .await
+        .expect("two crabs");
+    assert_eq!(written(&seen2).0, "🐍é🐍");
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// RED CASES decided about the request alone, so none of them costs a read:
+/// an empty `old`, an `expect_count` of 0, and `old` or `new` over 65536
+/// bytes. The bound counts BYTES: 32768 two-byte characters fit, 32769 do not.
+#[tokio::test]
+async fn a_malformed_patch_is_refused_before_anything_is_read() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+
+    let refused = |req: api::EditTaskRequest| {
+        let svc = &svc;
+        async move {
+            svc.edit_task(Request::new(req))
+                .await
+                .expect_err("a malformed patch")
+        }
+    };
+
+    let empty = refused(a_patch("", "x", 1)).await;
+    assert_eq!(empty.code(), Code::InvalidArgument);
+    assert_eq!(empty.message(), "a patch's `old` must not be empty");
+
+    let zero = refused(a_patch("stored", "x", 0)).await;
+    assert_eq!(zero.code(), Code::InvalidArgument);
+    assert_eq!(
+        zero.message(),
+        "a patch's `expect_count` must be at least 1"
+    );
+
+    let big_old = refused(a_patch(&persian(32769), "x", 1)).await;
+    assert_eq!(big_old.code(), Code::InvalidArgument);
+    assert_eq!(
+        big_old.message(),
+        "a patch's `old` is at most 65536 bytes; this one has 65538"
+    );
+    let big_new = refused(a_patch("stored", &"n".repeat(65537), 1)).await;
+    assert_eq!(big_new.code(), Code::InvalidArgument);
+    assert_eq!(
+        big_new.message(),
+        "a patch's `new` is at most 65536 bytes; this one has 65537"
+    );
+
+    assert!(
+        seen.lock().unwrap().get.is_empty(),
+        "a malformed patch cost a read"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// Exactly 65536 bytes on each side is inside the bound.
+#[tokio::test]
+async fn a_patch_of_exactly_65536_bytes_a_side_is_applied() {
+    let old = persian(32768);
+    let (svc, seen) = wire(a_store_whose_body_is(&old)).await;
+    svc.edit_task(Request::new(a_patch(&old, &"n".repeat(65536), 1)))
+        .await
+        .expect("65536 bytes is the bound, not over it");
+    assert_eq!(written(&seen).0.len(), 65536);
+}
+
+/// RED CASE: a result over 1048576 bytes, the largest request the gateway
+/// accepts, is refused after the read: its size depends on the stored body.
+#[tokio::test]
+async fn a_patch_whose_result_is_over_one_mebibyte_is_refused() {
+    // 17 occurrences of a one-byte `old`, each grown to 65536 bytes: 1114112.
+    let (svc, seen) = wire(a_store_whose_body_is(&"x".repeat(17))).await;
+    let status = svc
+        .edit_task(Request::new(a_patch("x", &"n".repeat(65536), 17)))
+        .await
+        .expect_err("the result would be 1114112 bytes");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "PATCH_RESULT_TOO_LARGE: the patched body would be 1114112 bytes; a body is \
+         at most 1048576. Nothing was written"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+
+    // 16 of them is exactly 1048576 and fits.
+    let (svc, seen) = wire(a_store_whose_body_is(&"x".repeat(16))).await;
+    svc.edit_task(Request::new(a_patch("x", &"n".repeat(65536), 16)))
+        .await
+        .expect("1048576 bytes is the bound");
+    assert_eq!(written(&seen).0.len(), 1_048_576);
+}
+
+/// IN PATCH MODE THE DIGEST IS OVER THE PRE-EDIT BODY (ADR-1008): the stored
+/// body's digest admits the patch, and any other is a FAILED_PRECONDITION that
+/// writes nothing — including the digest of the RESULT, which a caller who
+/// misread the rule would send.
+#[tokio::test]
+async fn a_patch_checks_expect_body_sha256_against_the_pre_edit_body() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    svc.edit_task(Request::new(api::EditTaskRequest {
+        expect_body_sha256: digest(STORED_BODY_SHA256),
+        ..a_patch("stored", "patched", 1)
+    }))
+    .await
+    .expect("the digest is the stored body's");
+    assert_eq!(written(&seen).0, "the patched body");
+
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    // `printf 'the patched body' | sha256sum`: the result, not the pre-edit body.
+    let result_sha = "a676e8c17b2ae2e14381e0f657dcf7b7800291c15e8e2d3904bd17557b1ae4c3";
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            expect_body_sha256: digest(result_sha),
+            ..a_patch("stored", "patched", 1)
+        }))
+        .await
+        .expect_err("a digest that is not the stored body's");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "BODY_SHA256_MISMATCH: the stored body does not match expect_body_sha256, so \
+         it is not the body you read; nothing was written. Re-read the task"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+
+    // A digest of the wrong length is still refused before the read.
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let short = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            expect_body_sha256: vec![0u8; 31],
+            ..a_patch("stored", "patched", 1)
+        }))
+        .await
+        .expect_err("31 bytes is not a digest");
+    assert_eq!(short.code(), Code::InvalidArgument);
+    assert!(seen.lock().unwrap().get.is_empty());
+}
+
+/// `patch` and `body` are mutually exclusive, and the mask and the message
+/// must agree. Each disagreement is refused before the read.
+#[tokio::test]
+async fn a_patch_and_its_mask_must_agree_and_exclude_body() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let mask = |paths: &[&str]| {
+        Some(prost_types::FieldMask {
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+        })
+    };
+    let cases = [
+        (
+            api::EditTaskRequest {
+                update_mask: mask(&["body", "patch"]),
+                ..a_patch("stored", "x", 1)
+            },
+            "`patch` and `body` are mutually exclusive; send one",
+        ),
+        (
+            // An empty mask means "every editable field", body included.
+            api::EditTaskRequest {
+                update_mask: None,
+                ..a_patch("stored", "x", 1)
+            },
+            "a patch was sent, but the mask does not name `patch`",
+        ),
+        (
+            api::EditTaskRequest {
+                update_mask: mask(&["body"]),
+                ..a_patch("stored", "x", 1)
+            },
+            "a patch was sent, but the mask does not name `patch`",
+        ),
+        (
+            api::EditTaskRequest {
+                patch: None,
+                ..a_patch("stored", "x", 1)
+            },
+            "the mask names `patch`, but no patch was sent",
+        ),
+    ];
+    for (req, message) in cases {
+        let status = svc.edit_task(Request::new(req)).await.expect_err(message);
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), message);
+    }
+    assert!(seen.lock().unwrap().get.is_empty());
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// MEMORY BOUND: the result's size is decided BEFORE it is built. A 1 MiB
+/// body of one-byte occurrences, each to grow to 64 KiB, would build a 64 GiB
+/// string if the replacement ran first. The refusal must come from arithmetic
+/// alone, so this returns at once rather than exhausting memory.
+#[tokio::test]
+async fn a_patch_whose_result_would_be_huge_is_refused_without_building_it() {
+    let (svc, seen) = wire(a_store_whose_body_is(&"x".repeat(1_048_576))).await;
+    let status = svc
+        .edit_task(Request::new(a_patch("x", &"n".repeat(65536), 1_048_576)))
+        .await
+        .expect_err("the result would be 68719476736 bytes");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "PATCH_RESULT_TOO_LARGE: the patched body would be 68719476736 bytes; a body is \
+         at most 1048576. Nothing was written"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// LOST UPDATE: a patch is computed on the body READ, so the read must be the
+/// version the caller expects. Otherwise a caller sending `expect_version`
+/// read+1 has its patch computed on the older body, and the store's
+/// compare-and-set passes if another writer lands that version in between.
+///
+/// The message carries NO reason token: ADR-1008 lists the tokens a patch
+/// refusal may start with on `EditTaskRequest.patch`, and a stale version is
+/// not one of them, as it is not in whole-body mode either.
+#[tokio::test]
+async fn a_patch_whose_expect_version_is_not_the_version_read_is_refused() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            expect_version: 4,
+            ..a_patch("stored", "patched", 1)
+        }))
+        .await
+        .expect_err("the read is at version 3");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "the task is at version 3, not the expect_version 4 this patch names; nothing \
+         was written. Re-read the task"
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// The compare half of the store's compare-and-set is the CALLER'S version,
+/// carried unchanged through the patch.
+#[tokio::test]
+async fn a_patch_sends_the_callers_expect_version_to_the_store() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    svc.edit_task(Request::new(a_patch("stored", "patched", 1)))
+        .await
+        .expect("a matching patch");
+    assert_eq!(seen.lock().unwrap().update[0].expect_version, 3);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-1019: the caller's deadline bounds every call to `-db`.
+// ---------------------------------------------------------------------------
+
+/// A `ReadTask` carrying a caller deadline of `timeout`, if any.
+fn a_read_within(timeout: Option<Duration>) -> Request<api::ReadTaskRequest> {
+    let mut request = Request::new(api::ReadTaskRequest {
+        scope: None,
+        key: Some(api::read_task_request::Key::Id(CALLER_ID.into())),
+    });
+    if let Some(t) = timeout {
+        request.set_timeout(t);
+    }
+    request
+}
+
+/// **THE WEDGED STORE.** The caller gives 300 ms and `-db` never answers. `task`
+/// must tell `-db` it has at most 250 ms (300 ms less the 50 ms margin), answer
+/// `DEADLINE_EXCEEDED` (not `CANCELLED`, not `UNAVAILABLE`) before the caller's
+/// 300 ms is spent, and drop the parked handler in `-db`. `call` receives the
+/// service and the caller's deadline and makes the one RPC under test.
+async fn assert_cut_off_inside_the_callers_deadline<T, Fut>(
+    call: impl FnOnce(Task, Duration) -> Fut,
+) where
+    Fut: std::future::Future<Output = Result<Response<T>, Status>>,
+    T: std::fmt::Debug,
+{
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (svc, seen) = wire(MockDb {
+        hang: true,
+        dropped: dropped.clone(),
+        ..Default::default()
+    })
+    .await;
+
+    let started = tokio::time::Instant::now();
+    // The outer 3 s only keeps a broken implementation from hanging the suite.
+    let status = tokio::time::timeout(
+        Duration::from_secs(3),
+        call(svc, Duration::from_millis(300)),
+    )
+    .await
+    .expect("task answered nothing: it waited on a store that never replies")
+    .expect_err("the store never answers");
+    let took = started.elapsed();
+
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        took < Duration::from_millis(300),
+        "answered after {took:?}, past the caller's 300 ms"
+    );
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told.len(), 1);
+    let told = told[0].expect("-db was told nothing: the caller's deadline was not propagated");
+    assert!(
+        told <= Duration::from_millis(250),
+        "-db was told {told:?}, more than the 250 ms the caller had left"
+    );
+
+    // The cancellation reaches the parked handler: wait briefly for the server
+    // to notice the closed stream.
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the store's handler was never dropped");
+}
+
+fn within<T>(message: T, timeout: Duration) -> Request<T> {
+    let mut request = Request::new(message);
+    request.set_timeout(timeout);
+    request
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.read_task(a_read_within(Some(t))).await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_create() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.create_task(within(
+            api::CreateTaskRequest {
+                title: "a title".into(),
+                ..Default::default()
+            },
+            t,
+        ))
+        .await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_find() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.find_tasks(within(api::FindTasksRequest::default(), t))
+            .await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_transition() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.transition_task(within(a_transition(db::TaskStatus::Done as i32), t))
+            .await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wedged_store_is_cut_off_inside_the_callers_deadline_on_remove() {
+    assert_cut_off_inside_the_callers_deadline(|svc, t| async move {
+        svc.remove_task(within(
+            api::RemoveTaskRequest {
+                id: CALLER_ID.into(),
+                expect_version: 3,
+                ..Default::default()
+            },
+            t,
+        ))
+        .await
+    })
+    .await;
+}
+
+/// No caller deadline: `-db` is told the configured ceiling, not nothing and
+/// not a built-in constant.
+#[tokio::test]
+async fn a_call_without_a_deadline_is_stamped_with_the_ceiling() {
+    let (svc, seen) = wire_with_ceiling(
+        MockDb {
+            get: Some(Ok(db::GetTaskResponse {
+                task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+            })),
+            ..Default::default()
+        },
+        Duration::from_secs(7),
+    )
+    .await;
+
+    svc.read_task(a_read_within(None)).await.expect("answered");
+
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told, vec![Some(Duration::from_secs(7))]);
+}
+
+/// A caller deadline LONGER than the ceiling does not raise the bound.
+#[tokio::test]
+async fn a_long_caller_deadline_never_raises_the_ceiling() {
+    let (svc, seen) = wire_with_ceiling(
+        MockDb {
+            get: Some(Ok(db::GetTaskResponse {
+                task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+            })),
+            ..Default::default()
+        },
+        Duration::from_secs(7),
+    )
+    .await;
+
+    svc.read_task(a_read_within(Some(Duration::from_secs(60))))
+        .await
+        .expect("answered");
+
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told, vec![Some(Duration::from_secs(7))]);
+}
+
+/// Edit makes two calls to `-db` under ONE deadline: the second is told what is
+/// left after the first, not a fresh allowance.
+#[tokio::test]
+async fn an_edits_second_call_is_told_what_the_first_left() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        update: Some(Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+            previous_status: db::TaskStatus::Open as i32,
+        })),
+        delay: Some(Duration::from_millis(200)),
+        ..Default::default()
+    })
+    .await;
+
+    let mut request = Request::new(an_edit());
+    request.set_timeout(Duration::from_secs(2));
+    svc.edit_task(request).await.expect("edited");
+
+    let told = seen.lock().unwrap().timeouts.clone();
+    assert_eq!(told.len(), 2);
+    let (first, second) = (
+        told[0].expect("first stamped"),
+        told[1].expect("second stamped"),
+    );
+    assert!(first <= Duration::from_millis(1950), "first {first:?}");
+    assert!(
+        second <= first - Duration::from_millis(150),
+        "second call was told {second:?} after the first was told {first:?} and took 200 ms"
+    );
 }

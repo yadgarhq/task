@@ -1,6 +1,7 @@
 //! `TaskService`. Business rules here; storage over the `-db` API, never directly.
 
 use tonic::Status;
+use yadgar_dial::Deadline;
 
 use crate::pb::yadgar::task::v1 as db;
 use crate::pb::yadgar::task::v1::task_db_service_client::TaskDbServiceClient;
@@ -37,7 +38,7 @@ mod handlers;
 ///
 /// An absent scope yields empty strings rather than an error: the call is refused
 /// on its own merits with INVALID_ARGUMENT, and telemetry must never be the thing
-/// that fails a request (D25).
+/// that fails a request (D67).
 fn tel_scope(
     scope: Option<&crate::pb::yadgar::common::v1::Scope>,
 ) -> yadgar_telemetry::observe::Scope {
@@ -52,12 +53,17 @@ fn tel_scope(
 #[derive(Clone)]
 pub struct Task {
     db: TaskDbServiceClient<tonic::transport::Channel>,
+    /// The `-db` request timeout the channel was dialled with (ADR-1019): the
+    /// CEILING on every `-db` call. The effective bound is the smaller of this
+    /// and what the caller's own deadline has left.
+    ceiling: std::time::Duration,
 }
 
 impl Task {
-    pub fn new(channel: tonic::transport::Channel) -> Self {
+    pub fn new(channel: tonic::transport::Channel, ceiling: std::time::Duration) -> Self {
         Self {
             db: TaskDbServiceClient::new(channel),
+            ceiling,
         }
     }
 
@@ -86,18 +92,24 @@ impl Task {
     async fn decide_transition(
         &self,
         req: &api::TransitionTaskRequest,
+        deadline: Deadline,
     ) -> Result<(db::Task, db::TaskStatus, db::TaskStatus), Status> {
         let key = crate::writes::target_key(&req.id, req.number)?;
         let to = db::TaskStatus::try_from(req.to)
             .map_err(|_| Status::invalid_argument("unknown target status"))?;
 
-        let current = self
-            .db
-            .clone()
-            .get_task(db::GetTaskRequest {
-                scope: req.scope.clone(),
-                key: Some(key),
-            })
+        let current = deadline
+            .call(
+                self.ceiling,
+                tonic::Request::new(db::GetTaskRequest {
+                    scope: req.scope.clone(),
+                    key: Some(key),
+                }),
+                |r| {
+                    let mut db = self.db.clone();
+                    async move { db.get_task(r).await }
+                },
+            )
             .await
             .map_err(|e| passthrough(e, "transition-read"))?
             .into_inner()
@@ -196,13 +208,15 @@ fn passthrough(status: Status, op: &str) -> Status {
         // request arriving before `task-db` is reachable fails RECOVERABLY. The
         // `_ =>` arm below collapsed it into INTERNAL, so the recoverable failure
         // was indistinguishable from a bug and no client would retry it.
-        //
-        // DEADLINE_EXCEEDED belongs with it rather than with the opaque arm: the
-        // store did not refuse the work, it did not answer in time — which is a
-        // transient condition of the same shape, and one a caller can act on
-        // identically.
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+        tonic::Code::Unavailable => {
             Status::unavailable("the task store could not be reached in time — retry")
+        }
+        // ADR-1019: the caller's own deadline ran out on the `-db` hop (or the
+        // `-db` request ceiling did). That is DEADLINE_EXCEEDED to the caller,
+        // not UNAVAILABLE: a caller that already gave up has nothing to retry
+        // against, and one with time left sees the true cause.
+        tonic::Code::DeadlineExceeded => {
+            Status::deadline_exceeded("the task store did not answer in time")
         }
         _ => Status::internal("the task store is unavailable"),
     }

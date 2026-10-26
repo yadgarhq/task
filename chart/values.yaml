@@ -25,7 +25,7 @@ taskDb:
 
   # HOW LONG ONE REQUEST TO task-db MAY WAIT for a peer that is connected and
   # never replies, in whole seconds (ADR-0705, ADR-0925 Q-C1). The binary has NO
-  # compiled-in default (ADR-0569); this explicit default is the only place 30
+  # compiled-in default (ADR-0569); this explicit default is the only place 14
   # lives, and `chart/values.schema.json` makes the key `required`.
   #
   # BOUNDED 14..=59 by `yadgar_dial`: below 14 the bound fires before HTTP/2
@@ -33,10 +33,15 @@ taskDb:
   # after the ingress has given up. `tests/chart_request_timeout.rs` holds the
   # schema's `minimum` and `maximum` to the pinned dial's own.
   #
-  # KEEP IT ABOVE task-db's pool acquire timeout (25s, ADR-0925): a request
-  # waiting on a pool slot must be allowed to wait as long as the pool does. The
-  # cross-chart check is ledger 1524, not this chart.
-  requestTimeoutSeconds: 30
+  # THE TIMEOUT CHAIN SHRINKS INWARD (ADR-1006): each hop's timeout sits
+  # strictly below its caller's, so the innermost component reports the real
+  # fault. 14 is below the gateway's 16 for its hop to task, and above task-db's
+  # pool acquire timeout (12s under ADR-1006): a request waiting on a pool slot
+  # must be allowed to wait as long as the pool does. 14 is also dial's floor,
+  # so this default cannot go lower. Neither neighbour's value is visible from
+  # this chart; the cross-chart check belongs to the parent chart
+  # (`yadgarhq/yadgar`), ledger 1524.
+  requestTimeoutSeconds: 14
 
   # The TRANSPORT to that twin. Everything in the cluster is cleartext today,
   # so a bearer token and every task body cross the pod network in the open;
@@ -221,6 +226,38 @@ tls:
   # is free to call them something else.
   certSecretKey: tls.crt
   keySecretKey: tls.key
+
+# THE LISTENER'S PROTOCOL LIMITS (ADR-1006). Chart values with stated
+# defaults, not constants: adopters size clusters differently, so a limit
+# belongs where an operator can change it. Each renders into a `LISTEN_*`
+# variable, and the binary has NO compiled-in default for any of them
+# (ADR-0569): an absent, non-numeric or out-of-range value refuses the boot
+# naming the variable and the key below.
+#
+# THE RANGES ARE `yadgar-lifecycle`'s (`ServerLimits::*`), and
+# `values.schema.json` states the same ones; `tests/chart_server_limits.rs`
+# holds the schema and these defaults to the pinned crate. The keepalive
+# timeout must also sit below the interval, a cross-key rule the schema cannot
+# express, so `templates/render-checks.yaml` refuses it by name.
+#
+# A NEW BLOCK, because this chart had no `server:` block before; the leaves are
+# camelCase with a unit suffix, as `taskDb.requestTimeoutSeconds` is.
+#
+# connection age (ADR-1006, 30 min) omitted until tonic#2780 ships; yaadgaar
+# #417. On tonic 0.14.6 `max_connection_age` panics the connection task after
+# GOAWAY and fails the calls in flight, so `yadgar-lifecycle` dropped it.
+server:
+  limits:
+    # Concurrent HTTP/2 streams one connection may open. 1..=10000.
+    maxConcurrentStreams: 256
+    # How often an idle connection is PINGed, in seconds. 1..=3600.
+    keepaliveIntervalSeconds: 30
+    # How long a PING may go unanswered before the connection is closed, in
+    # seconds. 1..=600, and below `keepaliveIntervalSeconds`.
+    keepaliveTimeoutSeconds: 10
+    # The largest HTTP/2 header list a request may carry, in bytes.
+    # 1024..=1048576.
+    maxHeaderListBytes: 16384
 
 # HOW A RENEWED CERTIFICATE ACTUALLY REACHES THE PROCESS.
 #

@@ -62,13 +62,14 @@ pub async fn serve_until_drained(
     mut server: Server,
     tls: Option<ServerTls>,
     channel: Channel,
+    ceiling: std::time::Duration,
     watch_inputs: Inputs,
     schedule: Schedule,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
+    // serve traffic, which is D67's rule applied to the metrics path too.
     // Named on the way out, for the reason given on TASK_DB_PORT above.
     let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
         .parse()
@@ -114,7 +115,7 @@ pub async fn serve_until_drained(
     let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
     let serving = tokio::spawn(
         server
-            .add_service(TaskServiceServer::new(Task::new(channel)))
+            .add_service(TaskServiceServer::new(Task::new(channel, ceiling)))
             .serve_with_shutdown(addr, async {
                 let _ = stop_requested.await;
             }),

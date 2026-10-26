@@ -6,6 +6,7 @@
 //! Nothing about what any of them does changed in the move.
 
 use tonic::{Request, Response, Status};
+use yadgar_dial::Deadline;
 use yadgar_telemetry::estimator::Class;
 use yadgar_telemetry::grpc::status_name;
 use yadgar_telemetry::observe::{Call, Outcome};
@@ -23,6 +24,7 @@ impl TaskService for Task {
         &self,
         request: Request<api::CreateTaskRequest>,
     ) -> Result<Response<api::CreateTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         // Started BEFORE the work, so the duration covers the handler and the
         // scope is captured before the request is consumed by the -db call.
@@ -42,21 +44,26 @@ impl TaskService for Task {
                 }
                 rules::title_fits(&req.title).map_err(Status::invalid_argument)?;
 
-                let created = self
-                    .db
-                    .clone()
-                    .create_task(db::CreateTaskRequest {
-                        idempotency: req.idempotency,
-                        scope: req.scope,
-                        task: Some(db::Task {
-                            title: req.title,
-                            body: req.body,
-                            status: db::TaskStatus::Open as i32,
-                            tags: req.tags,
-                            links: req.links,
-                            ..Default::default()
+                let created = deadline
+                    .call(
+                        self.ceiling,
+                        tonic::Request::new(db::CreateTaskRequest {
+                            idempotency: req.idempotency,
+                            scope: req.scope,
+                            task: Some(db::Task {
+                                title: req.title,
+                                body: req.body,
+                                status: db::TaskStatus::Open as i32,
+                                tags: req.tags,
+                                links: req.links,
+                                ..Default::default()
+                            }),
                         }),
-                    })
+                        |r| {
+                            let mut db = self.db.clone();
+                            async move { db.create_task(r).await }
+                        },
+                    )
                     .await
                     .map_err(|e| passthrough(e, "create"))?
                     .into_inner();
@@ -86,6 +93,7 @@ impl TaskService for Task {
         &self,
         request: Request<api::ReadTaskRequest>,
     ) -> Result<Response<api::ReadTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(
             "task",
@@ -106,13 +114,18 @@ impl TaskService for Task {
                     }
                 };
 
-                let got = self
-                    .db
-                    .clone()
-                    .get_task(db::GetTaskRequest {
-                        scope: req.scope,
-                        key: Some(key),
-                    })
+                let got = deadline
+                    .call(
+                        self.ceiling,
+                        tonic::Request::new(db::GetTaskRequest {
+                            scope: req.scope,
+                            key: Some(key),
+                        }),
+                        |r| {
+                            let mut db = self.db.clone();
+                            async move { db.get_task(r).await }
+                        },
+                    )
                     .await
                     .map_err(|e| passthrough(e, "read"))?
                     .into_inner();
@@ -138,6 +151,7 @@ impl TaskService for Task {
         &self,
         request: Request<api::FindTasksRequest>,
     ) -> Result<Response<api::FindTasksResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(
             "task",
@@ -148,15 +162,20 @@ impl TaskService for Task {
 
         call.run(
             async move {
-                let found = self
-                    .db
-                    .clone()
-                    .list_tasks(db::ListTasksRequest {
-                        scope: req.scope,
-                        statuses: req.statuses,
-                        page_size: req.page_size,
-                        page_token: req.page_token,
-                    })
+                let found = deadline
+                    .call(
+                        self.ceiling,
+                        tonic::Request::new(db::ListTasksRequest {
+                            scope: req.scope,
+                            statuses: req.statuses,
+                            page_size: req.page_size,
+                            page_token: req.page_token,
+                        }),
+                        |r| {
+                            let mut db = self.db.clone();
+                            async move { db.list_tasks(r).await }
+                        },
+                    )
                     .await
                     .map_err(|e| passthrough(e, "find"))?
                     .into_inner();
@@ -186,6 +205,7 @@ impl TaskService for Task {
         &self,
         request: Request<api::EditTaskRequest>,
     ) -> Result<Response<api::EditTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(
             "task",
@@ -201,9 +221,13 @@ impl TaskService for Task {
                 // no edit may write is refused here rather than after a `get_task`
                 // round trip whose answer was always going to be discarded.
                 let paths = writes::requested_paths(req.update_mask.as_ref())?;
-                // The key and the body digest are decisions about the request
-                // alone too, so they are settled before the read as well.
+                // The key, the patch's shape and the body digest are decisions
+                // about the request alone too, so they are settled before the
+                // read as well. In patch mode the digest is over the PRE-edit
+                // body, so only its length is settled here; `writes::patched`
+                // compares it after the read (ADR-1008).
                 let key = writes::target_key(&req.id, req.number)?;
+                writes::check_patch(&req, &paths)?;
                 writes::check_body_digest(&req, &paths)?;
 
                 // THE TITLE RULE, and it applies only to an edit that WRITES a
@@ -229,23 +253,37 @@ impl TaskService for Task {
                 // the rule is in the request rather than in this handler's
                 // discipline. It now also supplies the fields the mask does NOT
                 // name, for the rollout reason `edit_request` documents.
-                let current = self
-                    .db
-                    .clone()
-                    .get_task(db::GetTaskRequest {
-                        scope: req.scope.clone(),
-                        key: Some(key),
-                    })
+                let current = deadline
+                    .call(
+                        self.ceiling,
+                        tonic::Request::new(db::GetTaskRequest {
+                            scope: req.scope.clone(),
+                            key: Some(key),
+                        }),
+                        |r| {
+                            let mut db = self.db.clone();
+                            async move { db.get_task(r).await }
+                        },
+                    )
                     .await
                     .map_err(|e| passthrough(e, "edit-read"))?
                     .into_inner()
                     .task
                     .ok_or_else(|| Status::not_found("no such task in this scope"))?;
 
-                let updated = self
-                    .db
-                    .clone()
-                    .update_task(writes::edit_request(req, &current, &paths))
+                // A patch becomes a whole-body edit here, against the body
+                // just read (ADR-1008); any other edit passes through as sent.
+                let (req, paths) = writes::patched(req, &current, &paths)?;
+
+                let updated = deadline
+                    .call(
+                        self.ceiling,
+                        tonic::Request::new(writes::edit_request(req, &current, &paths)),
+                        |r| {
+                            let mut db = self.db.clone();
+                            async move { db.update_task(r).await }
+                        },
+                    )
                     .await
                     .map_err(|e| passthrough(e, "edit"))?
                     .into_inner();
@@ -294,6 +332,7 @@ impl TaskService for Task {
         &self,
         request: Request<api::TransitionTaskRequest>,
     ) -> Result<Response<api::TransitionTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(
             "task",
@@ -307,7 +346,7 @@ impl TaskService for Task {
                 // THE DECISION, ALL OF IT, BEFORE THE WRITE. See
                 // `Task::decide_transition` for what it settles, and for why
                 // the refusal it can raise is INVALID_ARGUMENT.
-                let (current, from, to) = self.decide_transition(&req).await?;
+                let (current, from, to) = self.decide_transition(&req, deadline).await?;
 
                 // THE WRITE BELOW CARRIES `req.expect_version`, NOT
                 // `current.meta.version`, AND THAT IS DELIBERATE. A scanner reads
@@ -367,10 +406,15 @@ impl TaskService for Task {
                 // second is plainly false, since the version is the ORIGINAL
                 // write's and the project comes from the scope. A synthesised
                 // envelope is a guess wearing the shape of an answer.
-                let updated = self
-                    .db
-                    .clone()
-                    .update_task(writes::transition_request(req, &current, to))
+                let updated = deadline
+                    .call(
+                        self.ceiling,
+                        tonic::Request::new(writes::transition_request(req, &current, to)),
+                        |r| {
+                            let mut db = self.db.clone();
+                            async move { db.update_task(r).await }
+                        },
+                    )
                     .await
                     .map_err(|e| passthrough(e, "transition"))?
                     .into_inner();
@@ -399,6 +443,7 @@ impl TaskService for Task {
         &self,
         request: Request<api::RemoveTaskRequest>,
     ) -> Result<Response<api::RemoveTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(
             "task",
@@ -409,14 +454,20 @@ impl TaskService for Task {
 
         call.run(
             async move {
-                self.db
-                    .clone()
-                    .delete_task(db::DeleteTaskRequest {
-                        idempotency: req.idempotency,
-                        scope: req.scope,
-                        id: req.id,
-                        expect_version: req.expect_version,
-                    })
+                deadline
+                    .call(
+                        self.ceiling,
+                        tonic::Request::new(db::DeleteTaskRequest {
+                            idempotency: req.idempotency,
+                            scope: req.scope,
+                            id: req.id,
+                            expect_version: req.expect_version,
+                        }),
+                        |r| {
+                            let mut db = self.db.clone();
+                            async move { db.delete_task(r).await }
+                        },
+                    )
                     .await
                     .map_err(|e| passthrough(e, "remove"))?;
                 // No payload to measure: RemoveTaskResponse is empty. Recording it
