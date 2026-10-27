@@ -1877,6 +1877,7 @@ fn a_patch(old: &str, new: &str, expect_count: u32) -> api::EditTaskRequest {
             old: old.into(),
             new: new.into(),
             expect_count,
+            expect_new_sha256: Vec::new(),
         }),
         ..an_edit()
     }
@@ -2232,9 +2233,8 @@ async fn a_patch_whose_result_would_be_huge_is_refused_without_building_it() {
 /// read+1 has its patch computed on the older body, and the store's
 /// compare-and-set passes if another writer lands that version in between.
 ///
-/// The message carries NO reason token: ADR-1008 lists the tokens a patch
-/// refusal may start with on `EditTaskRequest.patch`, and a stale version is
-/// not one of them, as it is not in whole-body mode either.
+/// The message starts with VERSION_MISMATCH (ADR-1042 rule 10): this service
+/// read the task itself and saw a version other than the caller's.
 #[tokio::test]
 async fn a_patch_whose_expect_version_is_not_the_version_read_is_refused() {
     let (svc, seen) = wire(a_store_holding_it()).await;
@@ -2248,8 +2248,8 @@ async fn a_patch_whose_expect_version_is_not_the_version_read_is_refused() {
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(
         status.message(),
-        "the task is at version 3, not the expect_version 4 this patch names; nothing \
-         was written. Re-read the task"
+        "VERSION_MISMATCH: the task is at version 3, not the expect_version 4 this patch \
+         names; nothing was written. Re-read the task"
     );
     assert!(seen.lock().unwrap().update.is_empty());
 }
@@ -2263,6 +2263,274 @@ async fn a_patch_sends_the_callers_expect_version_to_the_store() {
         .await
         .expect("a matching patch");
     assert_eq!(seen.lock().unwrap().update[0].expect_version, 3);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-1042: VERSION_MISMATCH, D9 replay, and BodyPatch.expect_new_sha256.
+// ---------------------------------------------------------------------------
+
+/// The idempotency key both attempts of a retry carry.
+const RETRY_KEY: &str = "0192f3c1-the-key-a-retry-carries";
+
+/// `printf 'patched' | sha256sum` (ADR-0573): the digest of the `new` that
+/// `a_patch("stored", "patched", 1)` sends.
+const PATCHED_SHA256: &str = "d7017ebcd65455e76e953d5b42fa96c3df28c7c3b616c7f069ed930fb4fae5fd";
+
+/// `printf '' | sha256sum`: the SHA-256 of no bytes.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// The full refusal `passthrough` gives a store FAILED_PRECONDITION. Every
+/// untokened case must produce it, and no tokened case may.
+const UNTOKENED_REFUSAL: &str = "a version mismatch, no such task in this scope, or a task you \
+     may read but not modify. Re-read: if the version has moved, retry with the new one. If \
+     the read returns the same version, or returns nothing, retrying will fail identically.";
+
+/// A store whose read shows the task at `version`, and whose write answers
+/// `update`.
+fn a_store_at(version: u64, update: Canned<db::UpdateTaskResponse>) -> MockDb {
+    let mut task = a_stored_task(db::TaskStatus::Open as i32);
+    task.meta
+        .as_mut()
+        .expect("a stored task has a meta")
+        .version = version;
+    MockDb {
+        get: Some(Ok(db::GetTaskResponse { task: Some(task) })),
+        update: Some(update),
+        ..Default::default()
+    }
+}
+
+fn with_key(req: api::EditTaskRequest) -> api::EditTaskRequest {
+    api::EditTaskRequest {
+        idempotency: Some(common::Idempotency {
+            key: RETRY_KEY.into(),
+        }),
+        ..req
+    }
+}
+
+fn a_guarded_patch(new: &str, sha: Vec<u8>) -> api::EditTaskRequest {
+    let mut req = a_patch("stored", new, 1);
+    req.patch
+        .as_mut()
+        .expect("a_patch sends a patch")
+        .expect_new_sha256 = sha;
+    req
+}
+
+/// **WHOLE-BODY MODE: THE TOKEN FOLLOWS THE STORE'S REFUSAL.** The read
+/// showed version 9 against the caller's 3, and the store refused the
+/// compare-and-set, so the refusal names the version. The write WAS sent: the
+/// token is added after the store answers, never instead of asking it.
+#[tokio::test]
+async fn a_whole_body_edit_the_store_refuses_on_a_moved_version_is_version_mismatch() {
+    let (svc, seen) = wire(a_store_at(9, Err((Code::FailedPrecondition, DB_DETAIL)))).await;
+    let status = svc
+        .edit_task(Request::new(a_body_edit(WHOLE_BODY, Vec::new())))
+        .await
+        .expect_err("the store refused the compare-and-set");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "VERSION_MISMATCH: the task was at version 9 when read, not the expect_version 3 \
+         this edit names; nothing was written. Re-read the task and retry with the version \
+         you then see"
+    );
+    assert_eq!(
+        seen.lock().unwrap().update.len(),
+        1,
+        "the token must follow the store's refusal, not replace the write"
+    );
+}
+
+/// **A WHOLE-BODY RETRY WITH THE SAME KEY IS STILL REPLAYED (D9).** After the
+/// first attempt applied, the read shows the NEXT version, so the caller's
+/// `expect_version` is stale against it. `task-db` claims the key before its
+/// compare-and-set and replays the recorded answer. This service must not
+/// refuse the retry ahead of the store.
+#[tokio::test]
+async fn a_whole_body_retry_with_the_same_key_is_still_replayed() {
+    let (svc, seen) = wire(a_store_at(
+        4,
+        Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+            previous_status: db::TaskStatus::Open as i32,
+        }),
+    ))
+    .await;
+    let meta = svc
+        .edit_task(Request::new(with_key(a_body_edit(WHOLE_BODY, Vec::new()))))
+        .await
+        .expect("a same-key retry is a replay, never a failure")
+        .into_inner()
+        .meta
+        .expect("a replay carries the recorded meta");
+    assert_eq!(meta.id, STORE_ID);
+    assert_eq!(meta.version, STORE_VERSION);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.update.len(), 1, "the store must see the retry");
+    assert_eq!(
+        seen.update[0]
+            .idempotency
+            .as_ref()
+            .expect("the key travels")
+            .key,
+        RETRY_KEY
+    );
+    assert_eq!(seen.update[0].expect_version, 3);
+}
+
+/// **A PATCH RETRY WITH THE SAME KEY IS REFUSED, NOT REPLAYED** (ADR-1042
+/// rule 12). The read after the first attempt shows the next version, so the
+/// patch is refused before the store sees the key, and the refusal is tokened.
+#[tokio::test]
+async fn a_patch_retry_with_the_same_key_is_version_mismatch() {
+    let (svc, seen) = wire(a_store_at(
+        4,
+        Ok(db::UpdateTaskResponse {
+            meta: Some(store_meta()),
+            previous_status: db::TaskStatus::Open as i32,
+        }),
+    ))
+    .await;
+    let status = svc
+        .edit_task(Request::new(with_key(a_patch("stored", "patched", 1))))
+        .await
+        .expect_err("the patch was already applied");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status.message().starts_with("VERSION_MISMATCH: "),
+        "{}",
+        status.message()
+    );
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// **THE STORE'S REFUSAL STAYS UNTOKENED WHEN THIS SERVICE SAW NO MISMATCH.**
+/// The read matched `expect_version`, so a writer landed between the read and
+/// the write, or the task is read-only for this caller. The store does not say
+/// which, and no token is claimed, in either mode.
+#[tokio::test]
+async fn a_store_refusal_after_a_matching_read_stays_untokened() {
+    for req in [
+        a_body_edit(WHOLE_BODY, Vec::new()),
+        a_patch("stored", "patched", 1),
+    ] {
+        let (svc, seen) = wire(a_store_at(3, Err((Code::FailedPrecondition, DB_DETAIL)))).await;
+        let status = svc
+            .edit_task(Request::new(req))
+            .await
+            .expect_err("the store refused the compare-and-set");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(status.message(), UNTOKENED_REFUSAL);
+        assert_eq!(seen.lock().unwrap().update.len(), 1);
+    }
+}
+
+/// Only a FAILED_PRECONDITION gets the token. A store that aborts the write
+/// keeps its own code, whatever the read showed.
+#[tokio::test]
+async fn a_store_abort_after_a_moved_read_stays_aborted() {
+    let (svc, _) = wire(a_store_at(9, Err((Code::Aborted, DB_DETAIL)))).await;
+    let status = svc
+        .edit_task(Request::new(a_body_edit(WHOLE_BODY, Vec::new())))
+        .await
+        .expect_err("the store aborted");
+    assert_eq!(status.code(), Code::Aborted);
+}
+
+/// Only a FAILED_PRECONDITION gets the token. A store INVALID_ARGUMENT (the
+/// D9 refusal of a key reused with a different payload) keeps its own code
+/// after a moved read, so no caller is told to re-read for it.
+#[tokio::test]
+async fn a_store_invalid_argument_after_a_moved_read_stays_untokened() {
+    let (svc, _) = wire(a_store_at(9, Err((Code::InvalidArgument, DB_DETAIL)))).await;
+    let status = svc
+        .edit_task(Request::new(with_key(a_body_edit(WHOLE_BODY, Vec::new()))))
+        .await
+        .expect_err("the store refused the reused key");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "invalid request");
+}
+
+/// The guard admits the `new` it was computed over.
+#[tokio::test]
+async fn a_patch_whose_new_matches_its_digest_is_applied() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    svc.edit_task(Request::new(a_guarded_patch(
+        "patched",
+        digest(PATCHED_SHA256),
+    )))
+    .await
+    .expect("the digest is over this `new`");
+    assert_eq!(written(&seen).0, "the patched body");
+}
+
+/// **THE CASE THE GUARD EXISTS FOR.** A `new` cut off in transit, and one with
+/// an extra trailing newline, are refused with the token before the store is
+/// read.
+#[tokio::test]
+async fn a_patch_whose_new_does_not_match_its_digest_is_refused_before_anything_is_read() {
+    for new in ["patch", "patched\n"] {
+        let (svc, seen) = wire(a_store_holding_it()).await;
+        let status = svc
+            .edit_task(Request::new(a_guarded_patch(new, digest(PATCHED_SHA256))))
+            .await
+            .expect_err("`new` is not the one the digest was computed over");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().starts_with("PATCH_NEW_SHA256_MISMATCH: "),
+            "{}",
+            status.message()
+        );
+        assert!(seen.lock().unwrap().get.is_empty());
+        assert!(seen.lock().unwrap().update.is_empty());
+    }
+}
+
+/// A digest that is not 32 bytes is refused, untokened, before the store is
+/// read. The 64-byte case is the hex string sent as raw bytes, which is the
+/// realistic mistake.
+#[tokio::test]
+async fn a_patch_digest_of_the_wrong_length_is_refused_before_anything_is_read() {
+    let mut short = digest(PATCHED_SHA256);
+    short.pop();
+    for sha in [short, PATCHED_SHA256.as_bytes().to_vec(), vec![0]] {
+        let len = sha.len();
+        let (svc, seen) = wire(a_store_holding_it()).await;
+        let status = svc
+            .edit_task(Request::new(a_guarded_patch("patched", sha)))
+            .await
+            .expect_err("a digest is 32 bytes");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            format!(
+                "a patch's `expect_new_sha256` must be a 32-byte SHA-256 digest, not {len} bytes"
+            )
+        );
+        assert!(seen.lock().unwrap().get.is_empty());
+    }
+}
+
+/// An empty `new` can be guarded: its digest is the SHA-256 of no bytes. A
+/// wrong digest over an empty `new` is still refused.
+#[tokio::test]
+async fn an_empty_new_with_the_guard_set_is_checked_like_any_other() {
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    svc.edit_task(Request::new(a_guarded_patch("", digest(EMPTY_SHA256))))
+        .await
+        .expect("the digest of no bytes guards an empty `new`");
+    assert_eq!(written(&seen).0, "the  body");
+
+    let (svc, seen) = wire(a_store_holding_it()).await;
+    let status = svc
+        .edit_task(Request::new(a_guarded_patch("", digest(PATCHED_SHA256))))
+        .await
+        .expect_err("an empty `new` is not `patched`");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status.message().starts_with("PATCH_NEW_SHA256_MISMATCH: "));
+    assert!(seen.lock().unwrap().get.is_empty());
 }
 
 // ---------------------------------------------------------------------------
