@@ -116,6 +116,7 @@ struct Recorded {
     get: Vec<db::GetTaskRequest>,
     list: Vec<db::ListTasksRequest>,
     delete: Vec<db::DeleteTaskRequest>,
+    lookup: Vec<db::LookupWriteRequest>,
     /// The `grpc-timeout` each call arrived with, in call order (ADR-1019). `None`
     /// when the header was absent.
     timeouts: Vec<Option<Duration>>,
@@ -157,6 +158,10 @@ struct MockDb {
     get: Option<Canned<db::GetTaskResponse>>,
     list: Option<Canned<db::ListTasksResponse>>,
     delete: Option<Canned<db::DeleteTaskResponse>>,
+    /// `LookupWrite` (ADR-1051). Unscripted answers UNIMPLEMENTED, which is
+    /// what a `task-db` older than 0.11.8 answers, so a keyed test must say
+    /// whether the key is a miss or a hit.
+    lookup: Option<Canned<db::LookupWriteResponse>>,
     seen: Arc<Mutex<Recorded>>,
     /// Never answer: park every call forever (ADR-1019).
     hang: bool,
@@ -241,6 +246,15 @@ impl TaskDbService for MockDb {
         self.arrive(&request).await;
         self.seen.lock().unwrap().delete.push(request.into_inner());
         answer(&self.delete, "DeleteTask")
+    }
+
+    async fn lookup_write(
+        &self,
+        request: Request<db::LookupWriteRequest>,
+    ) -> Result<Response<db::LookupWriteResponse>, Status> {
+        self.arrive(&request).await;
+        self.seen.lock().unwrap().lookup.push(request.into_inner());
+        answer(&self.lookup, "LookupWrite")
     }
 }
 
@@ -1146,53 +1160,19 @@ async fn a_transition_writes_the_status_column_and_names_only_it() {
     );
 }
 
-/// CHARACTERISATION, ledger 508 — and it PASSES ON UNFIXED CODE BY DESIGN.
-/// There is no fix to make at this contract version, so this pins the gap rather
-/// than pretending to close it.
+/// **`from` IS THE STORE'S RECORDED PRIOR STATUS, NEVER THIS SERVICE'S READ**
+/// (ADR-1051 rule 7). This test used to pin the gap (ledger 508): `from` was
+/// read off the pre-write `GetTask`, so on a store replay it equalled `to`.
 ///
-/// THE TRACE. `transition_task` reads before it writes. On the retry of an
-/// already-applied transition, the read returns the NEW status, `may_transition`
-/// waves it through as an identity no-op, `task-db` replays the recorded
-/// `UpdateTaskResponse` without writing, and `from` is reported as the status the
-/// task is ALREADY in.
-///
-/// WHY THAT MATTERS. `taskapi.proto:91-93` says `from` exists "so a caller that
-/// raced another writer sees what actually happened rather than assuming its own
-/// read was current". On this path `from == to` always, so it carries no
-/// information at all, which is precisely the guarantee it was added to provide.
-///
-/// WHAT CHANGED, AND WHAT DID NOT. The field this test was waiting for exists:
-/// `UpdateTaskResponse.previous_status` arrived in proto v1.7.0, and
-/// `yadgarhq/task-db` populates it on every update. So the answer now REACHES
-/// this service — and this service still throws it away, which is the half that
-/// is left. `from` is still read off the pre-write `GetTask`, so on a replay it
-/// is still the post-transition status and still carries no information.
-///
-/// WHY IT IS NOT FIXED HERE. Wiring `from` to `previous_status` changes what
-/// this service answers, which is a behaviour change to `TaskService` rather
-/// than a consequence of the pin bump this commit carries. It is its own change
-/// with its own reasoning, and this test is what will go red when it lands.
-///
-/// The store's double below now supplies `previous_status: BLOCKED`, a value
-/// neither the read nor the request contains. The assertions pin BOTH halves:
-/// `from` equals `to` (the gap), and `from` is not the value the store
-/// supplied (the reason the gap survives). Wiring `from` correctly inverts the
-/// second assertion, which is what makes this test a tripwire rather than a
-/// comment.
+/// The read here shows DONE, the target is DONE, and the store reports
+/// `previous_status: BLOCKED`, a value neither the read nor the request
+/// contains. `from` must be BLOCKED: it can only have come from the store.
 #[tokio::test]
-async fn a_replayed_transition_reports_a_from_that_carries_no_information() {
-    // The store already holds DONE: this is the retry, after the first delivery
-    // applied the transition.
+async fn a_transition_reports_the_prior_status_the_store_recorded_not_its_own_read() {
     let (svc, seen) = wire(MockDb {
         get: Some(Ok(db::GetTaskResponse {
             task: Some(a_stored_task(db::TaskStatus::Done as i32)),
         })),
-        // What `idem::claim` replays: the FIRST call's response, verbatim —
-        // and at proto v1.7.1 that response CARRIES the prior status. BLOCKED
-        // is deliberate: it is neither the status the read returns (DONE) nor
-        // the target the request names (DONE), so a `from` carrying it could
-        // only have come from the store. The handler discards it, and the
-        // assertion below is what says so.
         update: Some(Ok(db::UpdateTaskResponse {
             meta: Some(store_meta()),
             previous_status: db::TaskStatus::Blocked as i32,
@@ -1201,43 +1181,16 @@ async fn a_replayed_transition_reports_a_from_that_carries_no_information() {
     })
     .await;
 
-    let request = a_transition(db::TaskStatus::Done as i32);
-    let to = request.to;
-
     let response = svc
-        .transition_task(Request::new(request))
+        .transition_task(Request::new(a_transition(db::TaskStatus::Done as i32)))
         .await
-        .expect("an identity transition is allowed, so the retry succeeds")
+        .expect("an identity transition is allowed")
         .into_inner();
 
-    assert_eq!(
-        response.from, to,
-        "THE GAP: on a replay `from` equals `to`, so the field the contract adds \
-         for a racing caller tells that caller nothing"
-    );
-    assert_ne!(
-        response.from,
-        db::TaskStatus::Blocked as i32,
-        "THE REASON THE GAP SURVIVES: the store supplied the prior status on \
-         `UpdateTaskResponse.previous_status` and this service discarded it, \
-         answering from its own pre-write read instead. Wiring `from` to that \
-         field inverts this assertion, which is the point of writing it"
-    );
-
-    // The other half of the gap: there is no second place the prior status could
-    // have come from. One read, one write, and the write carries only the target.
+    assert_eq!(response.from, db::TaskStatus::Blocked as i32);
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.get.len(), 1, "the handler has exactly one read");
-    assert_eq!(seen.update.len(), 1, "the handler has exactly one write");
-    assert_eq!(
-        seen.update[0]
-            .task
-            .as_ref()
-            .expect("a transition carries a task")
-            .status,
-        to,
-        "the write names the target, so nothing on the wire holds the predecessor"
-    );
+    assert_eq!(seen.get.len(), 1);
+    assert_eq!(seen.update.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1200,10 @@ async fn a_replayed_transition_reports_a_from_that_carries_no_information() {
 #[tokio::test]
 async fn a_remove_forwards_the_compare_and_set_version() {
     let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_miss())),
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
         delete: Some(Ok(db::DeleteTaskResponse {})),
         ..Default::default()
     })
@@ -1277,6 +1234,7 @@ async fn a_remove_forwards_the_compare_and_set_version() {
 #[tokio::test]
 async fn a_remove_of_a_task_the_store_does_not_hold_is_not_found() {
     let (svc, _) = wire(MockDb {
+        get: Some(Err((Code::NotFound, DB_DETAIL))),
         delete: Some(Err((Code::NotFound, DB_DETAIL))),
         ..Default::default()
     })
@@ -2343,20 +2301,24 @@ async fn a_whole_body_edit_the_store_refuses_on_a_moved_version_is_version_misma
     );
 }
 
-/// **A WHOLE-BODY RETRY WITH THE SAME KEY IS STILL REPLAYED (D9).** After the
-/// first attempt applied, the read shows the NEXT version, so the caller's
+/// **A WHOLE-BODY RETRY THAT MISSES THE LOOKUP STILL REACHES THE STORE'S
+/// CLAIM (D9, ADR-1051 rule 8).** The lookup missed (another attempt claimed
+/// the key in between), and the read shows the NEXT version, so the caller's
 /// `expect_version` is stale against it. `task-db` claims the key before its
 /// compare-and-set and replays the recorded answer. This service must not
 /// refuse the retry ahead of the store.
 #[tokio::test]
 async fn a_whole_body_retry_with_the_same_key_is_still_replayed() {
-    let (svc, seen) = wire(a_store_at(
-        4,
-        Ok(db::UpdateTaskResponse {
-            meta: Some(store_meta()),
-            previous_status: db::TaskStatus::Open as i32,
-        }),
-    ))
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_miss())),
+        ..a_store_at(
+            4,
+            Ok(db::UpdateTaskResponse {
+                meta: Some(store_meta()),
+                previous_status: db::TaskStatus::Open as i32,
+            }),
+        )
+    })
     .await;
     let meta = svc
         .edit_task(Request::new(with_key(a_body_edit(WHOLE_BODY, Vec::new()))))
@@ -2380,30 +2342,31 @@ async fn a_whole_body_retry_with_the_same_key_is_still_replayed() {
     assert_eq!(seen.update[0].expect_version, 3);
 }
 
-/// **A PATCH RETRY WITH THE SAME KEY IS REFUSED, NOT REPLAYED** (ADR-1042
-/// rule 12). The read after the first attempt shows the next version, so the
-/// patch is refused before the store sees the key, and the refusal is tokened.
+/// **A PATCH RETRY WITH THE SAME KEY IS REPLAYED** (ADR-1051 rule 9, which
+/// reverses ADR-1042 rule 12). This test used to assert VERSION_MISMATCH: the
+/// read after the first attempt showed the next version, so the patch was
+/// refused before the store saw the key. Now the key is looked up first, the
+/// recorded outcome comes back, and nothing is read, patched or written.
 #[tokio::test]
-async fn a_patch_retry_with_the_same_key_is_version_mismatch() {
-    let (svc, seen) = wire(a_store_at(
-        4,
-        Ok(db::UpdateTaskResponse {
-            meta: Some(store_meta()),
-            previous_status: db::TaskStatus::Open as i32,
-        }),
-    ))
+async fn a_patch_retry_with_the_same_key_is_replayed() {
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_update(db::TaskStatus::Open))),
+        ..a_store_at(4, Err((Code::FailedPrecondition, DB_DETAIL)))
+    })
     .await;
-    let status = svc
+    let meta = svc
         .edit_task(Request::new(with_key(a_patch("stored", "patched", 1))))
         .await
-        .expect_err("the patch was already applied");
-    assert_eq!(status.code(), Code::FailedPrecondition);
-    assert!(
-        status.message().starts_with("VERSION_MISMATCH: "),
-        "{}",
-        status.message()
-    );
-    assert!(seen.lock().unwrap().update.is_empty());
+        .expect("a same-key patch retry is a replay")
+        .into_inner()
+        .meta
+        .expect("a replay carries the recorded meta");
+    assert_eq!(meta.id, STORE_ID);
+    assert_eq!(meta.version, STORE_VERSION);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.lookup.len(), 1);
+    assert!(seen.get.is_empty(), "a hit must not read");
+    assert!(seen.update.is_empty(), "a hit must not write");
 }
 
 /// **THE STORE'S REFUSAL STAYS UNTOKENED WHEN THIS SERVICE SAW NO MISMATCH.**
@@ -2444,7 +2407,11 @@ async fn a_store_abort_after_a_moved_read_stays_aborted() {
 /// after a moved read, so no caller is told to re-read for it.
 #[tokio::test]
 async fn a_store_invalid_argument_after_a_moved_read_stays_untokened() {
-    let (svc, _) = wire(a_store_at(9, Err((Code::InvalidArgument, DB_DETAIL)))).await;
+    let (svc, _) = wire(MockDb {
+        lookup: Some(Ok(a_miss())),
+        ..a_store_at(9, Err((Code::InvalidArgument, DB_DETAIL)))
+    })
+    .await;
     let status = svc
         .edit_task(Request::new(with_key(a_body_edit(WHOLE_BODY, Vec::new()))))
         .await
@@ -2740,5 +2707,647 @@ async fn an_edits_second_call_is_told_what_the_first_left() {
     assert!(
         second <= first - Duration::from_millis(150),
         "second call was told {second:?} after the first was told {first:?} and took 200 ms"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-1051: a keyed retry is looked up before the read, and replayed on a hit.
+// ADR-1050: TransitionTask and RemoveTask name a stale version too.
+// ---------------------------------------------------------------------------
+
+/// A lookup that found no claim: `outcome` unset, answered OK.
+fn a_miss() -> db::LookupWriteResponse {
+    db::LookupWriteResponse { outcome: None }
+}
+
+/// A lookup that found the first attempt's `UpdateTask`, recorded with
+/// `previous`. The meta is [`store_meta`], which no read below returns.
+fn a_hit_update(previous: db::TaskStatus) -> db::LookupWriteResponse {
+    db::LookupWriteResponse {
+        outcome: Some(db::lookup_write_response::Outcome::Update(
+            db::UpdateTaskResponse {
+                meta: Some(store_meta()),
+                previous_status: previous as i32,
+            },
+        )),
+    }
+}
+
+/// A lookup that found the first attempt's `DeleteTask`.
+fn a_hit_delete() -> db::LookupWriteResponse {
+    db::LookupWriteResponse {
+        outcome: Some(db::lookup_write_response::Outcome::Delete(
+            db::DeleteTaskResponse {},
+        )),
+    }
+}
+
+/// A scope the lookup must forward unchanged: the claim is keyed on its
+/// project and user.
+fn a_scope() -> Option<common::Scope> {
+    Some(common::Scope {
+        project_id: "quinyx/qwfm".into(),
+        user_id: "yadgar:user:the-caller".into(),
+        ..Default::default()
+    })
+}
+
+fn retry_key() -> Option<common::Idempotency> {
+    Some(common::Idempotency {
+        key: RETRY_KEY.into(),
+    })
+}
+
+/// The KAT transition of `tests/fingerprint.rs`, keyed. Its fingerprint is
+/// [`KAT_TRANSITION_SHA256`], computed outside this crate.
+fn a_kat_transition() -> api::TransitionTaskRequest {
+    api::TransitionTaskRequest {
+        idempotency: retry_key(),
+        scope: a_scope(),
+        id: "yadgar:task:kat".into(),
+        expect_version: 300,
+        to: db::TaskStatus::Done as i32,
+        number: 0,
+    }
+}
+
+/// The KAT remove of `tests/fingerprint.rs`, keyed.
+fn a_kat_remove() -> api::RemoveTaskRequest {
+    api::RemoveTaskRequest {
+        idempotency: retry_key(),
+        scope: a_scope(),
+        id: "yadgar:task:kat".into(),
+        expect_version: 300,
+    }
+}
+
+/// See `tests/fingerprint.rs` for how these were derived.
+const KAT_TRANSITION_SHA256: &str =
+    "200ec25084f8fef892aed75a7822fea8e0f2393e20b6a7691b97d05f2cd9f2a5";
+const KAT_REMOVE_SHA256: &str = "079d2f76e9d2792a8a21c3ed58358101a54756914e9de0489aba5567dcad77a8";
+
+fn keyed_transition(to: db::TaskStatus) -> api::TransitionTaskRequest {
+    api::TransitionTaskRequest {
+        idempotency: retry_key(),
+        ..a_transition(to as i32)
+    }
+}
+
+fn a_remove(idempotency: Option<common::Idempotency>) -> api::RemoveTaskRequest {
+    api::RemoveTaskRequest {
+        idempotency,
+        scope: None,
+        id: CALLER_ID.into(),
+        expect_version: 3,
+    }
+}
+
+/// A store whose read shows the task, in `status`, at `version`, and whose
+/// write and delete would REFUSE: a hit that ran either is caught.
+fn a_store_that_moved(version: u64, status: db::TaskStatus) -> MockDb {
+    let mut task = a_stored_task(status as i32);
+    task.meta.as_mut().expect("a meta").version = version;
+    MockDb {
+        get: Some(Ok(db::GetTaskResponse { task: Some(task) })),
+        update: Some(Err((Code::FailedPrecondition, DB_DETAIL))),
+        delete: Some(Err((Code::FailedPrecondition, DB_DETAIL))),
+        ..Default::default()
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// **REPLAY AFTER A DELETE (case 1).** The task is gone, so the read would
+/// answer NOT_FOUND. The key is looked up first and hits, so all three keyed
+/// writes return the recorded outcome with no read and no write.
+#[tokio::test]
+async fn a_hit_replays_after_the_task_was_deleted_without_reading() {
+    let gone = || MockDb {
+        get: Some(Err((Code::NotFound, DB_DETAIL))),
+        update: Some(Err((Code::NotFound, DB_DETAIL))),
+        delete: Some(Err((Code::NotFound, DB_DETAIL))),
+        ..Default::default()
+    };
+
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_update(db::TaskStatus::Open))),
+        ..gone()
+    })
+    .await;
+    let meta = svc
+        .edit_task(Request::new(with_key(an_edit())))
+        .await
+        .expect("an edit replay")
+        .into_inner()
+        .meta
+        .expect("the recorded meta");
+    assert_eq!((meta.id.as_str(), meta.version), (STORE_ID, STORE_VERSION));
+    assert_only_looked_up(&seen, db::WriteRpc::UpdateTask);
+
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_update(db::TaskStatus::Blocked))),
+        ..gone()
+    })
+    .await;
+    let response = svc
+        .transition_task(Request::new(keyed_transition(db::TaskStatus::Done)))
+        .await
+        .expect("a transition replay")
+        .into_inner();
+    assert_eq!(response.meta.expect("the recorded meta").id, STORE_ID);
+    assert_eq!(response.from, db::TaskStatus::Blocked as i32);
+    assert_only_looked_up(&seen, db::WriteRpc::UpdateTask);
+
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_delete())),
+        ..gone()
+    })
+    .await;
+    svc.remove_task(Request::new(a_remove(retry_key())))
+        .await
+        .expect("a remove replay");
+    assert_only_looked_up(&seen, db::WriteRpc::DeleteTask);
+}
+
+/// One lookup for `rpc`, carrying the retry key, and nothing else reached the
+/// store.
+fn assert_only_looked_up(seen: &Arc<Mutex<Recorded>>, rpc: db::WriteRpc) {
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.lookup.len(), 1);
+    assert_eq!(seen.lookup[0].rpc, rpc as i32);
+    assert_eq!(
+        seen.lookup[0].idempotency.as_ref().expect("the key").key,
+        RETRY_KEY
+    );
+    assert_eq!(seen.lookup[0].caller_fingerprint.len(), 32);
+    assert!(seen.get.is_empty(), "a hit must not read");
+    assert!(seen.update.is_empty(), "a hit must not update");
+    assert!(seen.delete.is_empty(), "a hit must not delete");
+}
+
+/// **REPLAY AFTER A CONCURRENT CHANGE (case 2), AND A HIT CARRIES NO TOKEN.**
+/// Another writer moved the task to version 9 and retitled it, so the store
+/// payload a fresh attempt would build now differs, and the store would
+/// refuse the write. The hit returns the recorded outcome anyway: no
+/// VERSION_MISMATCH, because none of the checks that emit one runs.
+#[tokio::test]
+async fn a_hit_replays_after_a_concurrent_edit_and_carries_no_token() {
+    let mut moved = a_store_that_moved(9, db::TaskStatus::Open);
+    if let Some(Ok(got)) = moved.get.as_mut() {
+        got.task.as_mut().expect("a task").title = "retitled by another writer".into();
+    }
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_update(db::TaskStatus::Open))),
+        ..moved
+    })
+    .await;
+    let meta = svc
+        .edit_task(Request::new(with_key(a_body_edit(WHOLE_BODY, Vec::new()))))
+        .await
+        .expect("a replay, not VERSION_MISMATCH")
+        .into_inner()
+        .meta
+        .expect("the recorded meta");
+    assert_eq!(meta.version, STORE_VERSION);
+    assert_only_looked_up(&seen, db::WriteRpc::UpdateTask);
+
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_delete())),
+        ..a_store_that_moved(9, db::TaskStatus::Open)
+    })
+    .await;
+    svc.remove_task(Request::new(a_remove(retry_key())))
+        .await
+        .expect("a replay, not VERSION_MISMATCH");
+    assert_only_looked_up(&seen, db::WriteRpc::DeleteTask);
+}
+
+/// **REPLAY AFTER A CONCURRENT TRANSITION (case 3).** The task is now
+/// DROPPED, so `may_transition(DROPPED, DONE)` would refuse with
+/// INVALID_ARGUMENT before the store. The rule check does not run on a hit,
+/// and `from` is the recorded prior status.
+#[tokio::test]
+async fn a_hit_replays_a_transition_the_rule_would_now_refuse() {
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_update(db::TaskStatus::InProgress))),
+        ..a_store_that_moved(9, db::TaskStatus::Dropped)
+    })
+    .await;
+    let response = svc
+        .transition_task(Request::new(keyed_transition(db::TaskStatus::Done)))
+        .await
+        .expect("a replay, not the rule's refusal")
+        .into_inner();
+    assert_eq!(response.from, db::TaskStatus::InProgress as i32);
+    assert_eq!(response.meta.expect("meta").version, STORE_VERSION);
+    assert_only_looked_up(&seen, db::WriteRpc::UpdateTask);
+}
+
+/// **A REPLAY OF A CLAIM RECORDED BEFORE THE STORE KEPT THE PRIOR STATUS**
+/// reports TASK_STATUS_UNSPECIFIED, carried through, never a guess from a
+/// read (proto v1.26.0, TransitionTaskResponse.from).
+#[tokio::test]
+async fn a_replay_with_no_recorded_prior_status_reports_unspecified() {
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_update(db::TaskStatus::Unspecified))),
+        ..a_store_that_moved(9, db::TaskStatus::Done)
+    })
+    .await;
+    let response = svc
+        .transition_task(Request::new(keyed_transition(db::TaskStatus::Done)))
+        .await
+        .expect("a replay")
+        .into_inner();
+    assert_eq!(response.from, db::TaskStatus::Unspecified as i32);
+    assert_only_looked_up(&seen, db::WriteRpc::UpdateTask);
+}
+
+/// **A MISS RUNS THE ORDINARY PATH AND SENDS THE CALLER FINGERPRINT.** The
+/// bytes on the lookup and on the write are the same, and they are the known
+/// answer computed outside this crate, so the wire carries the derivation
+/// rather than some other 32 bytes. The scope is forwarded to the lookup.
+#[tokio::test]
+async fn a_miss_runs_the_ordinary_path_and_sends_the_caller_fingerprint() {
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_miss())),
+        ..a_store_holding_it()
+    })
+    .await;
+    let response = svc
+        .transition_task(Request::new(a_kat_transition()))
+        .await
+        .expect("a fresh transition")
+        .into_inner();
+    assert_eq!(response.from, db::TaskStatus::Open as i32);
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.lookup.len(), 1);
+        assert_eq!(seen.lookup[0].rpc, db::WriteRpc::UpdateTask as i32);
+        assert_eq!(seen.lookup[0].scope, a_scope());
+        assert_eq!(
+            hex(&seen.lookup[0].caller_fingerprint),
+            KAT_TRANSITION_SHA256
+        );
+        assert_eq!(seen.get.len(), 1);
+        assert_eq!(seen.update.len(), 1);
+        assert_eq!(
+            hex(&seen.update[0].caller_fingerprint),
+            KAT_TRANSITION_SHA256
+        );
+    }
+
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_miss())),
+        get: Some(Ok(db::GetTaskResponse {
+            task: Some(a_stored_task(db::TaskStatus::Open as i32)),
+        })),
+        delete: Some(Ok(db::DeleteTaskResponse {})),
+        ..Default::default()
+    })
+    .await;
+    svc.remove_task(Request::new(a_kat_remove()))
+        .await
+        .expect("a fresh remove");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.lookup[0].rpc, db::WriteRpc::DeleteTask as i32);
+        assert_eq!(hex(&seen.lookup[0].caller_fingerprint), KAT_REMOVE_SHA256);
+        assert_eq!(
+            seen.get.len(),
+            1,
+            "the remove's pre-write read runs on a miss"
+        );
+        assert_eq!(seen.delete.len(), 1);
+        assert_eq!(hex(&seen.delete[0].caller_fingerprint), KAT_REMOVE_SHA256);
+    }
+
+    let edit = with_key(a_body_edit(WHOLE_BODY, Vec::new()));
+    let expected = yadgar_task::fingerprint::edit_task(&edit);
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_miss())),
+        ..a_store_holding_it()
+    })
+    .await;
+    svc.edit_task(Request::new(edit))
+        .await
+        .expect("a fresh edit");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.lookup[0].rpc, db::WriteRpc::UpdateTask as i32);
+    assert_eq!(seen.lookup[0].caller_fingerprint, expected);
+    assert_eq!(seen.update[0].caller_fingerprint, expected);
+}
+
+/// **A LOOKUP FAILURE FAILS THE CALL, WITH NO FALLBACK** (ADR-1051 rule 6).
+/// UNAVAILABLE passes through as UNAVAILABLE. UNIMPLEMENTED, which a
+/// `task-db` older than 0.11.8 answers, fails the call too: there is no
+/// tolerance for it (rule 11). Nothing is read or written either way.
+#[tokio::test]
+async fn a_lookup_failure_fails_every_keyed_write_and_touches_nothing_else() {
+    for (lookup, code) in [
+        (Some(Err((Code::Unavailable, DB_DETAIL))), Code::Unavailable),
+        (None, Code::Internal),
+    ] {
+        let store = || MockDb {
+            lookup: lookup.clone(),
+            ..a_store_holding_it()
+        };
+        let (svc, seen) = wire(store()).await;
+        let edit = svc.edit_task(Request::new(with_key(an_edit()))).await;
+        assert_eq!(edit.expect_err("lookup failed").code(), code);
+        assert_nothing_but_a_lookup(&seen);
+
+        let (svc, seen) = wire(store()).await;
+        let transition = svc
+            .transition_task(Request::new(keyed_transition(db::TaskStatus::Done)))
+            .await;
+        assert_eq!(transition.expect_err("lookup failed").code(), code);
+        assert_nothing_but_a_lookup(&seen);
+
+        let (svc, seen) = wire(store()).await;
+        let remove = svc.remove_task(Request::new(a_remove(retry_key()))).await;
+        assert_eq!(remove.expect_err("lookup failed").code(), code);
+        assert_nothing_but_a_lookup(&seen);
+    }
+}
+
+fn assert_nothing_but_a_lookup(seen: &Arc<Mutex<Recorded>>) {
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.lookup.len(), 1);
+    assert!(seen.get.is_empty() && seen.update.is_empty() && seen.delete.is_empty());
+}
+
+/// **AN EMPTY KEY DOES NO LOOKUP, AND THE WRITE CARRIES NO FINGERPRINT.**
+/// `idempotency` absent and present-but-empty are both an empty key. The
+/// mock's lookup is unscripted, so a lookup would fail the call.
+#[tokio::test]
+async fn an_empty_key_does_no_lookup_and_sends_no_fingerprint() {
+    for idempotency in [None, Some(common::Idempotency { key: String::new() })] {
+        let (svc, seen) = wire(a_store_holding_it()).await;
+        svc.edit_task(Request::new(api::EditTaskRequest {
+            idempotency: idempotency.clone(),
+            ..an_edit()
+        }))
+        .await
+        .expect("an unkeyed edit");
+        svc.transition_task(Request::new(api::TransitionTaskRequest {
+            idempotency: idempotency.clone(),
+            ..a_transition(db::TaskStatus::Done as i32)
+        }))
+        .await
+        .expect("an unkeyed transition");
+        {
+            let seen = seen.lock().unwrap();
+            assert!(seen.lookup.is_empty());
+            assert_eq!(seen.update.len(), 2);
+            assert!(seen.update.iter().all(|u| u.caller_fingerprint.is_empty()));
+        }
+
+        let (svc, seen) = wire(MockDb {
+            delete: Some(Ok(db::DeleteTaskResponse {})),
+            ..a_store_holding_it()
+        })
+        .await;
+        svc.remove_task(Request::new(a_remove(idempotency)))
+            .await
+            .expect("an unkeyed remove");
+        let seen = seen.lock().unwrap();
+        assert!(seen.lookup.is_empty());
+        assert!(seen.delete[0].caller_fingerprint.is_empty());
+    }
+}
+
+/// **A HIT IN ANOTHER ARM IS A STORE FAULT, NEVER A MISS.** Treating it as a
+/// miss would write a second time under a key the store says it holds.
+#[tokio::test]
+async fn a_hit_in_the_wrong_arm_is_internal_and_writes_nothing() {
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_delete())),
+        ..a_store_holding_it()
+    })
+    .await;
+    let status = svc
+        .edit_task(Request::new(with_key(an_edit())))
+        .await
+        .expect_err("a delete outcome cannot answer an edit");
+    assert_eq!(status.code(), Code::Internal);
+    assert_nothing_but_a_lookup(&seen);
+
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_hit_update(db::TaskStatus::Open))),
+        delete: Some(Ok(db::DeleteTaskResponse {})),
+        ..a_store_holding_it()
+    })
+    .await;
+    let status = svc
+        .remove_task(Request::new(a_remove(retry_key())))
+        .await
+        .expect_err("an update outcome cannot answer a remove");
+    assert_eq!(status.code(), Code::Internal);
+    assert_nothing_but_a_lookup(&seen);
+}
+
+/// **REQUEST-ONLY CHECKS RUN BEFORE THE LOOKUP.** A malformed keyed request
+/// is refused without the store being asked anything.
+#[tokio::test]
+async fn a_malformed_keyed_request_is_refused_before_the_lookup() {
+    let (svc, seen) = wire(MockDb {
+        lookup: Some(Ok(a_miss())),
+        ..a_store_holding_it()
+    })
+    .await;
+    let both = api::TransitionTaskRequest {
+        number: CALLER_NUMBER,
+        ..keyed_transition(db::TaskStatus::Done)
+    };
+    let unknown_to = api::TransitionTaskRequest {
+        to: 999,
+        ..keyed_transition(db::TaskStatus::Done)
+    };
+    for req in [both, unknown_to] {
+        let status = svc
+            .transition_task(Request::new(req))
+            .await
+            .expect_err("malformed");
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+    let status = svc
+        .edit_task(Request::new(api::EditTaskRequest {
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["status".into()],
+            }),
+            ..with_key(an_edit())
+        }))
+        .await
+        .expect_err("status is not editable");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let status = svc
+        .remove_task(Request::new(api::RemoveTaskRequest {
+            id: String::new(),
+            ..a_remove(retry_key())
+        }))
+        .await
+        .expect_err("no id");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(seen.lock().unwrap().lookup.is_empty());
+}
+
+const REMOVE_MISMATCH: &str = "VERSION_MISMATCH: the task was at version 9 when read, not the \
+     expect_version 3 this removal names; nothing was written. Re-read the task and retry with \
+     the version you then see";
+const TRANSITION_MISMATCH: &str = "VERSION_MISMATCH: the task was at version 9 when read, not \
+     the expect_version 3 this transition names; nothing was written. Re-read the task and \
+     retry with the version you then see";
+
+/// **ADR-1050: A REMOVE THE STORE REFUSES AFTER A MOVED READ IS
+/// VERSION_MISMATCH.** The delete WAS sent: the token follows the store's
+/// refusal, never replaces it.
+#[tokio::test]
+async fn a_remove_the_store_refuses_on_a_moved_version_is_version_mismatch() {
+    for idempotency in [None, retry_key()] {
+        let (svc, seen) = wire(MockDb {
+            lookup: Some(Ok(a_miss())),
+            ..a_store_that_moved(9, db::TaskStatus::Open)
+        })
+        .await;
+        let status = svc
+            .remove_task(Request::new(a_remove(idempotency)))
+            .await
+            .expect_err("the store refused the compare-and-set");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(status.message(), REMOVE_MISMATCH);
+        assert_eq!(seen.lock().unwrap().delete.len(), 1);
+    }
+}
+
+/// **ADR-1050: A NOT_FOUND FROM THE REMOVE'S PRE-WRITE READ DOES NOT REFUSE.**
+/// The read is there only to supply the token; the call goes on to the store,
+/// which decides. With no read version, a store refusal stays untokened.
+#[tokio::test]
+async fn a_remove_whose_read_finds_nothing_goes_on_to_the_store() {
+    for get in [
+        Err((Code::NotFound, DB_DETAIL)),
+        Ok(db::GetTaskResponse { task: None }),
+    ] {
+        let (svc, seen) = wire(MockDb {
+            get: Some(get.clone()),
+            delete: Some(Ok(db::DeleteTaskResponse {})),
+            ..Default::default()
+        })
+        .await;
+        svc.remove_task(Request::new(a_remove(None)))
+            .await
+            .expect("the store removed it");
+        assert_eq!(seen.lock().unwrap().delete.len(), 1);
+
+        let (svc, _) = wire(MockDb {
+            get: Some(get),
+            delete: Some(Err((Code::FailedPrecondition, DB_DETAIL))),
+            ..Default::default()
+        })
+        .await;
+        let status = svc
+            .remove_task(Request::new(a_remove(None)))
+            .await
+            .expect_err("the store refused");
+        assert_eq!(status.message(), UNTOKENED_REFUSAL);
+    }
+}
+
+/// Any OTHER failure of the pre-write read fails the call through
+/// `passthrough`, before the delete: only NOT_FOUND is carved out.
+#[tokio::test]
+async fn a_remove_whose_read_fails_otherwise_fails_and_deletes_nothing() {
+    let (svc, seen) = wire(MockDb {
+        get: Some(Err((Code::Unavailable, DB_DETAIL))),
+        delete: Some(Ok(db::DeleteTaskResponse {})),
+        ..Default::default()
+    })
+    .await;
+    let status = svc
+        .remove_task(Request::new(a_remove(None)))
+        .await
+        .expect_err("the read failed");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(seen.lock().unwrap().delete.is_empty());
+}
+
+/// **THE STORE'S COMPARE-AND-SET REFUSAL STAYS UNTOKENED AFTER A MATCHING
+/// READ**, for TransitionTask and RemoveTask alike.
+#[tokio::test]
+async fn a_cas_refusal_after_a_matching_read_stays_untokened() {
+    let (svc, seen) = wire(a_store_that_moved(3, db::TaskStatus::Open)).await;
+    let status = svc
+        .transition_task(Request::new(a_transition(db::TaskStatus::Done as i32)))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.message(), UNTOKENED_REFUSAL);
+    let status = svc
+        .remove_task(Request::new(a_remove(None)))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.message(), UNTOKENED_REFUSAL);
+    let seen = seen.lock().unwrap();
+    assert_eq!((seen.update.len(), seen.delete.len()), (1, 1));
+}
+
+/// **ADR-1050: A TRANSITION THE STORE REFUSES AFTER A MOVED READ IS
+/// VERSION_MISMATCH**, with EditTask's mechanics: after the store, never
+/// instead of it.
+#[tokio::test]
+async fn a_transition_the_store_refuses_on_a_moved_version_is_version_mismatch() {
+    let (svc, seen) = wire(a_store_that_moved(9, db::TaskStatus::Open)).await;
+    let status = svc
+        .transition_task(Request::new(a_transition(db::TaskStatus::Done as i32)))
+        .await
+        .expect_err("the store refused the compare-and-set");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.message(), TRANSITION_MISMATCH);
+    assert_eq!(seen.lock().unwrap().update.len(), 1);
+}
+
+/// **THE TRANSITION RULE IS DECIDED BEFORE THE VERSION** (proto v1.26.0,
+/// TransitionTaskRequest.expect_version). A moved read and an illegal `to`:
+/// INVALID_ARGUMENT, nothing written, no token.
+#[tokio::test]
+async fn a_transition_the_rule_refuses_after_a_moved_read_is_invalid_argument() {
+    let (svc, seen) = wire(a_store_that_moved(9, db::TaskStatus::Dropped)).await;
+    let status = svc
+        .transition_task(Request::new(a_transition(db::TaskStatus::Open as i32)))
+        .await
+        .expect_err("DROPPED is terminal");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(!status.message().starts_with("VERSION_MISMATCH"));
+    assert!(seen.lock().unwrap().update.is_empty());
+}
+
+/// Only a FAILED_PRECONDITION gets the token. A store INVALID_ARGUMENT after a
+/// moved read stays INVALID_ARGUMENT, for both verbs.
+#[tokio::test]
+async fn a_store_invalid_argument_stays_invalid_argument_on_transition_and_remove() {
+    let (svc, _) = wire(MockDb {
+        update: Some(Err((Code::InvalidArgument, DB_DETAIL))),
+        delete: Some(Err((Code::InvalidArgument, DB_DETAIL))),
+        ..a_store_that_moved(9, db::TaskStatus::Open)
+    })
+    .await;
+    let status = svc
+        .transition_task(Request::new(a_transition(db::TaskStatus::Done as i32)))
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        (status.code(), status.message()),
+        (Code::InvalidArgument, "invalid request")
+    );
+    let status = svc
+        .remove_task(Request::new(a_remove(None)))
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        (status.code(), status.message()),
+        (Code::InvalidArgument, "invalid request")
     );
 }

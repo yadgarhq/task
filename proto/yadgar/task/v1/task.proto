@@ -62,6 +62,31 @@ message UpdateTaskRequest {
   uint64 expect_version = 4;
   Task task = 5;
   google.protobuf.FieldMask update_mask = 6;
+
+  // THE CALLER FINGERPRINT (ADR-1051): what the logic service sent this write
+  // in answer to, as 32 raw SHA-256 bytes. Its derivation is stated once, on
+  // LookupWriteRequest.caller_fingerprint, and these bytes must equal the ones
+  // the same call sent to LookupWrite.
+  //
+  // EMPTY MEANS ABSENT, which is what every caller that predates this field
+  // sends. Present, it must be exactly 32 bytes, or the write is refused with
+  // INVALID_ARGUMENT.
+  //
+  // THE CLAIM STORES IT, beside the claim's own request fingerprint, so a
+  // later LookupWrite can compare against it.
+  //
+  // IT DECIDES A CLAIM COLLISION WHEN IT CAN. When this key is already
+  // claimed and BOTH the stored claim and this request carry a caller
+  // fingerprint, that comparison decides: equal replays the recorded outcome,
+  // different is refused with INVALID_ARGUMENT. Otherwise the store's own
+  // request fingerprint decides, as before this field existed. This also
+  // decides a LookupWrite miss that collides at the claim, because another
+  // attempt claimed the key in between (ADR-1051 rule 8).
+  //
+  // THE STORE'S REQUEST FINGERPRINT EXCLUDES THIS FIELD, as it excludes
+  // `scope` and `idempotency`. Otherwise an old caller and a new one sending
+  // the same write would differ by this field alone.
+  bytes caller_fingerprint = 7;
 }
 message UpdateTaskResponse {
   yadgar.common.v1.Meta meta = 1;
@@ -127,8 +152,108 @@ message DeleteTaskRequest {
   yadgar.common.v1.Scope scope = 2;
   string id = 3;
   uint64 expect_version = 4;
+
+  // THE CALLER FINGERPRINT (ADR-1051), with exactly the rules on
+  // UpdateTaskRequest.caller_fingerprint: empty means absent, any length other
+  // than 32 is INVALID_ARGUMENT, the claim stores it, it decides a claim
+  // collision when both sides carry one, and the store's request fingerprint
+  // excludes it.
+  bytes caller_fingerprint = 5;
 }
 message DeleteTaskResponse {}
+
+// The write RPC a claim was recorded for. Each value names the TaskDbService
+// RPC, not the logic-service RPC that called it: EditTask and TransitionTask
+// both write through UpdateTask, so both look up WRITE_RPC_UPDATE_TASK. What
+// tells those two apart under one key is the caller fingerprint, whose input
+// starts with the logic-service RPC name; a claim that stores no caller
+// fingerprint cannot tell them apart and replays (see LookupWrite).
+enum WriteRpc {
+  // Refused with INVALID_ARGUMENT.
+  WRITE_RPC_UNSPECIFIED = 0;
+  WRITE_RPC_CREATE_TASK = 1;
+  WRITE_RPC_UPDATE_TASK = 2;
+  WRITE_RPC_DELETE_TASK = 3;
+}
+
+// Look up a recorded write by its idempotency key, without writing (ADR-1051).
+//
+// WHY IT EXISTS. The logic service reads a task before it writes it. A
+// same-key retry whose first attempt was applied can then fail that read
+// (the task was removed or left the caller's reach), or fail a check made on
+// what the read returned, before the store ever sees the key. This RPC lets
+// the logic service ask the claim ledger first, so the retry is replayed
+// (D9) rather than refused.
+message LookupWriteRequest {
+  // As on every TaskDbService RPC. A missing or empty scope is refused as the
+  // other TaskDbService RPCs refuse it.
+  yadgar.common.v1.Scope scope = 1;
+
+  // THE KEY TO LOOK UP. AN EMPTY KEY IS REFUSED WITH INVALID_ARGUMENT. A write
+  // with no key records no claim, so a lookup of one could only ever miss,
+  // and a caller that sends one has a bug that a silent miss would hide.
+  yadgar.common.v1.Idempotency idempotency = 2;
+
+  // The write RPC the caller is about to make. WRITE_RPC_UNSPECIFIED is
+  // refused with INVALID_ARGUMENT.
+  WriteRpc rpc = 3;
+
+  // THE CALLER FINGERPRINT: REQUIRED, EXACTLY 32 BYTES. Empty, or any other
+  // length, is refused with INVALID_ARGUMENT. The same bytes travel on the
+  // write that follows a miss (UpdateTaskRequest.caller_fingerprint,
+  // DeleteTaskRequest.caller_fingerprint).
+  //
+  // THE DERIVATION (ADR-1051 rule 5). The logic service computes SHA-256 over
+  // the concatenation of:
+  //   1. the fully-qualified gRPC method path of the yadgar.taskapi.v1
+  //      TaskService RPC it is serving, as UTF-8 bytes — exactly
+  //      "/yadgar.taskapi.v1.TaskService/EditTask",
+  //      "/yadgar.taskapi.v1.TaskService/TransitionTask" or
+  //      "/yadgar.taskapi.v1.TaskService/RemoveTask";
+  //   2. one 0x00 byte;
+  //   3. the prost encoding of the taskapi request message as decoded, with
+  //      `scope` and `idempotency` set to absent, `update_mask` set to absent
+  //      when its `paths` is empty, and otherwise its `paths` sorted and
+  //      deduplicated.
+  //
+  // IT IS A RE-ENCODING OF THE DECODED MESSAGE, NOT THE BYTES ON THE WIRE.
+  // Unknown fields are dropped and fields come out in field-number order. An
+  // absent `update_mask` and a present one with no paths mean the same edit,
+  // so the derivation makes them equal; no other equivalence between masks is
+  // folded.
+  //
+  // WHEN IT IS COMPUTED. After the logic service's request-only checks, and
+  // before any read of the task or any patch computation, so it is the same
+  // on every attempt whatever happened to the task in between.
+  //
+  // THE BYTES ARE A COMPATIBILITY SURFACE. Known-answer tests in the logic
+  // service pin them. A change to any part of the derivation needs a task-db
+  // migration that sets every stored caller fingerprint to NULL; otherwise
+  // every retry across the deploy is refused as a different request. A
+  // taskapi field that task learns in a later release enters the encoding for
+  // any caller that already sends it, so such a caller's retry across that
+  // deploy is refused as a different request; it is one, because task now
+  // acts on the field.
+  bytes caller_fingerprint = 4;
+}
+
+// The recorded outcome, or nothing.
+//
+// AN UNSET `outcome` IS A MISS, AND IT ARRIVES AS OK, never as an error
+// status: the common path is a key never used, and it must stay out of error
+// telemetry. A miss reveals only that this caller never claimed this key in
+// this project.
+//
+// A HIT RETURNS THE OUTCOME EXACTLY AS RECORDED: the response the first
+// attempt returned, decoded from the claim and not recomputed from the task
+// row. A hit is set in the arm that matches the request's `rpc`.
+message LookupWriteResponse {
+  oneof outcome {
+    CreateTaskResponse create = 1;
+    UpdateTaskResponse update = 2;
+    DeleteTaskResponse delete = 3;
+  }
+}
 
 service TaskDbService {
   rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
@@ -136,4 +261,33 @@ service TaskDbService {
   rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
   rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+
+  // Look up a write's claim by its idempotency key (ADR-1051).
+  //
+  // A READ. It takes no lock and runs outside any transaction. task-db's
+  // claim stays authoritative: a miss here followed by a collision at the
+  // write's claim is decided there, by the rules on
+  // UpdateTaskRequest.caller_fingerprint.
+  //
+  // THE CLAIM IS FOUND BY EQUALITY ON (project_id, user_id, idempotency key),
+  // taken from `scope` and `idempotency`. The task's reach and
+  // `scope.team_ids` take no part: the claim is the caller's own record, and
+  // the task it names may since have been removed or moved out of reach.
+  //
+  // A HIT IS REFUSED WITH INVALID_ARGUMENT, with the texts a colliding write
+  // claim already uses, when either:
+  //   - the claim was recorded for another write RPC than `rpc`; or
+  //   - the claim stores a caller fingerprint that differs from the request's.
+  // A CLAIM RECORDED FOR THE SAME `rpc` THAT STORES NO CALLER FINGERPRINT
+  // REPLAYS, without a fingerprint comparison. A claim stores none when its
+  // write carried none: every claim recorded before task-db's migration 8,
+  // every CreateTask claim (CreateTaskRequest has no such field), and every
+  // UpdateTask or DeleteTask sent without one, for example by a task that
+  // predates ADR-1051. The rpc check still runs on these: a lookup for
+  // WRITE_RPC_UPDATE_TASK or WRITE_RPC_DELETE_TASK that hits a CreateTask
+  // claim is refused as another write RPC.
+  //
+  // KEYS ARE KEPT INDEFINITELY; no purge exists. If one is ever added, a
+  // purged key is a miss.
+  rpc LookupWrite(LookupWriteRequest) returns (LookupWriteResponse);
 }

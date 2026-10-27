@@ -49,7 +49,7 @@ fn edit(
     current: &db::Task,
 ) -> Result<db::UpdateTaskRequest, tonic::Status> {
     let paths = requested_paths(req.update_mask.as_ref())?;
-    Ok(edit_request(req, current, &paths))
+    Ok(edit_request(req, current, &paths, Vec::new()))
 }
 
 fn paths(req: &db::UpdateTaskRequest) -> Vec<String> {
@@ -193,6 +193,7 @@ fn a_transition_names_the_status_alone() {
         },
         &current,
         db::TaskStatus::Done,
+        Vec::new(),
     );
 
     assert_eq!(

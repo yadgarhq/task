@@ -213,16 +213,12 @@ fn check_new_digest(patch: &api::BodyPatch) -> Result<(), Status> {
 /// 1 MiB body of one-byte occurrences, each grown to 64 KiB, is a 64 GiB
 /// string; building it first and measuring after would exhaust memory.
 ///
-/// A SAME-KEY RETRY OF AN APPLIED PATCH IS REFUSED, NOT REPLAYED. This is now
-/// the contract, not a gap: taskapi.proto states it on `EditTaskRequest.patch`
-/// ("A RETRY OF AN APPLIED PATCH WITH THE SAME IDEMPOTENCY KEY IS REFUSED, NOT
-/// REPLAYED"), and ADR-1042 rule 12 rules it.
-///
-/// The read below runs before the write. On the retry of a patch that was
-/// already applied, it returns the PATCHED body at the NEW version, so this
-/// function refuses the retry with VERSION_MISMATCH before `task-db` sees the
-/// key. The patch is applied once. A whole-body same-key retry stays a D9
-/// replay, because that mode has no version check ahead of the store.
+/// A SAME-KEY RETRY OF AN APPLIED PATCH NEVER REACHES THIS FUNCTION. ADR-1051
+/// rule 9 reverses ADR-1042 rule 12: a keyed `EditTask` looks its key up in
+/// `task-db` before the read, and a recorded key is replayed without the read
+/// or this computation. This function runs only after a miss, or for a call
+/// with no key, so the version check here never refuses a D9 replay. The patch
+/// is still applied once.
 pub fn patched(
     mut req: api::EditTaskRequest,
     current: &db::Task,
@@ -314,10 +310,14 @@ fn mask(paths: &[&'static str]) -> Option<FieldMask> {
 /// than forwarded, by [`requested_paths`]. Forwarding it would let a client name
 /// `status` and reopen a DONE task through an RPC whose whole purpose is that it
 /// cannot.
+///
+/// `caller_fingerprint` is the 32 bytes the keyed lookup sent (ADR-1051), or
+/// empty for a call with no idempotency key; empty means absent to the store.
 pub fn edit_request(
     req: api::EditTaskRequest,
     current: &db::Task,
     paths: &[&'static str],
+    caller_fingerprint: Vec<u8>,
 ) -> db::UpdateTaskRequest {
     let writes = |field| paths.contains(&field);
     db::UpdateTaskRequest {
@@ -340,6 +340,7 @@ pub fn edit_request(
             ..Default::default()
         }),
         update_mask: mask(paths),
+        caller_fingerprint,
     }
 }
 
@@ -378,10 +379,13 @@ pub fn requested_paths(requested: Option<&FieldMask>) -> Result<Vec<&'static str
 /// The mask names `status` alone. Without it the request would carry an empty
 /// `tags` and `links` — the zero value of a message this handler never
 /// populated — and a `-db` that writes every field would erase them.
+///
+/// `caller_fingerprint` is as on [`edit_request`].
 pub fn transition_request(
     req: api::TransitionTaskRequest,
     current: &db::Task,
     to: db::TaskStatus,
+    caller_fingerprint: Vec<u8>,
 ) -> db::UpdateTaskRequest {
     db::UpdateTaskRequest {
         idempotency: req.idempotency,
@@ -398,5 +402,6 @@ pub fn transition_request(
             ..Default::default()
         }),
         update_mask: mask(&["status"]),
+        caller_fingerprint,
     }
 }
