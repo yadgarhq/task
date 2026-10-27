@@ -12,7 +12,7 @@ use yadgar_telemetry::grpc::status_name;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
-use super::{passthrough, tel_scope, Task};
+use super::{edit_refused, passthrough, tel_scope, Task};
 use crate::pb::yadgar::task::v1 as db;
 use crate::pb::yadgar::taskapi::v1 as api;
 use crate::pb::yadgar::taskapi::v1::task_service_server::TaskService;
@@ -221,9 +221,10 @@ impl TaskService for Task {
                 // no edit may write is refused here rather than after a `get_task`
                 // round trip whose answer was always going to be discarded.
                 let paths = writes::requested_paths(req.update_mask.as_ref())?;
-                // The key, the patch's shape and the body digest are decisions
-                // about the request alone too, so they are settled before the
-                // read as well. In patch mode the digest is over the PRE-edit
+                // The key, the patch's shape (including `expect_new_sha256`,
+                // checked in full) and the body digest are decisions about the
+                // request alone too, so they are settled before the read as
+                // well. In patch mode the digest is over the PRE-edit
                 // body, so only its length is settled here; `writes::patched`
                 // compares it after the read (ADR-1008).
                 let key = writes::target_key(&req.id, req.number)?;
@@ -275,6 +276,11 @@ impl TaskService for Task {
                 // just read (ADR-1008); any other edit passes through as sent.
                 let (req, paths) = writes::patched(req, &current, &paths)?;
 
+                // Both versions, before the request is consumed: a refusal of
+                // the write is named VERSION_MISMATCH only when they differ
+                // (ADR-1042), and only after the store has refused.
+                let read_version = current.meta.as_ref().map_or(0, |m| m.version);
+                let expect_version = req.expect_version;
                 let updated = deadline
                     .call(
                         self.ceiling,
@@ -285,7 +291,7 @@ impl TaskService for Task {
                         },
                     )
                     .await
-                    .map_err(|e| passthrough(e, "edit"))?
+                    .map_err(|e| edit_refused(e, read_version, expect_version))?
                     .into_inner();
 
                 let response = api::EditTaskResponse { meta: updated.meta };

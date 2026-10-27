@@ -221,3 +221,31 @@ fn passthrough(status: Status, op: &str) -> Status {
         _ => Status::internal("the task store is unavailable"),
     }
 }
+
+/// An `EditTask` write the store refused, mapped as [`passthrough`] maps it,
+/// with one exception: VERSION_MISMATCH (ADR-1042 rule 10).
+///
+/// **THE TOKEN FOLLOWS THE STORE'S REFUSAL, NEVER PRECEDES IT.** It is added
+/// only when the store refused with FAILED_PRECONDITION AND this service's own
+/// read already showed a version other than `expect_version`. A check ahead of
+/// the store would refuse a whole-body same-key retry that `task-db` replays
+/// (D9): the store claims the key before its compare-and-set, so a replay
+/// never reaches the refusal this function names.
+///
+/// When the read matched, the store's refusal stays untokened: a writer
+/// landed between the read and the write, or the task is out of reach or
+/// read-only for this caller, and the store does not say which.
+///
+/// The message says "when read", because the task may have moved again
+/// between this service's read and the store's compare-and-set.
+fn edit_refused(status: Status, read_version: u64, expect_version: u64) -> Status {
+    let mapped = passthrough(status, "edit");
+    if mapped.code() != tonic::Code::FailedPrecondition || read_version == expect_version {
+        return mapped;
+    }
+    Status::failed_precondition(format!(
+        "VERSION_MISMATCH: the task was at version {read_version} when read, not the \
+         expect_version {expect_version} this edit names; nothing was written. Re-read the \
+         task and retry with the version you then see"
+    ))
+}

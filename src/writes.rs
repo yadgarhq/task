@@ -110,7 +110,8 @@ pub const PATCH_RESULT_MAX: usize = 1_048_576;
 
 /// The rules a patch is held to before anything is read (ADR-1008): the mask
 /// and the message agree, `patch` excludes `body`, `old` is non-empty,
-/// `expect_count` is at least 1, and each side fits [`PATCH_SIDE_MAX`].
+/// `expect_count` is at least 1, each side fits [`PATCH_SIDE_MAX`], and `new`
+/// matches `expect_new_sha256` when that is set (ADR-1042 rule 11).
 ///
 /// **RUN BEFORE [`check_body_digest`]**, whose answer depends on whether the
 /// edit is a patch.
@@ -152,6 +153,35 @@ pub fn check_patch(req: &api::EditTaskRequest, paths: &[&'static str]) -> Result
             )));
         }
     }
+    check_new_digest(patch)
+}
+
+/// `BodyPatch.expect_new_sha256`: refuse a `new` that is not the one the
+/// caller hashed (ADR-1042 rule 11).
+///
+/// The check needs only the request, so it runs before the store is read.
+/// Empty is no guard. Present, it must be 32 bytes, and the digest is over the
+/// exact UTF-8 bytes of `new`, so an empty `new` is guarded by the SHA-256 of
+/// no bytes. Only a mismatch carries the PATCH_NEW_SHA256_MISMATCH token, as
+/// the proto lists it; a wrong length carries none.
+fn check_new_digest(patch: &api::BodyPatch) -> Result<(), Status> {
+    let expected = &patch.expect_new_sha256;
+    if expected.is_empty() {
+        return Ok(());
+    }
+    if expected.len() != SHA256_LEN {
+        return Err(Status::invalid_argument(format!(
+            "a patch's `expect_new_sha256` must be a {SHA256_LEN}-byte SHA-256 digest, not {} \
+             bytes",
+            expected.len()
+        )));
+    }
+    if Sha256::digest(patch.new.as_bytes()).as_slice() != expected.as_slice() {
+        return Err(Status::invalid_argument(
+            "PATCH_NEW_SHA256_MISMATCH: a patch's `new` does not match expect_new_sha256; it \
+             may have been cut off in transit, so nothing was written. Re-send the patch",
+        ));
+    }
     Ok(())
 }
 
@@ -165,9 +195,10 @@ pub fn check_patch(req: &api::EditTaskRequest, paths: &[&'static str]) -> Result
 /// a match always starts and ends on a character boundary.
 ///
 /// Each refusal here depends on the stored task, so it is FAILED_PRECONDITION,
-/// as a stale version is. A refusal over the body starts with a reason token
-/// listed on `EditTaskRequest.patch`; a stale version carries none, as it
-/// carries none in whole-body mode.
+/// as a stale version is. Each refusal here starts with a reason token listed
+/// on `EditTaskRequest.patch`. A stale version starts with VERSION_MISMATCH
+/// (ADR-1042 rule 10), because this service read the task itself and saw the
+/// other version.
 ///
 /// **THE READ MUST BE THE VERSION THE CALLER EXPECTS**, checked here and not
 /// left to the store. A patch is computed on the body READ. With
@@ -182,21 +213,16 @@ pub fn check_patch(req: &api::EditTaskRequest, paths: &[&'static str]) -> Result
 /// 1 MiB body of one-byte occurrences, each grown to 64 KiB, is a 64 GiB
 /// string; building it first and measuring after would exhaust memory.
 ///
-/// KNOWN CONTRACT GAP, recorded here rather than papered over: an IDEMPOTENT
-/// REPLAY of an applied patch is refused, not replayed.
+/// A SAME-KEY RETRY OF AN APPLIED PATCH IS REFUSED, NOT REPLAYED. This is now
+/// the contract, not a gap: taskapi.proto states it on `EditTaskRequest.patch`
+/// ("A RETRY OF AN APPLIED PATCH WITH THE SAME IDEMPOTENCY KEY IS REFUSED, NOT
+/// REPLAYED"), and ADR-1042 rule 12 rules it.
 ///
 /// The read below runs before the write. On the retry of a patch that was
 /// already applied, it returns the PATCHED body at the NEW version, so this
-/// function refuses the retry as a stale version before `task-db` is reached. `task-db` would have
-/// replayed the recorded response for the same key, and its fingerprint of the
-/// request covers the body THIS service computed, which a retry cannot
-/// reproduce from the new body anyway.
-///
-/// IT IS NOT FIXED HERE, because nothing this service can reach tells it that
-/// a key was already applied before it reads. Through the gateway the gap is
-/// unreachable: every gateway call mints a fresh idempotency key. A direct
-/// gRPC caller that retries with the same key after a lost response sees the
-/// refusal and must re-read, which is safe — the patch is applied once.
+/// function refuses the retry with VERSION_MISMATCH before `task-db` sees the
+/// key. The patch is applied once. A whole-body same-key retry stays a D9
+/// replay, because that mode has no version check ahead of the store.
 pub fn patched(
     mut req: api::EditTaskRequest,
     current: &db::Task,
@@ -208,8 +234,8 @@ pub fn patched(
     let read_version = current.meta.as_ref().map_or(0, |m| m.version);
     if read_version != req.expect_version {
         return Err(Status::failed_precondition(format!(
-            "the task is at version {read_version}, not the expect_version {} this patch \
-             names; nothing was written. Re-read the task",
+            "VERSION_MISMATCH: the task is at version {read_version}, not the expect_version \
+             {} this patch names; nothing was written. Re-read the task",
             req.expect_version
         )));
     }
