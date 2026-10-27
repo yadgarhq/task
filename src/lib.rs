@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fingerprint;
 pub mod rotate;
 pub mod rules;
 pub mod serve;
@@ -26,11 +27,25 @@ pub mod pb {
             }
         }
         pub mod task {
+            /// **THE LINT IS ALLOWED FOR THE GENERATED FILE AND FOR NOTHING
+            /// ELSE**, as `yadgarhq/gateway` allows it for `project.v1`. Proto
+            /// v1.26.0 documents LookupWrite, the caller fingerprint and the
+            /// keyed retries with numbered and bulleted lists whose items wrap,
+            /// and `prost` re-emits each comment line with a single leading
+            /// space, which `clippy::doc_lazy_continuation` reads as an
+            /// unindented continuation. `disable_comments` would drop the
+            /// contract's prose from the generated types, and re-indenting the
+            /// lists in `yadgarhq/proto` would shape the contract around one
+            /// style lint here. The attribute sits on a module that holds only
+            /// the `include_proto!`.
+            #[allow(clippy::doc_lazy_continuation)]
             pub mod v1 {
                 tonic::include_proto!("yadgar.task.v1");
             }
         }
         pub mod taskapi {
+            /// The same allow, for the same reason, as `task::v1` above.
+            #[allow(clippy::doc_lazy_continuation)]
             pub mod v1 {
                 tonic::include_proto!("yadgar.taskapi.v1");
             }

@@ -26,6 +26,10 @@ use crate::rules;
 /// `tel_scope` and `passthrough` without any of them widening.
 mod handlers;
 
+/// Keyed retries (ADR-1051): the lookup ahead of the read, and what a hit
+/// replays. A child for the same reason `handlers` is one.
+mod keyed;
+
 /// KNOWN LIMITATION, recorded rather than hidden: an error path returns via `?`,
 /// which drops the `Call`, and a dropped call records `UNRECORDED` rather than the
 /// real gRPC status. So failures are counted but not yet classified.
@@ -67,37 +71,133 @@ impl Task {
         }
     }
 
-    /// EVERYTHING A TRANSITION MUST SETTLE BEFORE ANYTHING IS WRITTEN, in the
-    /// order it has to be settled in: the target status the request names, the
-    /// task as the store holds it now, the status that task is in, and the
-    /// rule's verdict on moving between the two.
+    /// The TransitionTask write, after the rule has allowed it. Moved here
+    /// from `transition_task` for the file ceiling, with its reasoning.
     ///
-    /// It is one helper rather than three because it is one decision. Each step
-    /// is the input to the next — there is no reading of the store without a
-    /// target to read it for, and no rule to apply without both ends of the
-    /// move — so cutting between them would leave parts that only make sense
-    /// read together, which is the split a line ceiling is there to discourage
-    /// rather than to cause.
+    /// A store FAILED_PRECONDITION after a read that showed another version
+    /// is VERSION_MISMATCH (ADR-1050), by [`version_refused`]'s mechanics.
+    ///
+    /// THE WRITE CARRIES `req.expect_version`, NOT
+    /// `current.meta.version`, AND THAT IS DELIBERATE. A scanner reads
+    /// the read-then-check-then-write in `transition_task` as a race and proposes
+    /// substituting the version just read. Doing so would introduce a
+    /// real defect, so the reasoning is recorded here rather than left
+    /// to be rediscovered.
+    ///
+    /// `expect_version` is the CALLER'S claim about what it saw. It is
+    /// the compare half of a compare-and-set, and it exists to refuse a
+    /// caller that acted on a stale read. Replacing it with a version
+    /// this service read microseconds ago launders a stale expectation
+    /// into a fresh one: a write that must be refused would then
+    /// succeed, and the caller would never learn it had overwritten
+    /// somebody else's change.
+    ///
+    /// THERE IS NO ARM THAT SKIPS THE COMPARE. `task-db`'s
+    /// `write.rs::update` binds `expect_version` into the WHERE clause
+    /// of every UPDATE — `WHERE id = ? AND version = ? AND deleted_at
+    /// IS NULL AND <reach>` — and a mismatch makes `rows_affected()`
+    /// zero, which it turns into FAILED_PRECONDITION. Zero is not a
+    /// wildcard there; it is simply a version no row holds.
+    ///
+    /// A SECOND CHECK HERE WOULD CATCH NOTHING. Only the comparison
+    /// inside the store's transaction is atomic with the write. One
+    /// added here passes in exactly the cases the CAS passes, and in
+    /// the racing case — a writer committing between this read and that
+    /// UPDATE — it passes too, because it is reading the same stale row.
+    ///
+    /// THE CAS IS ALSO WHAT MAKES THE RULE CHECK ABOVE SOUND. Any
+    /// change that could invalidate `may_transition(from, to)` is a
+    /// change of STATUS, a status change is a write, and every write
+    /// bumps `version` — so the racing writer this handler cannot see
+    /// is one the CAS refuses on its behalf.
+    ///
+    /// ONE LOOSE END, AND IT IS IN EXACTLY ONE PLACE. A review claimed
+    /// `expect_version + 1` is live code both here and in
+    /// `task-db/src/write.rs`. IT IS NOT. In THIS crate the expression
+    /// survives only as the WORDS of the last paragraph below, which
+    /// describes what the handler used to do and no longer does;
+    /// there is no such arithmetic on any executable line here.
+    ///
+    /// In `task-db/src/write.rs` it IS live: the SQL sets `version =
+    /// version + 1`, and the response's `Meta.version` is then computed
+    /// as `req.expect_version + 1` rather than read back. That is
+    /// correct only BECAUSE the CAS guarantees the stored version
+    /// equalled `expect_version`. If that side is ever changed to read
+    /// the version back, the change belongs there alone — this
+    /// repository holds no second copy to keep in step.
+    ///
+    /// The STORE'S meta, as `edit_task` already does. This used to
+    /// discard the response and synthesise one from the request —
+    /// `id` from `req.id`, `version` from `expect_version + 1` — which
+    /// asserted two things this service cannot know: that `-db`
+    /// increments by exactly one, and that no other Meta field the
+    /// store fills in differs from the zero value. On a replay the
+    /// second is plainly false, since the version is the ORIGINAL
+    /// write's and the project comes from the scope. A synthesised
+    /// envelope is a guess wearing the shape of an answer.
+    async fn write_transition(
+        &self,
+        req: api::TransitionTaskRequest,
+        current: &db::Task,
+        to: db::TaskStatus,
+        caller_fingerprint: Vec<u8>,
+        deadline: Deadline,
+    ) -> Result<db::UpdateTaskResponse, Status> {
+        let read_version = current.meta.as_ref().map_or(0, |m| m.version);
+        let expect_version = req.expect_version;
+        deadline
+            .call(
+                self.ceiling,
+                tonic::Request::new(crate::writes::transition_request(
+                    req,
+                    current,
+                    to,
+                    caller_fingerprint,
+                )),
+                |r| {
+                    let mut db = self.db.clone();
+                    async move { db.update_task(r).await }
+                },
+            )
+            .await
+            .map_err(|e| {
+                version_refused(
+                    e,
+                    "transition",
+                    "transition",
+                    Some(read_version),
+                    expect_version,
+                )
+            })
+            .map(tonic::Response::into_inner)
+    }
+
+    /// WHAT A TRANSITION MUST SETTLE FROM THE STORE BEFORE ANYTHING IS
+    /// WRITTEN: the task as the store holds it now, the status that task is
+    /// in, and the rule's verdict on moving from it to `to`.
+    ///
+    /// The request-only half, the read key and the target, is
+    /// [`transition_target`]. It was part of this helper until ADR-1051 put the
+    /// keyed lookup between the two: the lookup runs after the request-only
+    /// checks and before any read, so this runs only after a miss.
     ///
     /// The seam it leaves behind in `transition_task` is the real one: what may
     /// happen, and then what happens. The long `expect_version` commentary
     /// stayed with the write it is about.
     ///
-    /// Returns the task as it stands, the status it is in, and the status it is
-    /// moving to — `(current, from, to)`, in that order.
+    /// Returns the task as it stands. The status it was in is NOT returned:
+    /// `from` is the store's recorded `previous_status` (ADR-1051 rule 7), and
+    /// this read's status is used only for the rule.
     ///
-    /// THE REQUEST IS BORROWED. Both fields read below were already cloned at
-    /// this point before the split, and `transition_task` still consumes the
-    /// request afterwards, on the write.
+    /// THE REQUEST IS BORROWED, because `transition_task` still consumes it
+    /// afterwards, on the write.
     async fn decide_transition(
         &self,
         req: &api::TransitionTaskRequest,
+        key: db::get_task_request::Key,
+        to: db::TaskStatus,
         deadline: Deadline,
-    ) -> Result<(db::Task, db::TaskStatus, db::TaskStatus), Status> {
-        let key = crate::writes::target_key(&req.id, req.number)?;
-        let to = db::TaskStatus::try_from(req.to)
-            .map_err(|_| Status::invalid_argument("unknown target status"))?;
-
+    ) -> Result<db::Task, Status> {
         let current = deadline
             .call(
                 self.ceiling,
@@ -130,8 +230,60 @@ impl Task {
         // refusal — a client obeying the contract loops.
         rules::may_transition(from, to).map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        Ok((current, from, to))
+        Ok(current)
     }
+}
+
+/// The request-only half of an edit: the paths it writes and the read key,
+/// after every check that needs nothing but the request. They run before the
+/// keyed lookup (ADR-1051) and before any read, so a malformed request costs
+/// no store call. Moved out of `edit_task` with its reasoning, unchanged.
+fn edit_target(
+    req: &api::EditTaskRequest,
+) -> Result<(Vec<&'static str>, db::get_task_request::Key), Status> {
+    // THE MASK FIRST, before the store is touched at all. Resolving it
+    // is a pure decision about the request, so a mask naming a field
+    // no edit may write is refused here rather than after a `get_task`
+    // round trip whose answer was always going to be discarded.
+    let paths = crate::writes::requested_paths(req.update_mask.as_ref())?;
+    // The key, the patch's shape (including `expect_new_sha256`,
+    // checked in full) and the body digest are decisions about the
+    // request alone too, so they are settled before the read as
+    // well. In patch mode the digest is over the PRE-edit
+    // body, so only its length is settled here; `writes::patched`
+    // compares it after the read (ADR-1008).
+    let key = crate::writes::target_key(&req.id, req.number)?;
+    crate::writes::check_patch(req, &paths)?;
+    crate::writes::check_body_digest(req, &paths)?;
+
+    // THE TITLE RULE, and it applies only to an edit that WRITES a
+    // title. It used to run before the mask was resolved, which made a
+    // body-only edit impossible: `EditTaskRequest.title` is empty when
+    // a caller does not intend to change it, and this refused the call
+    // over a value it was never going to store. The rule itself is
+    // unchanged — an untitled task is unfindable by the humans who
+    // have to triage it — it simply now applies where a title is
+    // actually at stake.
+    if paths.contains(&"title") && req.title.trim().is_empty() {
+        return Err(Status::invalid_argument("a task needs a title"));
+    }
+    // The bound, on the same condition: only a title being written.
+    if paths.contains(&"title") {
+        rules::title_fits(&req.title).map_err(Status::invalid_argument)?;
+    }
+    Ok((paths, key))
+}
+
+/// The request-only half of a transition: the read key and the target status.
+/// Both are decisions about the request alone, so they run before the keyed
+/// lookup and cost no store call.
+fn transition_target(
+    req: &api::TransitionTaskRequest,
+) -> Result<(db::get_task_request::Key, db::TaskStatus), Status> {
+    let key = crate::writes::target_key(&req.id, req.number)?;
+    let to = db::TaskStatus::try_from(req.to)
+        .map_err(|_| Status::invalid_argument("unknown target status"))?;
+    Ok((key, to))
 }
 
 /// A `-db` failure is passed through with its CODE intact but not its message.
@@ -222,30 +374,43 @@ fn passthrough(status: Status, op: &str) -> Status {
     }
 }
 
-/// An `EditTask` write the store refused, mapped as [`passthrough`] maps it,
-/// with one exception: VERSION_MISMATCH (ADR-1042 rule 10).
+/// A write the store refused, mapped as [`passthrough`] maps it under `op`,
+/// with one exception: VERSION_MISMATCH (ADR-1042 rule 10, which ADR-1050
+/// extends from EditTask to TransitionTask and RemoveTask).
 ///
 /// **THE TOKEN FOLLOWS THE STORE'S REFUSAL, NEVER PRECEDES IT.** It is added
 /// only when the store refused with FAILED_PRECONDITION AND this service's own
 /// read already showed a version other than `expect_version`. A check ahead of
-/// the store would refuse a whole-body same-key retry that `task-db` replays
-/// (D9): the store claims the key before its compare-and-set, so a replay
-/// never reaches the refusal this function names.
+/// the store would refuse a same-key retry that `task-db` replays (D9): the
+/// store claims the key before its compare-and-set, so a replay never reaches
+/// the refusal this function names.
 ///
-/// When the read matched, the store's refusal stays untokened: a writer
-/// landed between the read and the write, or the task is out of reach or
-/// read-only for this caller, and the store does not say which.
+/// When the read matched, or there was no read to compare (`read_version` is
+/// `None`: RemoveTask's read found nothing and the call went on to the store),
+/// the store's refusal stays untokened: a writer landed between the read and
+/// the write, or the task is out of reach or read-only for this caller, and
+/// the store does not say which.
 ///
 /// The message says "when read", because the task may have moved again
-/// between this service's read and the store's compare-and-set.
-fn edit_refused(status: Status, read_version: u64, expect_version: u64) -> Status {
-    let mapped = passthrough(status, "edit");
+/// between this service's read and the store's compare-and-set. `noun` names
+/// the write in it: "edit", "transition" or "removal".
+fn version_refused(
+    status: Status,
+    op: &str,
+    noun: &str,
+    read_version: Option<u64>,
+    expect_version: u64,
+) -> Status {
+    let mapped = passthrough(status, op);
+    let Some(read_version) = read_version else {
+        return mapped;
+    };
     if mapped.code() != tonic::Code::FailedPrecondition || read_version == expect_version {
         return mapped;
     }
     Status::failed_precondition(format!(
         "VERSION_MISMATCH: the task was at version {read_version} when read, not the \
-         expect_version {expect_version} this edit names; nothing was written. Re-read the \
+         expect_version {expect_version} this {noun} names; nothing was written. Re-read the \
          task and retry with the version you then see"
     ))
 }

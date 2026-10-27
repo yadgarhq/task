@@ -313,4 +313,11 @@ impl TaskDbService for HeldHandler {
     ) -> Result<Response<db::DeleteTaskResponse>, Status> {
         unused("DeleteTask")
     }
+
+    async fn lookup_write(
+        &self,
+        _: Request<db::LookupWriteRequest>,
+    ) -> Result<Response<db::LookupWriteResponse>, Status> {
+        unused("LookupWrite")
+    }
 }

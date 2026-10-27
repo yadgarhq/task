@@ -100,7 +100,13 @@ message EditTaskRequest {
   //
   // A WHOLE-BODY RETRY WITH THE SAME IDEMPOTENCY KEY IS STILL REPLAYED (D9).
   // This service's version check never runs ahead of the store's replay of a
-  // recorded key. Only patch mode refuses such a retry; see `patch`.
+  // recorded key. Today a whole-body retry is replayed unless this service's
+  // read fails (the task was removed or left the caller's reach) or a
+  // concurrent write changed a field this service copies from that read. A
+  // patch-mode same-key retry is refused (see `patch`). Once task ships
+  // ADR-1051, neither mode refuses it: a same-key retry is looked up before
+  // the read and replayed, so the version check does not run on it at all
+  // (see KEYED RETRIES on TaskService).
   //
   // ONCE task SHIPS ADR-1042, A FAILED_PRECONDITION WITH NO REASON TOKEN is the
   // store's compare-and-set refusing the write: a writer landed between this
@@ -158,10 +164,12 @@ message EditTaskRequest {
   //
   // REASON TOKENS. A refusal listed here carries a message that starts with an
   // upper-case reason token and a colon, for a program to branch on. The list
-  // covers EditTask in both modes and is kept here, in one place:
+  // covers EditTask in both modes, and VERSION_MISMATCH also covers
+  // TransitionTask and RemoveTask (ADR-1050). It is kept here, in one place:
   //   VERSION_MISMATCH           FAILED_PRECONDITION, either mode, once task
-  //                              ships ADR-1042: the task as read is not at
-  //                              `expect_version`.
+  //                              ships ADR-1042 (EditTask) or ADR-1050
+  //                              (TransitionTask, RemoveTask): the task as
+  //                              read is not at `expect_version`.
   //   PATCH_COUNT_MISMATCH       FAILED_PRECONDITION: `old` does not occur
   //                              exactly `expect_count` times.
   //   PATCH_RESULT_TOO_LARGE     FAILED_PRECONDITION: the result body is over
@@ -174,15 +182,23 @@ message EditTaskRequest {
   // A refusal not listed here carries no token; a program must not parse one
   // out of it.
   //
-  // A RETRY OF AN APPLIED PATCH WITH THE SAME IDEMPOTENCY KEY IS REFUSED, NOT
-  // REPLAYED. This service reads the task before it writes. After the first
-  // attempt is applied, that read returns the patched body at the next
-  // version, so the retry is refused as a stale version before the store sees
-  // the key (VERSION_MISMATCH once task ships ADR-1042; today the message
-  // carries no token). The patch is applied once. A direct gRPC caller that
-  // retries after a lost response re-reads the task and finds its edit there.
-  // Through the gateway this cannot happen: every gateway EditTask call mints a
-  // fresh key.
+  // A RETRY OF AN APPLIED PATCH WITH THE SAME IDEMPOTENCY KEY IS REPLAYED,
+  // ONCE task SHIPS ADR-1051, in either mode, and the patch is applied once.
+  // This reverses ADR-1042 rule 12. With a key, this service looks the key up
+  // in the store before it reads the task, and a recorded key returns the
+  // first attempt's outcome without the read, the patch computation or the
+  // write (see KEYED RETRIES on TaskService). The retry must be the same
+  // request: one that differs, under the same key, is refused with
+  // INVALID_ARGUMENT (D9), unless the first attempt's claim stores no caller
+  // fingerprint (see KEYED RETRIES on TaskService).
+  //
+  // UNTIL task SHIPS ADR-1051, such a retry is refused, not replayed. This
+  // service reads the task before it writes. After the first attempt is
+  // applied, that read returns the patched body at the next version, so the
+  // retry is refused as a stale version before the store sees the key
+  // (VERSION_MISMATCH once task ships ADR-1042; otherwise the message carries
+  // no token). The patch is applied once either way. Through the gateway the
+  // retry cannot happen: every gateway EditTask call mints a fresh key.
   BodyPatch patch = 10;
 }
 
@@ -247,6 +263,45 @@ message TransitionTaskRequest {
   // on EditTaskRequest: `number` is 0 when absent and resolves in the caller's
   // exact project only.
   string id = 3;
+  // THE VERSION THE CALLER READ: the compare half of a compare-and-set, as on
+  // EditTaskRequest.
+  //
+  // A STALE VERSION IS REFUSED WITH FAILED_PRECONDITION. Once task ships
+  // ADR-1050, a refusal where this service has read the task within the
+  // caller's reach and found a version other than this one starts with the
+  // reason token VERSION_MISMATCH; until then it carries no token. The caller
+  // re-reads and retries with the version it then sees.
+  //
+  // THE TRANSITION RULE IS DECIDED BEFORE THE VERSION. A `to` that is not
+  // legal from the status this service reads is refused with
+  // INVALID_ARGUMENT, whatever this version is.
+  //
+  // A RETRY WITH THE SAME IDEMPOTENCY KEY IS STILL REPLAYED (D9). This
+  // service's version check never runs ahead of the store's replay of a
+  // recorded key.
+  //
+  // ONCE task SHIPS ADR-1051, NOTHING RUNS AHEAD OF THE REPLAY. With a key,
+  // this service looks the key up in the store before it reads the task. A
+  // recorded key returns the first attempt's outcome without the read, the
+  // transition rule check or the write, so a retry whose `to` is no longer
+  // legal from the status now stored is replayed (see KEYED RETRIES on
+  // TaskService). UNTIL task SHIPS ADR-1051, the read and the transition rule
+  // run first, so such a retry is refused with INVALID_ARGUMENT, not
+  // replayed, and a retry whose task was removed or left the caller's reach
+  // is refused with the read's NOT_FOUND, and one whose task a concurrent
+  // write changed in a field this service copies from its read is refused
+  // with INVALID_ARGUMENT as a different request.
+  //
+  // ONCE task SHIPS ADR-1050, A FAILED_PRECONDITION WITH NO REASON TOKEN is the
+  // store's compare-and-set refusing the write: a writer landed between this
+  // service's read and the write, or the task is out of reach or read-only for
+  // this caller. The store does not say which, deliberately, so no token is
+  // claimed for it. The caller re-reads: a moved version means retry with it;
+  // the same version, or no task, means the retry fails identically.
+  //
+  // REASON TOKENS. Once task ships ADR-1050, TransitionTask carries one token,
+  // VERSION_MISMATCH, with the meaning given in the REASON TOKENS list on
+  // EditTaskRequest.patch (ADR-1050 extends ADR-1042 rule 10 to this RPC).
   uint64 expect_version = 4;
   yadgar.task.v1.TaskStatus to = 5;
   uint32 number = 6;
@@ -255,6 +310,13 @@ message TransitionTaskResponse {
   yadgar.common.v1.Meta meta = 1;
   // What it moved FROM, so a caller that raced another writer sees what actually
   // happened rather than assuming its own read was current.
+  //
+  // ONCE task SHIPS ADR-1051, IT IS THE STORE'S RECORDED PRIOR STATUS on both
+  // a fresh transition and a replay: yadgar.task.v1.UpdateTaskResponse
+  // .previous_status, never this service's own read. On a replay of a claim
+  // recorded before the store kept that status, it is TASK_STATUS_UNSPECIFIED,
+  // which means the prior status is unknown and NOT a transition out of
+  // "unspecified"; the rules for that value are on previous_status.
   yadgar.task.v1.TaskStatus from = 2;
 }
 
@@ -262,6 +324,38 @@ message RemoveTaskRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   yadgar.common.v1.Scope scope = 2;
   string id = 3;
+  // THE VERSION THE CALLER READ: the compare half of a compare-and-set, as on
+  // EditTaskRequest.
+  //
+  // A STALE VERSION IS REFUSED WITH FAILED_PRECONDITION. Once task ships
+  // ADR-1050, a refusal where this service has read the task within the
+  // caller's reach and found a version other than this one starts with the
+  // reason token VERSION_MISMATCH; until then it carries no token. The caller
+  // re-reads and retries with the version it then sees.
+  //
+  // A RETRY WITH THE SAME IDEMPOTENCY KEY IS STILL REPLAYED (D9). This
+  // service's version check never runs ahead of the store's replay of a
+  // recorded key.
+  //
+  // ONCE task SHIPS ADR-1051, a keyed call looks the key up in the store
+  // before this service's pre-write read, and a recorded key returns the first
+  // attempt's outcome without that read or the write (see KEYED RETRIES on
+  // TaskService). The pre-write read runs only on a miss, and only to supply
+  // VERSION_MISMATCH (ADR-1050): a NOT_FOUND from it does not refuse the call,
+  // which goes on to the store. UNTIL THEN, the store replays a recorded key;
+  // once task ships ADR-1050, a NOT_FOUND from its pre-write read likewise
+  // sends the call on to the store rather than refusing it.
+  //
+  // ONCE task SHIPS ADR-1050, A FAILED_PRECONDITION WITH NO REASON TOKEN is the
+  // store's compare-and-set refusing the write: a writer landed between this
+  // service's read and the write, or the task is out of reach or read-only for
+  // this caller. The store does not say which, deliberately, so no token is
+  // claimed for it. The caller re-reads: a moved version means retry with it;
+  // the same version, or no task, means the retry fails identically.
+  //
+  // REASON TOKENS. Once task ships ADR-1050, RemoveTask carries one token,
+  // VERSION_MISMATCH, with the meaning given in the REASON TOKENS list on
+  // EditTaskRequest.patch (ADR-1050 extends ADR-1042 rule 10 to this RPC).
   uint64 expect_version = 4;
 }
 message RemoveTaskResponse {}
@@ -269,6 +363,33 @@ message RemoveTaskResponse {}
 // Holds no store. Reaches its data ONLY over TaskDbService, never by opening a
 // connection of its own — which is what makes the twin a connection
 // concentrator rather than merely a boundary (D4).
+//
+// KEYED RETRIES (ADR-1051), once task ships it. When `idempotency.key` is
+// non-empty, EditTask, TransitionTask and RemoveTask run in this order:
+//   1. the request-only checks, which need nothing but the request;
+//   2. yadgar.task.v1.TaskDbService.LookupWrite, with a caller fingerprint
+//      derived from this request (the derivation is on
+//      yadgar.task.v1.LookupWriteRequest.caller_fingerprint);
+//   3. on a hit, the recorded outcome is returned, and the read, the rule
+//      checks and the write do not run;
+//   4. on a miss, the call takes its ordinary path, and the write carries the
+//      same caller fingerprint.
+// A same-key retry of the same request is therefore replayed even when the
+// task has since been removed, has moved out of the caller's reach, or would
+// now fail a check made on what a read returns. The same key with a different
+// request is refused with INVALID_ARGUMENT (D9), except where the first
+// attempt's claim stores no caller fingerprint: such a claim replays without
+// comparing the request (see yadgar.task.v1.TaskDbService.LookupWrite).
+//
+// A LOOKUP FAILURE FAILS THE CALL, with the store's status passed through.
+// There is no fallback to the unlooked-up path: a store outage stays visible.
+//
+// ADR-1050's "read before the write" now means the read after the lookup. A
+// replayed outcome carries no reason token, because none of the checks that
+// emit one runs.
+//
+// CreateTask DOES NO LOOKUP. It reads nothing before the store, so the store's
+// claim already replays a same-key retry.
 service TaskService {
   rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
   rpc ReadTask(ReadTaskRequest) returns (ReadTaskResponse);

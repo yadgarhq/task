@@ -12,11 +12,12 @@ use yadgar_telemetry::grpc::status_name;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
-use super::{edit_refused, passthrough, tel_scope, Task};
+use super::keyed::{self, Lookup};
+use super::{edit_target, passthrough, tel_scope, transition_target, version_refused, Task};
 use crate::pb::yadgar::task::v1 as db;
 use crate::pb::yadgar::taskapi::v1 as api;
 use crate::pb::yadgar::taskapi::v1::task_service_server::TaskService;
-use crate::{rules, writes};
+use crate::{fingerprint, rules, writes};
 
 #[tonic::async_trait]
 impl TaskService for Task {
@@ -216,36 +217,32 @@ impl TaskService for Task {
 
         call.run(
             async move {
-                // THE MASK FIRST, before the store is touched at all. Resolving it
-                // is a pure decision about the request, so a mask naming a field
-                // no edit may write is refused here rather than after a `get_task`
-                // round trip whose answer was always going to be discarded.
-                let paths = writes::requested_paths(req.update_mask.as_ref())?;
-                // The key, the patch's shape (including `expect_new_sha256`,
-                // checked in full) and the body digest are decisions about the
-                // request alone too, so they are settled before the read as
-                // well. In patch mode the digest is over the PRE-edit
-                // body, so only its length is settled here; `writes::patched`
-                // compares it after the read (ADR-1008).
-                let key = writes::target_key(&req.id, req.number)?;
-                writes::check_patch(&req, &paths)?;
-                writes::check_body_digest(&req, &paths)?;
+                // EVERY REQUEST-ONLY CHECK, before the store is touched at all:
+                // see `edit_target`. They run ahead of the keyed lookup too.
+                let (paths, key) = edit_target(&req)?;
 
-                // THE TITLE RULE, and it applies only to an edit that WRITES a
-                // title. It used to run before the mask was resolved, which made a
-                // body-only edit impossible: `EditTaskRequest.title` is empty when
-                // a caller does not intend to change it, and this refused the call
-                // over a value it was never going to store. The rule itself is
-                // unchanged — an untitled task is unfindable by the humans who
-                // have to triage it — it simply now applies where a title is
-                // actually at stake.
-                if paths.contains(&"title") && req.title.trim().is_empty() {
-                    return Err(Status::invalid_argument("a task needs a title"));
-                }
-                // The bound, on the same condition: only a title being written.
-                if paths.contains(&"title") {
-                    rules::title_fits(&req.title).map_err(Status::invalid_argument)?;
-                }
+                // THE KEYED LOOKUP (ADR-1051), after every request-only check and
+                // before the read: a hit replays the recorded outcome, with no
+                // read, no patch and no write; a miss writes with the
+                // fingerprint the lookup sent. See `keyed`.
+                let caller_fingerprint = match self
+                    .look_up(
+                        deadline,
+                        &req.scope,
+                        &req.idempotency,
+                        db::WriteRpc::UpdateTask,
+                        || fingerprint::edit_task(&req),
+                    )
+                    .await?
+                {
+                    Lookup::Hit(outcome) => {
+                        let recorded = keyed::replayed_update(outcome)?;
+                        return Ok(api::EditTaskResponse {
+                            meta: recorded.meta,
+                        });
+                    }
+                    Lookup::Miss(caller_fingerprint) => caller_fingerprint,
+                };
 
                 // The read is kept for what it actually provides: NOT_FOUND for a
                 // task that is not there or not visible, before anything is
@@ -284,14 +281,21 @@ impl TaskService for Task {
                 let updated = deadline
                     .call(
                         self.ceiling,
-                        tonic::Request::new(writes::edit_request(req, &current, &paths)),
+                        tonic::Request::new(writes::edit_request(
+                            req,
+                            &current,
+                            &paths,
+                            caller_fingerprint,
+                        )),
                         |r| {
                             let mut db = self.db.clone();
                             async move { db.update_task(r).await }
                         },
                     )
                     .await
-                    .map_err(|e| edit_refused(e, read_version, expect_version))?
+                    .map_err(|e| {
+                        version_refused(e, "edit", "edit", Some(read_version), expect_version)
+                    })?
                     .into_inner();
 
                 let response = api::EditTaskResponse { meta: updated.meta };
@@ -311,29 +315,13 @@ impl TaskService for Task {
         .map(Response::new)
     }
 
-    /// KNOWN CONTRACT GAP, recorded here rather than papered over: on an
-    /// IDEMPOTENT REPLAY, `from` reports the status the task is already in.
-    ///
-    /// The read below runs before the write. On the retry of a transition that
-    /// was already applied, it returns the NEW status; `rules::may_transition`
-    /// waves `(to, to)` through as an identity no-op; `task-db` replays the
-    /// recorded response without writing; and `from` comes back equal to `to`.
-    ///
-    /// That is exactly the guarantee the field exists to give. `taskapi.proto`
-    /// says `from` is there "so a caller that raced another writer sees what
-    /// actually happened rather than assuming its own read was current" — and on
-    /// this path it carries no information at all.
-    ///
-    /// IT CANNOT BE FIXED HERE. Nothing this service can reach holds the prior
-    /// status. `UpdateTaskResponse` carries `meta` and nothing else, identically
-    /// at proto v1.2.0 and v1.6.0, and `task-db`'s idempotency row persists that
-    /// same response — so even a change confined to `-db` has nowhere to put the
-    /// answer. Closing it needs a new field on `UpdateTaskResponse` in
-    /// yadgarhq/proto first, after which the store's replay carries the true
-    /// predecessor and this handler reports it instead of its own read.
-    ///
-    /// Deriving one instead would be worse than the gap: several statuses lead to
-    /// any given target, so a guess is indistinguishable from an answer.
+    /// `from` IS THE STORE'S RECORDED PRIOR STATUS (ADR-1051 rule 7):
+    /// `UpdateTaskResponse.previous_status`, on a fresh transition and on a
+    /// replay alike, never this service's own read. On a replay that read
+    /// returns the status the first attempt already wrote, so a `from` taken
+    /// from it would equal `to` and tell a racing caller nothing (ledger 508).
+    /// TASK_STATUS_UNSPECIFIED is carried through as the store sent it: it
+    /// means the prior status is unknown, and a guess would be worse.
     async fn transition_task(
         &self,
         request: Request<api::TransitionTaskRequest>,
@@ -349,85 +337,46 @@ impl TaskService for Task {
 
         call.run(
             async move {
+                // The request-only checks, then the keyed lookup (ADR-1051):
+                // a hit replays with no read and no rule check, so a retry
+                // whose `to` is no longer legal is still replayed.
+                let (key, to) = transition_target(&req)?;
+                let caller_fingerprint = match self
+                    .look_up(
+                        deadline,
+                        &req.scope,
+                        &req.idempotency,
+                        db::WriteRpc::UpdateTask,
+                        || fingerprint::transition_task(&req),
+                    )
+                    .await?
+                {
+                    Lookup::Hit(outcome) => {
+                        let recorded = keyed::replayed_update(outcome)?;
+                        return Ok(api::TransitionTaskResponse {
+                            meta: recorded.meta,
+                            from: recorded.previous_status,
+                        });
+                    }
+                    Lookup::Miss(caller_fingerprint) => caller_fingerprint,
+                };
+
                 // THE DECISION, ALL OF IT, BEFORE THE WRITE. See
                 // `Task::decide_transition` for what it settles, and for why
-                // the refusal it can raise is INVALID_ARGUMENT.
-                let (current, from, to) = self.decide_transition(&req, deadline).await?;
+                // the refusal it can raise is INVALID_ARGUMENT. The rule is
+                // decided before the version: an illegal `to` is refused here,
+                // whatever the read's version.
+                let current = self.decide_transition(&req, key, to, deadline).await?;
 
-                // THE WRITE BELOW CARRIES `req.expect_version`, NOT
-                // `current.meta.version`, AND THAT IS DELIBERATE. A scanner reads
-                // the read-then-check-then-write above as a race and proposes
-                // substituting the version just read. Doing so would introduce a
-                // real defect, so the reasoning is recorded here rather than left
-                // to be rediscovered.
-                //
-                // `expect_version` is the CALLER'S claim about what it saw. It is
-                // the compare half of a compare-and-set, and it exists to refuse a
-                // caller that acted on a stale read. Replacing it with a version
-                // this service read microseconds ago launders a stale expectation
-                // into a fresh one: a write that must be refused would then
-                // succeed, and the caller would never learn it had overwritten
-                // somebody else's change.
-                //
-                // THERE IS NO ARM THAT SKIPS THE COMPARE. `task-db`'s
-                // `write.rs::update` binds `expect_version` into the WHERE clause
-                // of every UPDATE — `WHERE id = ? AND version = ? AND deleted_at
-                // IS NULL AND <reach>` — and a mismatch makes `rows_affected()`
-                // zero, which it turns into FAILED_PRECONDITION. Zero is not a
-                // wildcard there; it is simply a version no row holds.
-                //
-                // A SECOND CHECK HERE WOULD CATCH NOTHING. Only the comparison
-                // inside the store's transaction is atomic with the write. One
-                // added here passes in exactly the cases the CAS passes, and in
-                // the racing case — a writer committing between this read and that
-                // UPDATE — it passes too, because it is reading the same stale row.
-                //
-                // THE CAS IS ALSO WHAT MAKES THE RULE CHECK ABOVE SOUND. Any
-                // change that could invalidate `may_transition(from, to)` is a
-                // change of STATUS, a status change is a write, and every write
-                // bumps `version` — so the racing writer this handler cannot see
-                // is one the CAS refuses on its behalf.
-                //
-                // ONE LOOSE END, AND IT IS IN EXACTLY ONE PLACE. A review claimed
-                // `expect_version + 1` is live code both here and in
-                // `task-db/src/write.rs`. IT IS NOT. In THIS crate the expression
-                // survives only as the WORDS of the comment directly below, which
-                // describes what this handler used to do and no longer does;
-                // there is no such arithmetic on any executable line here.
-                //
-                // In `task-db/src/write.rs` it IS live: the SQL sets `version =
-                // version + 1`, and the response's `Meta.version` is then computed
-                // as `req.expect_version + 1` rather than read back. That is
-                // correct only BECAUSE the CAS guarantees the stored version
-                // equalled `expect_version`. If that side is ever changed to read
-                // the version back, the change belongs there alone — this
-                // repository holds no second copy to keep in step.
-                //
-                // The STORE'S meta, as `edit_task` already does. This used to
-                // discard the response and synthesise one from the request —
-                // `id` from `req.id`, `version` from `expect_version + 1` — which
-                // asserted two things this service cannot know: that `-db`
-                // increments by exactly one, and that no other Meta field the
-                // store fills in differs from the zero value. On a replay the
-                // second is plainly false, since the version is the ORIGINAL
-                // write's and the project comes from the scope. A synthesised
-                // envelope is a guess wearing the shape of an answer.
-                let updated = deadline
-                    .call(
-                        self.ceiling,
-                        tonic::Request::new(writes::transition_request(req, &current, to)),
-                        |r| {
-                            let mut db = self.db.clone();
-                            async move { db.update_task(r).await }
-                        },
-                    )
-                    .await
-                    .map_err(|e| passthrough(e, "transition"))?
-                    .into_inner();
+                // THE WRITE, and why it carries `req.expect_version` rather than
+                // the version just read: see `Task::write_transition`.
+                let updated = self
+                    .write_transition(req, &current, to, caller_fingerprint, deadline)
+                    .await?;
 
                 let response = api::TransitionTaskResponse {
                     meta: updated.meta,
-                    from: from as i32,
+                    from: updated.previous_status,
                 };
                 Ok(response)
             },
@@ -460,26 +409,9 @@ impl TaskService for Task {
 
         call.run(
             async move {
-                deadline
-                    .call(
-                        self.ceiling,
-                        tonic::Request::new(db::DeleteTaskRequest {
-                            idempotency: req.idempotency,
-                            scope: req.scope,
-                            id: req.id,
-                            expect_version: req.expect_version,
-                        }),
-                        |r| {
-                            let mut db = self.db.clone();
-                            async move { db.delete_task(r).await }
-                        },
-                    )
-                    .await
-                    .map_err(|e| passthrough(e, "remove"))?;
-                // No payload to measure: RemoveTaskResponse is empty. Recording it
-                // anyway matters — a call that returns nothing still costs time and still
-                // belongs in the count, and omitting it would make deletes invisible.
-                Ok(api::RemoveTaskResponse {})
+                // See `Task::remove` (in `keyed`): the request-only check, the
+                // keyed lookup, the pre-write read and the delete.
+                self.remove(req, deadline).await
             },
             |_| Outcome {
                 status: "OK",
