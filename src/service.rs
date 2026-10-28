@@ -283,6 +283,15 @@ fn transition_target(
     let key = crate::writes::target_key(&req.id, req.number)?;
     let to = db::TaskStatus::try_from(req.to)
         .map_err(|_| Status::invalid_argument("unknown target status"))?;
+    // `to == UNSPECIFIED` is refused by the request alone, so it is refused
+    // here, before the lookup. Left to `may_transition` it ran after the
+    // read, and a store outage answered UNAVAILABLE for a request that could
+    // never succeed. The message is the one `may_transition` gives.
+    if to == db::TaskStatus::Unspecified {
+        return Err(Status::invalid_argument(
+            rules::TransitionError::Unspecified.to_string(),
+        ));
+    }
     Ok((key, to))
 }
 

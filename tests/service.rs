@@ -3165,7 +3165,11 @@ async fn a_malformed_keyed_request_is_refused_before_the_lookup() {
         to: 999,
         ..keyed_transition(db::TaskStatus::Done)
     };
-    for req in [both, unknown_to] {
+    let unspecified_to = api::TransitionTaskRequest {
+        to: 0,
+        ..keyed_transition(db::TaskStatus::Done)
+    };
+    for req in [both, unknown_to, unspecified_to] {
         let status = svc
             .transition_task(Request::new(req))
             .await
