@@ -42,7 +42,7 @@ tonic-prost = "0.14"
 # `ServerTls` now — the one implementation of server TLS and client-certificate
 # verification six servers adopt — so this repository's own copy is deleted.
 # Same tonic major and the same `tls-ring` provider this manifest names above.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.0", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.2", features = [
   "serve-tls",
 ] }
 # The shared instrumentation seam (D67). Pinned by release tag, like every other
@@ -51,8 +51,8 @@ yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v
 # Client-side balancing, shared rather than copied. This began life as
 # src/balance.rs here; the gateway needed the identical logic and the invariant
 # is that anything every service needs is implemented once.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.25" }
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.2.0", features = ["grpc"] }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.26" }
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.2.7", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
 tokio = { version = "1", features = [
