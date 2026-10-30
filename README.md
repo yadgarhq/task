@@ -188,6 +188,12 @@ to be two builder calls in `main.rs`, and no test here spawned the binary then: 
 could be deleted and every test still passed. `main.rs` calls `watch_set` now and
 `tests/assembly.rs` calls the same function, so that edit turns a test red.
 
+## Installing
+
+Install task from the published OCI chart: `helm install task oci://ghcr.io/yadgarhq/charts/task --version <version>`. The release pins that chart to the image digest.
+
+A checkout of `chart/` renders `image.tag: latest`, a moving tag. Use a checkout for development only.
+
 ## Local development
 
 ```bash
