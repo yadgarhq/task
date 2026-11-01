@@ -2,7 +2,7 @@
 name = "yadgar-task"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.99.1"
 license = "Apache-2.0"
 description = "The task module's logic service: business rules, no store."
 
