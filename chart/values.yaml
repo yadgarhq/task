@@ -46,9 +46,11 @@ taskDb:
   # (`yadgarhq/yadgar`), ledger 1524.
   requestTimeoutSeconds: 14
 
-  # The TRANSPORT to that twin. Everything in the cluster is cleartext today,
-  # so a bearer token and every task body cross the pod network in the open;
-  # this is the seam that closes it, one hop at a time.
+  # The TRANSPORT to that twin. Every server in the estate serves TLS (ledger
+  # 1294), and `enabled` below ships no default (ADR-0845): each deployment
+  # states whether this hop uses it. With `true`, a bearer token and
+  # every task body are encrypted and the twin's certificate is verified.
+  # With `false`, they cross the pod network in the open.
   #
   # PATHS AND A FLAG, NEVER AN ISSUER-SPECIFIC RESOURCE (D80). The chart names a
   # Secret and a key inside it, and the binary is handed a file path. In the
