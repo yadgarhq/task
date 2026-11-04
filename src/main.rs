@@ -195,10 +195,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("TASK_DB_PORT is not a port number: {e}"))?;
 
-    // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
-    // the cleartext dial this service has always done — no server in the estate
-    // serves TLS yet, so the cut-over is a later change that can be reverted on
-    // its own.
+    // REQUIRED, NO DEFAULT (ADR-0845). `TASK_DB_TLS_ENABLED` is exactly "1"
+    // (TLS) or "0" (cleartext); absent or anything else refuses the boot. Every
+    // server in the estate serves TLS (ledger 1294), so "0" is the explicit
+    // reverted state, not a fallback: it can be flipped back on its own, and it
+    // logs a warning if a CA bundle is still configured.
     //
     // `.to_string()` on the way out. It dates from when `main` returned
     // `Result` and Rust printed a bare `?` here with Debug, as
