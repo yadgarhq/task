@@ -252,6 +252,7 @@ fn limits() -> serve::ServerLimits {
         ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
         ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
         ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+        ("LISTEN_MAX_CONNECTION_AGE_SECS", "1800"),
     ];
     serve::limits_from_lookup(|key| {
         vars.iter()

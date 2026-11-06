@@ -6,6 +6,7 @@
 server.limits.keepaliveIntervalSeconds  # ADR-1140 OK: DEFAULT-OK in the ratified list, yet gated by (b); default 30 needs a ruling: drop the gate source or reclassify (ADR-1140 decision 5). runtime tuning
 server.limits.keepaliveTimeoutSeconds  # ADR-1140 OK: DEFAULT-OK in the ratified list, yet gated by (b); default 10 needs a ruling: drop the gate source or reclassify (ADR-1140 decision 5). runtime tuning
 server.limits.maxConcurrentStreams  # ADR-1140 OK: DEFAULT-OK in the ratified list, yet gated by (b); default 256 needs a ruling: drop the gate source or reclassify (ADR-1140 decision 5). runtime tuning (deployment.yaml:218 (via parent object))
+server.limits.maxConnectionAgeSeconds  # ADR-1140 unclassified: not a row of the ratified list at its classified sha; gated by (b), default 1800 (ADR-1006, 30 min) needs classifying
 server.limits.maxHeaderListBytes  # ADR-1140 OK: DEFAULT-OK in the ratified list, yet gated by (b); default 16384 needs a ruling: drop the gate source or reclassify (ADR-1140 decision 5). runtime tuning (deployment.yaml:218 (via parent object))
 taskDb.requestTimeoutSeconds  # ADR-1140 OK: DEFAULT-OK in the ratified list, yet gated by (b); default 14 needs a ruling: drop the gate source or reclassify (ADR-1140 decision 5). timeout tuning (schema-required today, default present)
 taskDb.tls.caSecret  # ADR-1140 R-a: REQUIRED; default task-db-tls stays until every consumer sets the key (ADR-1140 decision 3). trust anchor: names the CA Secret this side verifies the peer against; seeder precedent ADR-0854 ships it with no default

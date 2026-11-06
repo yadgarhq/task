@@ -301,7 +301,7 @@ counts as unnamed — the mount's gate is its truthiness.
 THE SHAPE OF `server.limits`, AND THE ONE RULE THE SCHEMA CANNOT STATE (ADR-1006;
 yaadgaar #218).
 
-`values.schema.json` bounds each of the four limits to the range `yadgar-lifecycle`
+`values.schema.json` bounds each of the five limits to the range `yadgar-lifecycle`
 enforces, types it `integer` and makes it `required`. Two things it cannot see:
 
   - `server` or `server.limits` itself, deleted. This chart's `values.yaml` declares
@@ -318,8 +318,7 @@ enforces, types it `integer` and makes it `required`. Two things it cannot see:
 
 BOTH SIDES OF THE COMPARE ARE CAST WITH `int64`. A values-file number reaches the
 template as a float64 and a `--set` one as an int64, and Go templates refuse to
-compare the two kinds rather than converting. Connection age (ADR-1006, 30 min) is
-omitted until tonic#2780 ships; yaadgaar #417.
+compare the two kinds rather than converting.
 
 The shape and sentences follow iam-db's copy of this block (iam-db#102).
 
