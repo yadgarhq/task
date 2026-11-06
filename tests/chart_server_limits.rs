@@ -18,31 +18,41 @@ use serde_json::Value;
 use yadgar_lifecycle::serve_tls::ServerLimits;
 
 /// Each leaf under `server.limits`, its ADR-1006 default, the library's range,
-/// and the variable `templates/deployment.yaml` renders it into.
-const LIMITS: [(&str, u64, RangeInclusive<u64>, &str); 4] = [
+/// and the variable `templates/deployment.yaml` renders it into. The range is
+/// `None` for `maxConnectionAgeSeconds` until the lifecycle pin carries
+/// `ServerLimits::MAX_CONNECTION_AGE_SECS` (yadgarhq/lifecycle#78, v0.4.0); its
+/// literal bounds are held by `the_connection_age_schema_bounds_are_the_literal_range`,
+/// and the pin-bump PR replaces the `None` with the const.
+const LIMITS: [(&str, u64, Option<RangeInclusive<u64>>, &str); 5] = [
     (
         "maxConcurrentStreams",
         256,
-        ServerLimits::MAX_CONCURRENT_STREAMS,
+        Some(ServerLimits::MAX_CONCURRENT_STREAMS),
         "LISTEN_MAX_CONCURRENT_STREAMS",
     ),
     (
         "keepaliveIntervalSeconds",
         30,
-        ServerLimits::KEEPALIVE_INTERVAL_SECS,
+        Some(ServerLimits::KEEPALIVE_INTERVAL_SECS),
         "LISTEN_KEEPALIVE_INTERVAL_SECS",
     ),
     (
         "keepaliveTimeoutSeconds",
         10,
-        ServerLimits::KEEPALIVE_TIMEOUT_SECS,
+        Some(ServerLimits::KEEPALIVE_TIMEOUT_SECS),
         "LISTEN_KEEPALIVE_TIMEOUT_SECS",
     ),
     (
         "maxHeaderListBytes",
         16384,
-        ServerLimits::MAX_HEADER_LIST_BYTES,
+        Some(ServerLimits::MAX_HEADER_LIST_BYTES),
         "LISTEN_MAX_HEADER_LIST_BYTES",
+    ),
+    (
+        "maxConnectionAgeSeconds",
+        1800,
+        None,
+        "LISTEN_MAX_CONNECTION_AGE_SECS",
     ),
 ];
 
@@ -106,11 +116,13 @@ fn the_chart_defaults_are_the_ruled_ones_and_inside_the_library_ranges() {
             default, ruled,
             "`server.limits.{leaf}` moved off its ADR-1006 default"
         );
-        assert!(
-            range.contains(&default),
-            "`server.limits.{leaf}` = {default} is outside {range:?}, which the pinned \
-             yadgar-lifecycle refuses at boot"
-        );
+        if let Some(range) = range {
+            assert!(
+                range.contains(&default),
+                "`server.limits.{leaf}` = {default} is outside {range:?}, which the pinned \
+                 yadgar-lifecycle refuses at boot"
+            );
+        }
     }
     assert!(
         values_default("keepaliveTimeoutSeconds") < values_default("keepaliveIntervalSeconds"),
@@ -127,21 +139,32 @@ fn the_schema_bounds_are_the_library_ranges_and_every_key_is_required() {
     for (leaf, _, range, _) in LIMITS {
         let property = &block["properties"][leaf];
         assert_eq!(property["type"], "integer", "server.limits.{leaf}");
-        assert_eq!(
-            property["minimum"].as_u64(),
-            Some(*range.start()),
-            "the schema's minimum for `server.limits.{leaf}` is not the pinned library's"
-        );
-        assert_eq!(
-            property["maximum"].as_u64(),
-            Some(*range.end()),
-            "the schema's maximum for `server.limits.{leaf}` is not the pinned library's"
-        );
+        if let Some(range) = range {
+            assert_eq!(
+                property["minimum"].as_u64(),
+                Some(*range.start()),
+                "the schema's minimum for `server.limits.{leaf}` is not the pinned library's"
+            );
+            assert_eq!(
+                property["maximum"].as_u64(),
+                Some(*range.end()),
+                "the schema's maximum for `server.limits.{leaf}` is not the pinned library's"
+            );
+        }
         assert!(
             required.iter().any(|k| k == leaf),
             "`server.limits.{leaf}` must be `required`: the binary has no default (ADR-0569)"
         );
     }
+}
+
+/// `maxConnectionAgeSeconds` has no library const to compare with yet (see
+/// `LIMITS`), so its range is pinned as a literal: ADR-1006, 1..=86400.
+#[test]
+fn the_connection_age_schema_bounds_are_the_literal_range() {
+    let property = &schema_limits()["properties"]["maxConnectionAgeSeconds"];
+    assert_eq!(property["minimum"].as_u64(), Some(1));
+    assert_eq!(property["maximum"].as_u64(), Some(86_400));
 }
 
 /// `templates/deployment.yaml` binds `$limits` to `.Values.server.limits` once,

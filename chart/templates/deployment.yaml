@@ -214,8 +214,7 @@ spec:
             # nulled block reaches the named refusal in `render-checks.yaml`
             # rather than a raw nil-pointer error. `| int64` because helm hands
             # a values-file number over as a float64, and `quote` alone prints
-            # 1048576 as `1.048576e+06`, which the binary refuses. Connection
-            # age (ADR-1006) is omitted until tonic#2780 ships; yaadgaar #417.
+            # 1048576 as `1.048576e+06`, which the binary refuses.
             {{- $limits := (and (kindIs "map" .Values.server) (kindIs "map" .Values.server.limits) .Values.server.limits) | default dict }}
             - name: LISTEN_MAX_CONCURRENT_STREAMS
               value: {{ $limits.maxConcurrentStreams | int64 | quote }}
@@ -225,6 +224,8 @@ spec:
               value: {{ $limits.keepaliveTimeoutSeconds | int64 | quote }}
             - name: LISTEN_MAX_HEADER_LIST_BYTES
               value: {{ $limits.maxHeaderListBytes | int64 | quote }}
+            - name: LISTEN_MAX_CONNECTION_AGE_SECS
+              value: {{ $limits.maxConnectionAgeSeconds | int64 | quote }}
             # THE HOP TO task-db, which LISTEN_TLS_ENABLED below says nothing
             # about: that one describes this pod's own listener.
             #

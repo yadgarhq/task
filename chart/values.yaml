@@ -248,9 +248,8 @@ tls:
 # A NEW BLOCK, because this chart had no `server:` block before; the leaves are
 # camelCase with a unit suffix, as `taskDb.requestTimeoutSeconds` is.
 #
-# connection age (ADR-1006, 30 min) omitted until tonic#2780 ships; yaadgaar
-# #417. On tonic 0.14.6 `max_connection_age` panics the connection task after
-# GOAWAY and fails the calls in flight, so `yadgar-lifecycle` dropped it.
+# `maxConnectionAgeSeconds` (ADR-1006, 30 min) is read by `yadgar-lifecycle`
+# from v0.4.0 on; older releases ignore the variable it renders (yaadgaar #417).
 server:
   limits:
     # Concurrent HTTP/2 streams one connection may open. 1..=10000.
@@ -263,6 +262,9 @@ server:
     # The largest HTTP/2 header list a request may carry, in bytes.
     # 1024..=1048576.
     maxHeaderListBytes: 16384
+    # How long a connection lives before the server sends GOAWAY, in seconds
+    # (30 min). 1..=86400.
+    maxConnectionAgeSeconds: 1800
 
 # HOW A RENEWED CERTIFICATE ACTUALLY REACHES THE PROCESS.
 #

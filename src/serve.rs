@@ -55,9 +55,9 @@ pub const CHART_KEY: &str = "tls";
 
 /// The chart values block the listener's protocol limits render from (ADR-1006):
 /// `server.limits.maxConcurrentStreams`, `.keepaliveIntervalSeconds`,
-/// `.keepaliveTimeoutSeconds` and `.maxHeaderListBytes` in
-/// `chart/values.yaml`. Connection age (ADR-1006) is omitted until tonic#2780
-/// ships; yaadgaar #417. Every refusal names
+/// `.keepaliveTimeoutSeconds`, `.maxHeaderListBytes` and
+/// `.maxConnectionAgeSeconds` in `chart/values.yaml`. The pinned library reads
+/// the last one from v0.4.0 on (yaadgaar #417). Every refusal names
 /// `<LIMITS_CHART_KEY>.<leaf>` beside the `LISTEN_*` variable.
 pub const LIMITS_CHART_KEY: &str = "server.limits";
 

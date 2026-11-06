@@ -131,6 +131,7 @@ REQUIRED_BOUNDED_INTEGER = {
     "server.limits.keepaliveIntervalSeconds": (1, 3600),
     "server.limits.keepaliveTimeoutSeconds": (1, 600),
     "server.limits.maxHeaderListBytes": (1024, 1048576),
+    "server.limits.maxConnectionAgeSeconds": (1, 86400),
 }
 
 
@@ -932,8 +933,22 @@ def test_the_shipped_limits_render_into_their_variables():
         ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
         ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
         ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+        ("LISTEN_MAX_CONNECTION_AGE_SECS", "1800"),
     ):
         assert env_value(result.stdout, name) == value, name
+
+
+def test_the_connection_age_range_is_refused_outside_and_accepted_at_both_ends():
+    """ADR-1006: 1..=86400, required. 0 and 86401 are refused naming the key; 1 and
+    86400 render into LISTEN_MAX_CONNECTION_AGE_SECS as whole numbers."""
+    for bad in ("0", "86401"):
+        result = render("--set", f"server.limits.maxConnectionAgeSeconds={bad}")
+        assert result.returncode != 0, f"maxConnectionAgeSeconds={bad} rendered"
+        assert "maxConnectionAgeSeconds" in result.stderr, result.stderr
+    for good in ("1", "86400"):
+        result = render("--set", f"server.limits.maxConnectionAgeSeconds={good}")
+        assert result.returncode == 0, result.stderr
+        assert env_value(result.stdout, "LISTEN_MAX_CONNECTION_AGE_SECS") == good
 
 
 @pytest.mark.parametrize(

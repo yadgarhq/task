@@ -90,6 +90,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
         ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
         ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+        ("LISTEN_MAX_CONNECTION_AGE_SECS", "1800"),
     ]
 }
 

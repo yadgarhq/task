@@ -79,13 +79,19 @@
               "type": "integer",
               "minimum": 1024,
               "maximum": 1048576
+            },
+            "maxConnectionAgeSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400
             }
           },
           "required": [
             "maxConcurrentStreams",
             "keepaliveIntervalSeconds",
             "keepaliveTimeoutSeconds",
-            "maxHeaderListBytes"
+            "maxHeaderListBytes",
+            "maxConnectionAgeSeconds"
           ],
           "additionalProperties": false
         }
