@@ -47,7 +47,7 @@ repos:
   # v1.32.0 (C-A3 pre-pin parent gate, a ci-pr.yaml change) and v1.33.x (trivy
   # renders what it scans; D80 skips CRD schemas).
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.65.3
+    rev: v1.65.4
     hooks:
       - id: gitleaks
       - id: prettier
