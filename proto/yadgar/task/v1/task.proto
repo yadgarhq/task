@@ -185,8 +185,8 @@ enum WriteRpc {
 // the logic service ask the claim ledger first, so the retry is replayed
 // (D9) rather than refused.
 message LookupWriteRequest {
-  // As on every TaskDbService RPC. A missing or empty scope is refused as the
-  // other TaskDbService RPCs refuse it.
+  // As on every TaskDbService RPC. A missing scope is refused as the other
+  // TaskDbService RPCs refuse it.
   yadgar.common.v1.Scope scope = 1;
 
   // THE KEY TO LOOK UP. AN EMPTY KEY IS REFUSED WITH INVALID_ARGUMENT. A write
@@ -232,8 +232,8 @@ message LookupWriteRequest {
   // every retry across the deploy is refused as a different request. A
   // taskapi field that task learns in a later release enters the encoding for
   // any caller that already sends it, so such a caller's retry across that
-  // deploy is refused as a different request; it is one, because task now
-  // acts on the field.
+  // deploy is refused as a different request, whether or not task yet acts on
+  // the field.
   bytes caller_fingerprint = 4;
 }
 
